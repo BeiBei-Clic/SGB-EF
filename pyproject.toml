@@ -1,0 +1,14 @@
+[project]
+name = "sgb-ef"
+version = "0.1.0"
+description = "SGB-EF Symbolic Regression Data Generation"
+dependencies = [
+    "sympy>=1.12",
+    "numpy>=1.24",
+]
+
+[tool.uv]
+dev-dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["data_generation"]
