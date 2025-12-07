@@ -5,24 +5,24 @@ EditFlow Transformer - 基于Transformer的符号回归编辑流模型
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, PretrainedConfig, AutoModel, AutoConfig
+from transformers import AutoModel, AutoConfig
 import math
 
 
-class EditFlowConfig(PretrainedConfig):
-    model_type = "editflow"
+class EditFlowConfig:
+    """EditFlow Transformer配置类 - 不继承PretrainedConfig以避免AutoModel系统冲突"""
 
     def __init__(self, vocab_size=50265, hidden_dim=768, num_layers=6, num_heads=12,
                  max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
-                 base_model_name="gpt2", use_condition_injection=True,
+                 base_model_name="openai-community/gpt2", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
         self.dropout = dropout
+        self.pad_token_id = pad_token_id
         self.condition_dim = condition_dim or hidden_dim
         self.base_model_name = base_model_name
         self.use_condition_injection = use_condition_injection
@@ -82,11 +82,12 @@ class CrossAttentionConditionInjection(nn.Module):
         return self.out_proj(attn_output)
 
 
-class EditFlowTransformer(PreTrainedModel):
-    config_class = EditFlowConfig
+class EditFlowTransformer(nn.Module):
+    """EditFlow Transformer - 基于Transformer的符号回归编辑流模型"""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
 
         # 加载预训练的transformer模型
         if hasattr(config, 'base_model_name') and config.base_model_name:
@@ -163,9 +164,8 @@ class EditFlowTransformer(PreTrainedModel):
         )
 
         self.final_layer_norm = nn.LayerNorm(config.hidden_dim)
-        self.post_init()
 
-    def forward(self, input_ids, time_steps, condition, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, time_steps=None, condition=None):
         print(f"EditFlow input_ids.shape: {input_ids.shape}")
         print(f"EditFlow input_ids.ndim: {input_ids.ndim}")
         if input_ids.ndim == 2:
@@ -176,12 +176,22 @@ class EditFlowTransformer(PreTrainedModel):
         else:
             raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
+        # 自动生成时间嵌入（如果没有提供）
+        if time_steps is None:
+            # 默认使用随机时间步或固定时间步
+            time_steps = torch.rand(batch_size, 1, device=input_ids.device)
+
         # 时间嵌入
         if self.config.time_embedding_type == "sinusoidal":
             time_emb = self.time_embedding(time_steps)
         else:
             time_emb = self.time_embedding(time_steps.float())
         time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # 自动生成条件嵌入（如果没有提供）
+        if condition is None:
+            # 默认使用零条件
+            condition = torch.zeros(batch_size, self.config.condition_dim, device=input_ids.device)
 
         # 额外的位置嵌入
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
@@ -225,14 +235,11 @@ class EditFlowTransformer(PreTrainedModel):
 
 # 测试代码
 if __name__ == "__main__":
-    from transformers import AutoConfig, AutoModel
-
-    # 注册模型配置
-    AutoConfig.register("editflow", EditFlowConfig)
-    # 注意：不要注册EditFlowTransformer到AutoModel，这会导致递归问题
-
     config = EditFlowConfig(vocab_size=1000, hidden_dim=256, num_layers=4, num_heads=8)
     model = EditFlowTransformer(config)
+
+    # 验证基础模型确实是真正的GPT2而不是EditFlowTransformer
+    print(f"Base model type: {type(model.base_model)}")
 
     # 测试数据
     input_ids = torch.randint(0, config.vocab_size, (2, 64))
@@ -243,10 +250,18 @@ if __name__ == "__main__":
     # 前向传播
     model.eval()
     with torch.no_grad():
-        rates, insert_probs, substitute_probs = model(input_ids, time_steps, condition, attention_mask)
-
-    print(f"模型参数数量: {model.num_parameters():,}")
-    print(f"输入形状: {input_ids.shape}")
-    print(f"速率输出形状: {rates.shape}")
-    print(f"插入概率形状: {insert_probs.shape}")
-    print(f"替换概率形状: {substitute_probs.shape}")
+        try:
+            rates, insert_probs, substitute_probs = model(input_ids, time_steps, condition, attention_mask)
+            print(f"✓ 前向传播成功")
+            model_params = sum(p.numel() for p in model.parameters())
+            print(f"模型参数数量: {model_params:,}")
+            print(f"输入形状: {input_ids.shape}")
+            print(f"速率输出形状: {rates.shape}")
+            print(f"插入概率形状: {insert_probs.shape}")
+            print(f"替换概率形状: {substitute_probs.shape}")
+        except RecursionError as e:
+            print(f"✗ 递归错误仍然存在: {e}")
+        except Exception as e:
+            print(f"✗ 其他错误: {e}")
+            import traceback
+            traceback.print_exc()

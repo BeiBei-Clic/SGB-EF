@@ -297,7 +297,7 @@ class EditFlowTrainer:
             max_seq_len=64,
             condition_dim=condition_encoder.output_dim,
             use_condition_injection=True,
-            base_model_name="gpt2"  # 添加base_model_name
+            base_model_name="openai-community/gpt2"  # 添加base_model_name
         )
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
@@ -412,7 +412,7 @@ class EditFlowTrainer:
         # 设置模型
         model, condition_encoder, criterion, optimizer = self.setup_models()
 
-        print(f"模型参数数量: {model.num_parameters():,}")
+        print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
 
         # 训练循环
