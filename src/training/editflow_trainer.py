@@ -18,8 +18,9 @@ class TripletDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[Dict], vocab_size: int = 1000):
         self.samples = samples
         self.vocab_size = vocab_size
-        self.pad_token = vocab_size
-        self.bos_token = vocab_size + 1
+        # 这些稍后会在训练器中更新为实际的模型vocab_size
+        self.pad_token = vocab_size - 1  # 临时设置，会更新
+        self.bos_token = vocab_size - 2  # 临时设置，会更新
         self.max_dim = 10  # 支持最高十维变量
 
     def __len__(self):
@@ -49,14 +50,25 @@ class TripletDataset(torch.utils.data.Dataset):
         token_ids = []
         for token in tokens:
             if token in token_to_id:
-                token_ids.append(token_to_id[token])
+                token_id = token_to_id[token]
+                # 确保token ID在有效范围内
+                if 0 <= token_id < self.vocab_size:
+                    token_ids.append(token_id)
+                else:
+                    token_ids.append(self.bos_token)  # 使用BOS作为安全的默认值
             elif token.replace('.', '').replace('-', '').isdigit():
-                # 常数映射
+                # 常数映射，确保在有效范围内
                 const_val = float(token)
                 const_id = 50 + min(int(abs(const_val)) % 50, 49)
-                token_ids.append(const_id)
+                # 确保常数ID不超出vocab_size范围
+                if const_id < self.vocab_size - 2:  # 留出空间给特殊token
+                    token_ids.append(const_id)
+                else:
+                    token_ids.append(self.bos_token)  # 使用BOS作为安全的默认值
             else:
-                token_ids.append(200)  # 未知token
+                # 使用安全的默认值
+                safe_token_id = min(200, self.vocab_size - 3)  # 确保不超过范围
+                token_ids.append(safe_token_id)
 
         return token_ids
 
@@ -169,12 +181,20 @@ class EditFlowLoss:
         """
         batch_size, seq_len, _ = pred_rates.shape
 
-        # 构建组合预测 u_cat
-        ins_rates = pred_rates[:, :, 0:1] * pred_ins_probs  # (batch_size, seq_len, vocab_size)
-        sub_rates = pred_rates[:, :, 1:2] * pred_sub_probs  # (batch_size, seq_len, vocab_size)
-        del_rates = pred_rates[:, :, 2:3]  # (batch_size, seq_len, 1)
+        # 构建组合预测 u_cat，与target_mask保持一致的顺序
+        insert_rates = pred_rates[:, :, 0:1]  # (batch_size, seq_len, 1)
+        substitute_rates = pred_rates[:, :, 1:2]  # (batch_size, seq_len, 1)
+        delete_rates = pred_rates[:, :, 2:3]  # (batch_size, seq_len, 1)
 
-        u_cat = torch.cat([ins_rates, sub_rates, del_rates], dim=-1)  # (batch_size, seq_len, 2*vocab_size + 1)
+        # 将rates与probabilities相乘得到实际的编辑概率
+        ins_probs = insert_rates * pred_ins_probs  # (batch_size, seq_len, vocab_size)
+        sub_probs = substitute_rates * pred_sub_probs  # (batch_size, seq_len, vocab_size)
+
+        # 按照target_mask的顺序构造u_cat: [3 rates, insert_probs, substitute_probs]
+        u_cat = torch.cat([insert_rates, substitute_rates, delete_rates, ins_probs, sub_probs], dim=-1)  # (batch_size, seq_len, 3 + 2*vocab_size)
+
+        # 添加小的epsilon避免log(0)
+        u_cat = torch.clamp(u_cat, min=1e-8)
 
         # 构建目标掩码
         target_masks = []
@@ -186,8 +206,11 @@ class EditFlowLoss:
         # 计算总速率
         u_total = pred_rates.sum(dim=(1, 2))  # (batch_size,)
 
-        # 计算调度器系数
-        sched_coeff = (self.scheduler_derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
+        # 计算调度器系数，增加数值稳定性
+        sched_t = self.scheduler(t)
+        sched_dt = self.scheduler_derivative(t)
+        sched_coeff = (sched_dt / (1 - sched_t + 1e-8)).squeeze(-1)
+        sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)  # 防止极端值
 
         # 计算交叉熵项
         log_u_cat = torch.clamp(u_cat.log(), min=-20)
@@ -203,9 +226,10 @@ class EditFlowLoss:
 
 def sample_conditional_path(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, scheduler) -> torch.Tensor:
     """从x0到x1的条件路径采样"""
-    # 简化的线性插值
-    t = t.view(-1, 1, 1)
-    return ((1 - scheduler(t)) * x0 + scheduler(t) * x1).long()
+    # 简化的线性插值，确保保持2D形状
+    t = t.view(-1, 1)  # 形状: (batch_size, 1)
+    t_expanded = t.expand(-1, x0.size(1))  # 形状: (batch_size, seq_len)
+    return ((1 - scheduler(t_expanded)) * x0 + scheduler(t_expanded) * x1).long()
 
 
 def custom_collate_fn(batch):
@@ -287,17 +311,35 @@ class EditFlowTrainer:
         print("初始化条件编码器...")
         # 初始化条件编码器
         condition_encoder = ConditionEncoder().to(self.device)
+
+        # 先创建一个临时模型来获取实际配置
         print(f"初始化EditFlow模型...")
-        # 初始化EditFlow模型
-        config = EditFlowConfig(
-            vocab_size=self.args.vocab_size + 2,  # +2 for PAD and BOS
+        temp_config = EditFlowConfig(
+            vocab_size=self.args.vocab_size,  # 使用原始vocab_size
             hidden_dim=self.args.hidden_dim,
             num_layers=self.args.num_layers,
             num_heads=self.args.num_heads,
             max_seq_len=64,
             condition_dim=condition_encoder.output_dim,
             use_condition_injection=True,
-            base_model_name="openai-community/gpt2"  # 添加base_model_name
+            base_model_name="openai-community/gpt2"
+        )
+        temp_model = EditFlowTransformer(temp_config)
+
+        # 获取模型实际的vocab_size
+        actual_vocab_size = temp_model.base_model.config.vocab_size
+        print(f"模型实际vocab_size: {actual_vocab_size}")
+
+        # 使用实际vocab_size创建最终模型
+        config = EditFlowConfig(
+            vocab_size=actual_vocab_size,
+            hidden_dim=self.args.hidden_dim,
+            num_layers=self.args.num_layers,
+            num_heads=self.args.num_heads,
+            max_seq_len=64,
+            condition_dim=condition_encoder.output_dim,
+            use_condition_injection=True,
+            base_model_name="openai-community/gpt2"
         )
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
@@ -312,7 +354,7 @@ class EditFlowTrainer:
             weight_decay=self.args.weight_decay
         )
 
-        return model, condition_encoder, criterion, optimizer
+        return model, condition_encoder, criterion, optimizer, actual_vocab_size
 
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
         """训练一个epoch"""
@@ -363,7 +405,7 @@ class EditFlowTrainer:
                 pred_sub_probs=pred_sub_probs,
                 alignment=alignment,
                 t=t,
-                vocab_size=self.args.vocab_size
+                vocab_size=model.config.vocab_size
             )
 
             # 反向传播
@@ -410,7 +452,13 @@ class EditFlowTrainer:
         dataloaders, datasets, dimension_groups = self.prepare_data()
 
         # 设置模型
-        model, condition_encoder, criterion, optimizer = self.setup_models()
+        model, condition_encoder, criterion, optimizer, actual_vocab_size = self.setup_models()
+
+        # 更新所有datasets的vocab_size
+        for dataset in datasets.values():
+            dataset.vocab_size = actual_vocab_size
+            dataset.pad_token = actual_vocab_size - 1  # 使用最后一个有效token作为PAD
+            dataset.bos_token = actual_vocab_size - 2  # 使用倒数第二个作为BOS
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
