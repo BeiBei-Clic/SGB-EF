@@ -14,66 +14,39 @@ class ConditionEncoder(nn.Module):
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
         super().__init__()
 
-        # 设置本地缓存目录 - 使用项目根目录下的models文件夹
+        # 设置本地缓存目录
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         cache_dir = os.path.join(project_root, "models", "huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        print(f"正在加载模型: {model_name}")
-        print(f"模型缓存目录: {cache_dir}")
+        print(f"加载模型: {model_name}")
 
-        # 加载Qwen模型和tokenizer到本地缓存，会自动显示下载进度
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
-        print("✓ 主模型加载完成")
-
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left')
-        print("✓ Tokenizer加载完成")
-
         self.output_dim = self.model.config.hidden_size
-
-    def points_to_text(self, points: torch.Tensor) -> list[str]:
-        batch_size = points.shape[0]
-        texts = []
-
-        for b in range(batch_size):
-            point_texts = []
-            for i in range(points.shape[1]):
-                x_val = points[b, i, 0].item()
-                r_val = points[b, i, 1].item()
-                point_texts.append(f"Data point: x={x_val:.6f}, r={r_val:.6f}")
-
-            text = " ".join(point_texts)
-            texts.append(text)
-
-        return texts
 
     def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
         """
         编码残差点集
         Args:
-            x_values: (batch_size, num_points, input_dim) x值
-            residuals: (batch_size, num_points, 1) 残差值
+            x_values: (batch_size, num_points) x值
+            residuals: (batch_size, num_points) 残差值
         Returns:
             condition: (batch_size, output_dim) 条件向量
         """
-        # 确保输入形状正确
-        if x_values.dim() == 2:
-            x_values = x_values.unsqueeze(-1)  # (batch_size, num_points, 1)
+        # 确保输入为3维
+        x_values = x_values.unsqueeze(-1) if x_values.dim() == 2 else x_values
+        residuals = residuals.unsqueeze(-1) if residuals.dim() == 2 else residuals
 
-        # residuals 应该已经是 (batch_size, num_points, 1)
-        if residuals.dim() == 2:
-            residuals = residuals.unsqueeze(-1)  # (batch_size, num_points, 1)
-
-        # 拼接x值和残差
+        # 拼接并转换为文本
         points = torch.cat([x_values, residuals], dim=-1)
-        # (batch_size, num_points, input_dim + 1)
-
-        # 转换为文本
-        texts = self.points_to_text(points)
-
-        # 添加任务指令
         task = "Generate numerical embeddings for symbolic regression data points"
-        texts = [f"Instruct: {task}\nQuery: {text}" for text in texts]
+
+        texts = []
+        for b in range(points.shape[0]):
+            point_texts = [f"Data point: x={points[b, i, 0].item():.6f}, r={points[b, i, 1].item():.6f}"
+                          for i in range(points.shape[1])]
+            texts.append(f"Instruct: {task}\nQuery: {' '.join(point_texts)}")
 
         # 编码文本
         inputs = self.tokenizer(
@@ -82,34 +55,9 @@ class ConditionEncoder(nn.Module):
             truncation=True,
             max_length=512,
             return_tensors="pt"
-        )
-
-        device = points.device
-        for key in inputs:
-            inputs[key] = inputs[key].to(device)
+        ).to(points.device)
 
         outputs = self.model(**inputs)
         embeddings = outputs.last_hidden_state[:, -1]
-        condition = torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
-        return condition
-
-
-# 测试代码
-if __name__ == "__main__":
-    # 创建条件编码器
-    encoder = ConditionEncoder(model_name="Qwen/Qwen3-Embedding-0.6B")
-
-    # 测试数据
-    batch_size = 2
-    num_points = 10
-    x_values = torch.randn(batch_size, num_points)
-    residuals = torch.randn(batch_size, num_points)
-
-    # 测试编码
-    with torch.no_grad():
-        condition = encoder(x_values, residuals)
-        print(f"条件编码输出形状: {condition.shape}")
-        print(f"条件编码输出均值: {condition.mean().item():.4f}")
-
-    print("Hugging Face条件编码器测试完成！")
+        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
