@@ -18,96 +18,58 @@ class TripletDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[Dict], vocab_size: int = 1000):
         self.samples = samples
         self.vocab_size = vocab_size
-        # 这些稍后会在训练器中更新为实际的模型vocab_size
-        self.pad_token = vocab_size - 1  # 临时设置，会更新
-        self.bos_token = vocab_size - 2  # 临时设置，会更新
-        self.max_dim = 10  # 支持最高十维变量
+        self.pad_token = vocab_size - 1
+        self.bos_token = vocab_size - 2
+        self.max_dim = 10
+        self.token_to_id = {
+            'add': 1, 'sub': 2, 'mul': 3, 'div': 4, 'pow': 5,
+            'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11,
+            **{f'x{i}': 12 + i for i in range(self.max_dim)}
+        }
 
     def __len__(self):
         return len(self.samples)
-
-    def _build_token_mapping(self) -> Dict[str, int]:
-        """动态构建token映射，支持最高十维变量"""
-        token_to_id = {
-            'add': 1, 'sub': 2, 'mul': 3, 'div': 4, 'pow': 5,
-            'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11,
-        }
-
-        # 动态添加变量token x0-x9
-        for i in range(self.max_dim):
-            token_to_id[f'x{i}'] = 12 + i
-
-        return token_to_id
 
     def _tokenize_expression(self, tree_str: str) -> List[int]:
         """将表达式树字符串转换为token序列"""
         if not tree_str:
             return []
 
-        tokens = tree_str.split(',')
-        token_to_id = self._build_token_mapping()
-
         token_ids = []
-        for token in tokens:
-            if token in token_to_id:
-                token_id = token_to_id[token]
-                # 确保token ID在有效范围内
-                if 0 <= token_id < self.vocab_size:
-                    token_ids.append(token_id)
-                else:
-                    token_ids.append(self.bos_token)  # 使用BOS作为安全的默认值
+        for token in tree_str.split(','):
+            if token in self.token_to_id:
+                token_ids.append(self.token_to_id[token])
             elif token.replace('.', '').replace('-', '').isdigit():
-                # 常数映射，确保在有效范围内
-                const_val = float(token)
-                const_id = 50 + min(int(abs(const_val)) % 50, 49)
-                # 确保常数ID不超出vocab_size范围
-                if const_id < self.vocab_size - 2:  # 留出空间给特殊token
-                    token_ids.append(const_id)
-                else:
-                    token_ids.append(self.bos_token)  # 使用BOS作为安全的默认值
+                const_id = 50 + int(abs(float(token))) % 50
+                token_ids.append(min(const_id, self.vocab_size - 3))
             else:
-                # 使用安全的默认值
-                safe_token_id = min(200, self.vocab_size - 3)  # 确保不超过范围
-                token_ids.append(safe_token_id)
+                token_ids.append(min(200, self.vocab_size - 3))
 
         return token_ids
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
 
-        # 提取数据
         x_values = torch.FloatTensor(sample['x_values'])
         residuals = torch.FloatTensor(sample['residuals'])
-
-        # 确保residuals是2D格式: (n_points, 1) - 对应标量输出
         if residuals.dim() == 1:
-            residuals = residuals.unsqueeze(-1)  # (n_points,) -> (n_points, 1)
+            residuals = residuals.unsqueeze(-1)
 
-        # Token化表达式
         curr_tokens = self._tokenize_expression(sample['tree_cur1'])
         target_tokens = self._tokenize_expression(sample['tree_gt'])
 
-        # 添加BOS token并填充
-        max_len = 64  # 固定最大长度
-
-        def pad_sequence(tokens, max_len):
+        max_len = 64
+        def pad_sequence(tokens):
             tokens = [self.bos_token] + tokens[:max_len-1]
-            if len(tokens) < max_len:
-                tokens.extend([self.pad_token] * (max_len - len(tokens)))
+            tokens.extend([self.pad_token] * (max_len - len(tokens)))
             return torch.LongTensor(tokens)
-
-        curr_token_ids = pad_sequence(curr_tokens, max_len)
-        target_token_ids = pad_sequence(target_tokens, max_len)
-
-        # 对齐信息
-        alignment = sample['alignment_vector']['alignment']
 
         return {
             'x_values': x_values,
             'residuals': residuals,
-            'curr_token_ids': curr_token_ids,
-            'target_token_ids': target_token_ids,
-            'alignment': alignment
+            'curr_token_ids': pad_sequence(curr_tokens),
+            'target_token_ids': pad_sequence(target_tokens),
+            'alignment': sample['alignment_vector']['alignment']
         }
 
 
@@ -116,137 +78,75 @@ class EditFlowLoss:
 
     def __init__(self, scheduler_type='cubic'):
         self.scheduler_type = scheduler_type
+        self.func_map = {'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11}
 
     def scheduler(self, t: torch.Tensor) -> torch.Tensor:
-        """时间调度器 κ(t)"""
-        if self.scheduler_type == 'cubic':
-            return 3 * t**2 - 2 * t**3
-        elif self.scheduler_type == 'linear':
-            return t
-        else:
-            return t
+        return 3 * t**2 - 2 * t**3 if self.scheduler_type == 'cubic' else t
 
     def scheduler_derivative(self, t: torch.Tensor) -> torch.Tensor:
-        """调度器导数 κ'(t)"""
-        if self.scheduler_type == 'cubic':
-            return 6 * t - 6 * t**2
-        elif self.scheduler_type == 'linear':
-            return torch.ones_like(t)
-        else:
-            return torch.ones_like(t)
-
-    def _get_function_token_id(self, func_name: str) -> int:
-        """获取函数token ID"""
-        func_map = {'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11}
-        return func_map.get(func_name, 6)  # 默认返回sin
+        return 6 * t - 6 * t**2 if self.scheduler_type == 'cubic' else torch.ones_like(t)
 
     def alignment_to_target_mask(self, alignment: List[Tuple], seq_len: int, vocab_size: int) -> torch.Tensor:
-        """将对齐序列转换为目标掩码"""
-        # 创建目标掩码: (seq_len, 3 + 2*vocab_size)
-        # [insert_rate, substitute_rate, delete_rate, insert_probs..., substitute_probs...]
         target_mask = torch.zeros(seq_len, 3 + 2 * vocab_size)
 
         for i, (op, src, tgt) in enumerate(alignment[:seq_len]):
             if op == 'keep':
-                target_mask[i, 1] = 0.1  # 低替换率
+                target_mask[i, 1] = 0.1
             elif op == 'insert':
-                target_mask[i, 0] = 1.0  # 高插入率
-                # 设置插入的目标token
-                if tgt in ['sin', 'cos', 'exp', 'log', 'sqrt']:
-                    token_id = self._get_function_token_id(tgt)
-                    target_mask[i, 3 + token_id] = 1.0
+                target_mask[i, 0] = 1.0
+                if tgt in self.func_map:
+                    target_mask[i, 3 + self.func_map[tgt]] = 1.0
             elif op == 'delete':
-                target_mask[i, 2] = 1.0  # 高删除率
+                target_mask[i, 2] = 1.0
             elif op == 'substitute':
-                target_mask[i, 1] = 1.0  # 高替换率
-                # 设置替换的目标token
-                if tgt in ['sin', 'cos', 'exp', 'log', 'sqrt']:
-                    token_id = self._get_function_token_id(tgt)
-                    target_mask[i, 3 + vocab_size + token_id] = 1.0
+                target_mask[i, 1] = 1.0
+                if tgt in self.func_map:
+                    target_mask[i, 3 + vocab_size + self.func_map[tgt]] = 1.0
 
         return target_mask
 
     def __call__(self, pred_rates: torch.Tensor, pred_ins_probs: torch.Tensor,
                  pred_sub_probs: torch.Tensor, alignment: List[Tuple],
                  t: torch.Tensor, vocab_size: int) -> torch.Tensor:
-        """
-        计算EditFlow损失
-        Args:
-            pred_rates: (batch_size, seq_len, 3) 预测的编辑速率
-            pred_ins_probs: (batch_size, seq_len, vocab_size) 预测的插入概率
-            pred_sub_probs: (batch_size, seq_len, vocab_size) 预测的替换概率
-            alignment: 对齐序列列表
-            t: (batch_size, 1) 时间步
-            vocab_size: 词汇表大小
-        """
         batch_size, seq_len, _ = pred_rates.shape
 
-        # 构建组合预测 u_cat，与target_mask保持一致的顺序
-        insert_rates = pred_rates[:, :, 0:1]  # (batch_size, seq_len, 1)
-        substitute_rates = pred_rates[:, :, 1:2]  # (batch_size, seq_len, 1)
-        delete_rates = pred_rates[:, :, 2:3]  # (batch_size, seq_len, 1)
+        insert_rates = pred_rates[:, :, 0:1]
+        substitute_rates = pred_rates[:, :, 1:2]
+        delete_rates = pred_rates[:, :, 2:3]
 
-        # 将rates与probabilities相乘得到实际的编辑概率
-        ins_probs = insert_rates * pred_ins_probs  # (batch_size, seq_len, vocab_size)
-        sub_probs = substitute_rates * pred_sub_probs  # (batch_size, seq_len, vocab_size)
-
-        # 按照target_mask的顺序构造u_cat: [3 rates, insert_probs, substitute_probs]
-        u_cat = torch.cat([insert_rates, substitute_rates, delete_rates, ins_probs, sub_probs], dim=-1)  # (batch_size, seq_len, 3 + 2*vocab_size)
-
-        # 添加小的epsilon避免log(0)
+        ins_probs = insert_rates * pred_ins_probs
+        sub_probs = substitute_rates * pred_sub_probs
+        u_cat = torch.cat([insert_rates, substitute_rates, delete_rates, ins_probs, sub_probs], dim=-1)
         u_cat = torch.clamp(u_cat, min=1e-8)
 
-        # 构建目标掩码
-        target_masks = []
-        for i, align in enumerate(alignment):
-            target_mask = self.alignment_to_target_mask(align, seq_len, vocab_size)
-            target_masks.append(target_mask)
-        target_masks = torch.stack(target_masks).to(pred_rates.device)
+        target_masks = torch.stack([
+            self.alignment_to_target_mask(align, seq_len, vocab_size)
+            for align in alignment
+        ]).to(pred_rates.device)
 
-        # 计算总速率
-        u_total = pred_rates.sum(dim=(1, 2))  # (batch_size,)
-
-        # 计算调度器系数，增加数值稳定性
+        u_total = pred_rates.sum(dim=(1, 2))
         sched_t = self.scheduler(t)
         sched_dt = self.scheduler_derivative(t)
-        sched_coeff = (sched_dt / (1 - sched_t + 1e-8)).squeeze(-1)
-        sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)  # 防止极端值
+        sched_coeff = torch.clamp((sched_dt / (1 - sched_t + 1e-8)).squeeze(-1), min=-10, max=10)
 
-        # 计算交叉熵项
-        log_u_cat = torch.clamp(u_cat.log(), min=-20)
-        cross_entropy = (log_u_cat * target_masks).sum(dim=(1, 2))
-
-        # Bregman散度损失
+        cross_entropy = (torch.clamp(u_cat.log(), min=-20) * target_masks).sum(dim=(1, 2))
         loss = u_total - cross_entropy * sched_coeff
 
         return loss.mean()
 
 
-
-
 def sample_conditional_path(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, scheduler) -> torch.Tensor:
-    """从x0到x1的条件路径采样"""
-    # 简化的线性插值，确保保持2D形状
-    t = t.view(-1, 1)  # 形状: (batch_size, 1)
-    t_expanded = t.expand(-1, x0.size(1))  # 形状: (batch_size, seq_len)
-    return ((1 - scheduler(t_expanded)) * x0 + scheduler(t_expanded) * x1).long()
+    t = t.view(-1, 1).expand(-1, x0.size(1))
+    return ((1 - scheduler(t)) * x0 + scheduler(t) * x1).long()
 
 
 def custom_collate_fn(batch):
-    """自定义collate函数，处理不同长度的alignment数据"""
-    # 分离不同字段
-    x_values = torch.stack([item['x_values'] for item in batch])
-    residuals = torch.stack([item['residuals'] for item in batch])
-    curr_token_ids = torch.stack([item['curr_token_ids'] for item in batch])
-    target_token_ids = torch.stack([item['target_token_ids'] for item in batch])
-    alignment = [item['alignment'] for item in batch]  # 保持为列表
-
     return {
-        'x_values': x_values,
-        'residuals': residuals,
-        'curr_token_ids': curr_token_ids,
-        'target_token_ids': target_token_ids,
-        'alignment': alignment
+        'x_values': torch.stack([item['x_values'] for item in batch]),
+        'residuals': torch.stack([item['residuals'] for item in batch]),
+        'curr_token_ids': torch.stack([item['curr_token_ids'] for item in batch]),
+        'target_token_ids': torch.stack([item['target_token_ids'] for item in batch]),
+        'alignment': [item['alignment'] for item in batch]
     }
 
 
@@ -259,7 +159,6 @@ class EditFlowTrainer:
         self.set_seed(args.seed)
 
     def set_seed(self, seed: int):
-        """设置随机种子"""
         import random
         random.seed(seed)
         torch.manual_seed(seed)
@@ -268,9 +167,7 @@ class EditFlowTrainer:
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
-    
     def prepare_data(self):
-        """准备训练数据，按维度分组"""
         print("生成三元组训练数据...")
         samples = generate_triplet_samples(
             num_samples=self.args.num_samples,
@@ -279,15 +176,11 @@ class EditFlowTrainer:
             max_depth=self.args.max_depth
         )
 
-        # 按维度分组样本
         dimension_groups = {}
         for sample in samples:
             dim = sample['input_dimension']
-            if dim not in dimension_groups:
-                dimension_groups[dim] = []
-            dimension_groups[dim].append(sample)
+            dimension_groups.setdefault(dim, []).append(sample)
 
-        # 为每个维度创建独立的DataLoader
         dataloaders = {}
         datasets = {}
 
@@ -295,11 +188,8 @@ class EditFlowTrainer:
             print(f"维度 {dim}: {len(dim_samples)} 个样本")
             dataset = TripletDataset(dim_samples, vocab_size=self.args.vocab_size)
             dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=self.args.batch_size,
-                shuffle=True,
-                num_workers=0,  # 设为0避免多进程问题
-                collate_fn=custom_collate_fn
+                dataset, batch_size=self.args.batch_size, shuffle=True,
+                num_workers=0, collate_fn=custom_collate_fn
             )
             dataloaders[dim] = dataloader
             datasets[dim] = dataset
@@ -307,15 +197,12 @@ class EditFlowTrainer:
         return dataloaders, datasets, dimension_groups
 
     def setup_models(self):
-        """设置模型和损失函数"""
         print("初始化条件编码器...")
-        # 初始化条件编码器
         condition_encoder = ConditionEncoder().to(self.device)
 
-        # 先创建一个临时模型来获取实际配置
-        print(f"初始化EditFlow模型...")
+        print("初始化EditFlow模型...")
         temp_config = EditFlowConfig(
-            vocab_size=self.args.vocab_size,  # 使用原始vocab_size
+            vocab_size=self.args.vocab_size,
             hidden_dim=self.args.hidden_dim,
             num_layers=self.args.num_layers,
             num_heads=self.args.num_heads,
@@ -325,12 +212,9 @@ class EditFlowTrainer:
             base_model_name="openai-community/gpt2"
         )
         temp_model = EditFlowTransformer(temp_config)
-
-        # 获取模型实际的vocab_size
         actual_vocab_size = temp_model.base_model.config.vocab_size
         print(f"模型实际vocab_size: {actual_vocab_size}")
 
-        # 使用实际vocab_size创建最终模型
         config = EditFlowConfig(
             vocab_size=actual_vocab_size,
             hidden_dim=self.args.hidden_dim,
@@ -344,10 +228,7 @@ class EditFlowTrainer:
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
 
-        # 初始化损失函数
         criterion = EditFlowLoss(scheduler_type='cubic')
-
-        # 初始化优化器
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate,
@@ -357,58 +238,38 @@ class EditFlowTrainer:
         return model, condition_encoder, criterion, optimizer, actual_vocab_size
 
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
-        """训练一个epoch"""
         model.train()
         condition_encoder.train()
 
         total_loss = 0.0
         num_batches = 0
-
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
 
         for batch in progress_bar:
-            # 提取数据
-            x_values = batch['x_values'].to(self.device)  # (batch_size, n_points, dimension)
-            residuals = batch['residuals'].to(self.device)  # (batch_size, n_points)
-            curr_token_ids = batch['curr_token_ids'].to(self.device)  # (batch_size, seq_len)
-            target_token_ids = batch['target_token_ids'].to(self.device)  # (batch_size, seq_len)
-            alignment = batch['alignment']  # List of alignment sequences
+            x_values = batch['x_values'].to(self.device)
+            residuals = batch['residuals'].to(self.device)
+            curr_token_ids = batch['curr_token_ids'].to(self.device)
+            target_token_ids = batch['target_token_ids'].to(self.device)
+            alignment = batch['alignment']
 
-            # 采样时间步
             t = torch.rand(curr_token_ids.size(0), 1, device=self.device)
+            condition = condition_encoder(x_values, residuals)
 
-            # 条件编码：编码残差
-            condition = condition_encoder(x_values, residuals)  # (batch_size, condition_dim)
-
-            # 生成插值序列 (简化的条件路径)
             import random
-            if random.random() < 0.5:  # 50%概率使用curr，50%使用插值
-                x_t = curr_token_ids
-            else:
-                x_t = sample_conditional_path(curr_token_ids, target_token_ids, t, criterion.scheduler)
+            x_t = curr_token_ids if random.random() < 0.5 else sample_conditional_path(
+                curr_token_ids, target_token_ids, t, criterion.scheduler
+            )
 
-            # 创建attention mask
             attention_mask = (x_t != dataset.pad_token).float()
-
-            # 前向传播
             pred_rates, pred_ins_probs, pred_sub_probs = model(
-                input_ids=x_t,
-                time_steps=t,
-                condition=condition,
-                attention_mask=attention_mask
+                input_ids=x_t, time_steps=t, condition=condition, attention_mask=attention_mask
             )
 
-            # 计算损失
             loss = criterion(
-                pred_rates=pred_rates,
-                pred_ins_probs=pred_ins_probs,
-                pred_sub_probs=pred_sub_probs,
-                alignment=alignment,
-                t=t,
-                vocab_size=model.config.vocab_size
+                pred_rates=pred_rates, pred_ins_probs=pred_ins_probs, pred_sub_probs=pred_sub_probs,
+                alignment=alignment, t=t, vocab_size=model.config.vocab_size
             )
 
-            # 反向传播
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -417,60 +278,43 @@ class EditFlowTrainer:
 
             total_loss += loss.item()
             num_batches += 1
-
-            # 更新进度条
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss/num_batches:.4f}'
-            })
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'avg_loss': f'{total_loss/num_batches:.4f}'})
 
         return total_loss / num_batches, num_batches
 
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
-        """保存检查点"""
         import os
         checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
         torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
             'condition_encoder_state_dict': condition_encoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss,
-            'config': config,
-            'args': self.args
+            'optimizer_state_dict': optimizer.state_dict(), 'loss': loss,
+            'config': config, 'args': self.args
         }, checkpoint_path)
 
         return checkpoint_path
 
     def train(self):
-        """完整的训练流程"""
         print(f"使用设备: {self.device}")
 
-        # 准备数据
         dataloaders, datasets, dimension_groups = self.prepare_data()
-
-        # 设置模型
         model, condition_encoder, criterion, optimizer, actual_vocab_size = self.setup_models()
 
-        # 更新所有datasets的vocab_size
         for dataset in datasets.values():
             dataset.vocab_size = actual_vocab_size
-            dataset.pad_token = actual_vocab_size - 1  # 使用最后一个有效token作为PAD
-            dataset.bos_token = actual_vocab_size - 2  # 使用倒数第二个作为BOS
+            dataset.pad_token = actual_vocab_size - 1
+            dataset.bos_token = actual_vocab_size - 2
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
-
-        # 训练循环
         print(f"开始训练 ({self.args.num_epochs} epochs)...")
 
         for epoch in range(self.args.num_epochs):
             total_loss = 0.0
             total_batches = 0
 
-            # 按维度分别训练
             for dim, dataloader in dataloaders.items():
                 print(f"\n训练维度 {dim} 的数据...")
                 dataset = datasets[dim]
@@ -485,15 +329,12 @@ class EditFlowTrainer:
             avg_loss = total_loss / total_batches
             print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 总体平均损失: {avg_loss:.4f}")
 
-            # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
                 checkpoint_path = self.save_checkpoint(
-                    model, condition_encoder, optimizer, avg_loss,
-                    epoch, model.config
+                    model, condition_encoder, optimizer, avg_loss, epoch, model.config
                 )
                 print(f"检查点已保存到: {checkpoint_path}")
 
-        # 保存最终模型
         import os
         final_model_path = os.path.join(self.args.save_dir, "editflow_final.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
@@ -508,5 +349,4 @@ class EditFlowTrainer:
         }, final_model_path)
 
         print(f"最终模型已保存到: {final_model_path}")
-
         return model, condition_encoder
