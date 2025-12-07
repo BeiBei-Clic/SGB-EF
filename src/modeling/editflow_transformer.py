@@ -1,20 +1,20 @@
 """
-EditFlow Transformer - 基于GPT的符号回归编辑流模型
+EditFlow Transformer - 基于Transformer的符号回归编辑流模型
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, PretrainedConfig, GPT2Model, GPT2Config
+from transformers import PreTrainedModel, PretrainedConfig, AutoModel, AutoConfig
 import math
 
 
 class EditFlowConfig(PretrainedConfig):
     model_type = "editflow"
 
-    def __init__(self, vocab_size=50257, hidden_dim=768, num_layers=12, num_heads=12,
-                 max_seq_len=1024, dropout=0.1, pad_token_id=0, condition_dim=None,
-                 base_model_name="openai-community/gpt2", use_condition_injection=True,
+    def __init__(self, vocab_size=50265, hidden_dim=768, num_layers=6, num_heads=12,
+                 max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
+                 base_model_name="distilroberta-base", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.vocab_size = vocab_size
@@ -88,18 +88,7 @@ class EditFlowTransformer(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        # 创建GPT模型
-        gpt_config = GPT2Config(
-            vocab_size=config.vocab_size,
-            n_embd=config.hidden_dim,
-            n_layer=config.num_layers,
-            n_head=config.num_heads,
-            n_positions=config.max_seq_len,
-            resid_pdrop=config.dropout,
-            embd_pdrop=config.dropout,
-            attn_pdrop=config.dropout,
-        )
-
+        # 加载预训练的transformer模型
         if hasattr(config, 'base_model_name') and config.base_model_name:
             # 设置缓存目录
             import os
@@ -108,21 +97,26 @@ class EditFlowTransformer(PreTrainedModel):
             cache_dir = os.path.join(project_root, "models", "huggingface_cache")
             os.makedirs(cache_dir, exist_ok=True)
 
-            print(f"正在加载GPT基础模型: {config.base_model_name}")
+            print(f"正在加载基础模型: {config.base_model_name}")
             print(f"模型缓存目录: {cache_dir}")
 
-            # 加载预训练的GPT模型，会自动显示下载进度
-            self.gpt_model = GPT2Model.from_pretrained(
+            # 加载预训练模型，自动适应架构
+            self.base_model = AutoModel.from_pretrained(
                 config.base_model_name,
-                config=gpt_config,
-                cache_dir=cache_dir
+                cache_dir=cache_dir,
+                trust_remote_code=True
             )
-            print("✓ GPT基础模型加载完成")
-        else:
-            print("使用随机初始化的GPT模型")
-            self.gpt_model = GPT2Model(gpt_config)
+            print("✓ 基础模型加载完成")
 
-        # 自定义嵌入层（GPT已经内置位置嵌入，但我们添加额外的位置和时间嵌入）
+            # 自动获取模型配置
+            self.model_config = self.base_model.config
+            config.hidden_dim = getattr(self.model_config, 'hidden_size', config.hidden_dim)
+            config.num_heads = getattr(self.model_config, 'num_attention_heads', config.num_heads)
+            config.num_layers = getattr(self.model_config, 'num_hidden_layers', config.num_layers)
+        else:
+            raise ValueError("必须指定base_model_name")
+
+        # 额外的位置嵌入（与基础模型的嵌入结合使用）
         self.extra_position_embedding = nn.Embedding(config.max_seq_len, config.hidden_dim)
 
         # 时间嵌入
@@ -173,13 +167,6 @@ class EditFlowTransformer(PreTrainedModel):
     def forward(self, input_ids, time_steps, condition, attention_mask=None):
         batch_size, seq_len = input_ids.shape
 
-        # 获取GPT的token嵌入
-        token_emb = self.gpt_model.wte(input_ids)
-
-        # 额外的位置嵌入
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        extra_pos_emb = self.extra_position_embedding(positions)
-
         # 时间嵌入
         if self.config.time_embedding_type == "sinusoidal":
             time_emb = self.time_embedding(time_steps)
@@ -187,12 +174,16 @@ class EditFlowTransformer(PreTrainedModel):
             time_emb = self.time_embedding(time_steps.float())
         time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # 组合嵌入
-        inputs_embeds = token_emb + extra_pos_emb + time_emb
+        # 额外的位置嵌入
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        extra_pos_emb = self.extra_position_embedding(positions)
 
-        # 通过GPT模型
-        gpt_outputs = self.gpt_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-        hidden_states = gpt_outputs.last_hidden_state
+        # 获取基础模型的嵌入并添加时间/位置信息
+        base_outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        hidden_states = base_outputs.last_hidden_state
+
+        # 添加时间和位置嵌入
+        hidden_states = hidden_states + extra_pos_emb + time_emb
 
         # 条件注入
         condition_proj = self.condition_projection(condition)
