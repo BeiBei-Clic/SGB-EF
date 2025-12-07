@@ -6,8 +6,12 @@ import numpy as np
 import random
 import sympy as sp
 import os
+import warnings
 from typing import List, Dict, Tuple
 from tqdm import tqdm
+
+# 关闭所有RuntimeWarning警告
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 运算符定义
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
@@ -21,30 +25,77 @@ def expr_to_tree(expr: sp.Expr) -> str:
         val = float(expr)
         return str(int(round(val))) if abs(val - round(val)) < 1e-6 else str(round(val, 6))
 
+    # 检查是否有参数 - 防止某些特殊表达式导致 IndexError
+    if not hasattr(expr, 'args') or not expr.args:
+        return str(expr)
+
     func_name = str(expr.func).lower()
 
     if 'add' in func_name:
-        return 'add,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        if len(expr.args) >= 2:
+            return 'add,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        elif len(expr.args) == 1:
+            return 'add,' + expr_to_tree(expr.args[0]) + ',0'
+        else:
+            return 'add,0,0'
     elif 'sub' in func_name:
-        return 'sub,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        if len(expr.args) >= 2:
+            return 'sub,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        elif len(expr.args) == 1:
+            return 'sub,' + expr_to_tree(expr.args[0]) + ',0'
+        else:
+            return 'sub,0,0'
     elif 'mul' in func_name:
-        return 'mul,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        if len(expr.args) >= 2:
+            return 'mul,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        elif len(expr.args) == 1:
+            return 'mul,' + expr_to_tree(expr.args[0]) + ',1'
+        else:
+            return 'mul,1,1'
     elif 'div' in func_name or 'truediv' in func_name:
-        return 'div,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        if len(expr.args) >= 2:
+            return 'div,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        elif len(expr.args) == 1:
+            return 'div,' + expr_to_tree(expr.args[0]) + ',1'
+        else:
+            return 'div,0,1'
     elif 'pow' in func_name:
-        return 'pow,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        if len(expr.args) >= 2:
+            return 'pow,' + expr_to_tree(expr.args[0]) + ',' + expr_to_tree(expr.args[1])
+        elif len(expr.args) == 1:
+            return 'pow,' + expr_to_tree(expr.args[0]) + ',1'
+        else:
+            return 'pow,1,1'
     elif 'sin' in func_name:
-        return 'sin,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'sin,' + expr_to_tree(expr.args[0])
+        else:
+            return 'sin,0'
     elif 'cos' in func_name:
-        return 'cos,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'cos,' + expr_to_tree(expr.args[0])
+        else:
+            return 'cos,0'
     elif 'tan' in func_name:
-        return 'tan,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'tan,' + expr_to_tree(expr.args[0])
+        else:
+            return 'tan,0'
     elif 'exp' in func_name:
-        return 'exp,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'exp,' + expr_to_tree(expr.args[0])
+        else:
+            return 'exp,0'
     elif 'log' in func_name:
-        return 'log,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'log,' + expr_to_tree(expr.args[0])
+        else:
+            return 'log,1'
     elif 'sqrt' in func_name:
-        return 'sqrt,' + expr_to_tree(expr.args[0])
+        if len(expr.args) >= 1:
+            return 'sqrt,' + expr_to_tree(expr.args[0])
+        else:
+            return 'sqrt,0'
     else:
         # 对于未识别的表达式，返回其字符串表示
         return str(expr)
@@ -336,15 +387,3 @@ def save_triplets_to_txt(samples: List[Dict], filename: str):
 
     print(f"已保存 {len(samples)} 个三元组样本到 {filepath}")
 
-if __name__ == "__main__":
-    # 测试数据生成器
-    print("开始生成并保存样本...")
-    samples = generate_samples(
-        num_samples=50,
-        max_dim=5,
-        n_points=100,
-        max_depth=4
-    )
-
-    save_to_txt(samples, "symbolic_samples_simplified.txt")
-    print(f"成功生成并保存了 {len(samples)} 个样本")
