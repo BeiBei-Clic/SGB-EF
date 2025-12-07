@@ -7,11 +7,27 @@ import random
 import sympy as sp
 import os
 import warnings
+import time
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
 # 关闭所有RuntimeWarning警告
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+def timed_simplify(expr: sp.Expr, max_time: float = 1) -> sp.Expr:
+    """带时间限制的化简函数"""
+    start_time = time.time()
+    simplified = expr
+
+    # 使用更简单的化简策略，限制时间
+    # 只进行基本的化简，避免复杂的trig简化
+    if time.time() - start_time < max_time:
+        simplified = sp.together(simplified)
+
+    if time.time() - start_time < max_time:
+        simplified = sp.radsimp(simplified)
+
+    return simplified
 
 # 运算符定义
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
@@ -118,7 +134,8 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
         else:
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
-    return sp.simplify(generate_expr(0))
+    # 使用带时间限制的化简
+    return timed_simplify(generate_expr(0), max_time=1)
 
 def apply_unary_op(op: str, operand: sp.Expr) -> sp.Expr:
     """应用一元运算符"""
@@ -126,9 +143,9 @@ def apply_unary_op(op: str, operand: sp.Expr) -> sp.Expr:
         'sin': sp.sin,
         'cos': sp.cos,
         'tan': sp.tan,
-        'exp': sp.exp,
-        'log': lambda x: sp.log(abs(x) + 1e-8),
-        'sqrt': lambda x: sp.sqrt(abs(x)),
+        'exp': lambda x: sp.exp(x) / (1 + sp.exp(x-20)),  # 避免指数爆炸，使用sigmoid
+        'log': lambda x: sp.log(abs(x) + sp.Rational(1, 1000)),  # 避免log(0)
+        'sqrt': lambda x: sp.sqrt(abs(x)),  # 移除数值检查，在evaluate阶段处理
     }
     return op_map.get(op, lambda x: x)(operand)
 
@@ -138,8 +155,8 @@ def apply_binary_op(op: str, left: sp.Expr, right: sp.Expr) -> sp.Expr:
         'add': lambda l, r: l + r,
         'sub': lambda l, r: l - r,
         'mul': lambda l, r: l * r,
-        'div': lambda l, r: l / (r + sp.Rational(1, 100)),
-        'pow': lambda l, r: l ** r
+        'div': lambda l, r: l / (r + sp.Rational(1, 100)),  # 已经加了小常数避免除零
+        'pow': lambda l, r: l ** r  # 移除数值检查，在evaluate阶段处理
     }
     return op_map.get(op, lambda l, r: l + r)(left, right)
 
@@ -149,8 +166,9 @@ def corrupt_expression(expr: sp.Expr, corruption_prob: float = 0.5) -> sp.Expr:
         corruption_type = random.choice(['simplify', 'replace_constant', 'mutate_operator'])
 
         if corruption_type == 'simplify':
-            # 简化表达式
-            return sp.simplify(expr * random.uniform(0.5, 2.0))
+            # 使用带时间限制的化简
+            scaled_expr = expr * random.uniform(0.5, 2.0)
+            return timed_simplify(scaled_expr, max_time=1)
 
         elif corruption_type == 'replace_constant':
             # 替换常数为随机值
