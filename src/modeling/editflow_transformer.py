@@ -14,7 +14,7 @@ class EditFlowConfig(PretrainedConfig):
 
     def __init__(self, vocab_size=50257, hidden_dim=768, num_layers=12, num_heads=12,
                  max_seq_len=1024, dropout=0.1, pad_token_id=0, condition_dim=None,
-                 base_model_name="gpt2", use_condition_injection=True,
+                 base_model_name="openai-community/gpt2", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.vocab_size = vocab_size
@@ -101,11 +101,25 @@ class EditFlowTransformer(PreTrainedModel):
         )
 
         if hasattr(config, 'base_model_name') and config.base_model_name:
-            try:
-                self.gpt_model = GPT2Model.from_pretrained(config.base_model_name, config=gpt_config)
-            except:
-                self.gpt_model = GPT2Model(gpt_config)
+            # 设置缓存目录
+            import os
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(current_dir))
+            cache_dir = os.path.join(project_root, "models", "huggingface_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+
+            print(f"正在加载GPT基础模型: {config.base_model_name}")
+            print(f"模型缓存目录: {cache_dir}")
+
+            # 加载预训练的GPT模型，会自动显示下载进度
+            self.gpt_model = GPT2Model.from_pretrained(
+                config.base_model_name,
+                config=gpt_config,
+                cache_dir=cache_dir
+            )
+            print("✓ GPT基础模型加载完成")
         else:
+            print("使用随机初始化的GPT模型")
             self.gpt_model = GPT2Model(gpt_config)
 
         # 自定义嵌入层（GPT已经内置位置嵌入，但我们添加额外的位置和时间嵌入）

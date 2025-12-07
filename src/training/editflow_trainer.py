@@ -242,9 +242,10 @@ class EditFlowTrainer:
 
     def setup_models(self):
         """设置模型和损失函数"""
+        print("初始化条件编码器...")
         # 初始化条件编码器
         condition_encoder = ConditionEncoder().to(self.device)
-
+        print(f"初始化EditFlow模型...")
         # 初始化EditFlow模型
         config = EditFlowConfig(
             vocab_size=self.args.vocab_size + 2,  # +2 for PAD and BOS
@@ -256,6 +257,7 @@ class EditFlowTrainer:
             use_condition_injection=True
         )
         model = EditFlowTransformer(config).to(self.device)
+        print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
 
         # 初始化损失函数
         criterion = EditFlowLoss(scheduler_type='cubic')

@@ -32,10 +32,10 @@ def main():
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")
 
     # 模型参数
-    parser.add_argument("--vocab_size", type=int, default=256, help="词汇表大小")
-    parser.add_argument("--hidden_dim", type=int, default=512, help="隐藏层维度")
-    parser.add_argument("--num_layers", type=int, default=8, help="Transformer层数")
-    parser.add_argument("--num_heads", type=int, default=8, help="注意力头数")
+    parser.add_argument("--vocab_size", type=int, default=50257, help="词汇表大小")
+    parser.add_argument("--hidden_dim", type=int, default=768, help="隐藏层维度")
+    parser.add_argument("--num_layers", type=int, default=12, help="Transformer层数")
+    parser.add_argument("--num_heads", type=int, default=12, help="注意力头数")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小")

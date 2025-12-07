@@ -14,13 +14,20 @@ class ConditionEncoder(nn.Module):
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
         super().__init__()
 
-        # 设置本地缓存目录
-        cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "huggingface_cache")
+        # 设置本地缓存目录 - 使用项目根目录下的models文件夹
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        cache_dir = os.path.join(project_root, "models", "huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        # 加载Qwen模型和tokenizer到本地缓存
+        print(f"正在加载模型: {model_name}")
+        print(f"模型缓存目录: {cache_dir}")
+
+        # 加载Qwen模型和tokenizer到本地缓存，会自动显示下载进度
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+        print("✓ 主模型加载完成")
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left')
+        print("✓ Tokenizer加载完成")
 
         self.output_dim = self.model.config.hidden_size
 
