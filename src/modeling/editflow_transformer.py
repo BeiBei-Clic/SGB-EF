@@ -14,7 +14,7 @@ class EditFlowConfig(PretrainedConfig):
 
     def __init__(self, vocab_size=50265, hidden_dim=768, num_layers=6, num_heads=12,
                  max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
-                 base_model_name="distilroberta-base", use_condition_injection=True,
+                 base_model_name="gpt2", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.vocab_size = vocab_size
@@ -106,7 +106,8 @@ class EditFlowTransformer(PreTrainedModel):
                 cache_dir=cache_dir,
                 trust_remote_code=True
             )
-            print("✓ 基础模型加载完成")
+            print(f"✓ 基础模型加载完成: {type(self.base_model)}")
+            print(f"Base model class: {self.base_model.__class__}")
 
             # 自动获取模型配置
             self.model_config = self.base_model.config
@@ -186,8 +187,11 @@ class EditFlowTransformer(PreTrainedModel):
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         extra_pos_emb = self.extra_position_embedding(positions)
 
-        # 获取基础模型的嵌入并添加时间/位置信息
-        base_outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        # 获取基础模型的输出
+        base_outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
         hidden_states = base_outputs.last_hidden_state
 
         # 添加时间和位置嵌入
@@ -223,9 +227,9 @@ class EditFlowTransformer(PreTrainedModel):
 if __name__ == "__main__":
     from transformers import AutoConfig, AutoModel
 
-    # 注册模型
+    # 注册模型配置
     AutoConfig.register("editflow", EditFlowConfig)
-    AutoModel.register(EditFlowConfig, EditFlowTransformer)
+    # 注意：不要注册EditFlowTransformer到AutoModel，这会导致递归问题
 
     config = EditFlowConfig(vocab_size=1000, hidden_dim=256, num_layers=4, num_heads=8)
     model = EditFlowTransformer(config)

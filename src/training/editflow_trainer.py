@@ -296,7 +296,8 @@ class EditFlowTrainer:
             num_heads=self.args.num_heads,
             max_seq_len=64,
             condition_dim=condition_encoder.output_dim,
-            use_condition_injection=True
+            use_condition_injection=True,
+            base_model_name="gpt2"  # 添加base_model_name
         )
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")

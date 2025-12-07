@@ -38,7 +38,7 @@ def main():
     parser.add_argument("--num_heads", type=int, default=12, help="注意力头数")
 
     # 训练参数
-    parser.add_argument("--batch_size", type=int, default=32, help="批次大小")
+    parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
