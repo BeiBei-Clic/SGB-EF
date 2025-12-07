@@ -6,7 +6,8 @@ import numpy as np
 import random
 import sympy as sp
 import os
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from tqdm import tqdm
 
 # 运算符定义
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
@@ -185,6 +186,121 @@ def generate_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, ma
 
     return samples
 
+def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
+    """生成三元组样本 (E_curr, E_target, r, z) 用于EditFlow预训练"""
+    samples = []
+    dimension_count = {}
+
+    print(f"生成 {num_samples} 个三元组样本用于EditFlow预训练...")
+
+    for i in tqdm(range(num_samples), desc="生成三元组数据"):
+        # 随机选择输入维度
+        dim = random.randint(1, max_dim)
+        dimension_count[dim] = dimension_count.get(dim, 0) + 1
+
+        # 生成x值
+        if dim == 1:
+            x_values = np.linspace(-5.0, 5.0, n_points)
+        else:
+            x_values = np.random.uniform(-5.0, 5.0, (n_points, dim))
+
+        # 步骤 A: 生成 Ground Truth (GT)
+        target_expr = generate_random_expr(dim, max_depth)
+        y_target = evaluate_expr(target_expr, x_values)
+
+        # 步骤 B: 构造"中间态"公式 (Artificial Corruption)
+        curr_expr = corrupt_expression(target_expr, corruption_prob=0.7)
+        y_curr = evaluate_expr(curr_expr, x_values)
+
+        # 步骤 C: 计算数值残差 (r)
+        residuals = y_target - y_curr  # r = y_target - y_curr
+
+        # 步骤 D: 构建辅助向量 (z) - 对齐路径
+        alignment_vector = compute_expression_alignment(curr_expr, target_expr)
+
+        sample = {
+            "input_dimension": dim,
+            "x_values": x_values.tolist() if dim == 1 else x_values.tolist(),
+            "y_target": y_target.tolist(),
+            "y_curr": y_curr.tolist(),
+            "residuals": residuals.tolist(),
+            "tree_gt": expr_to_tree(target_expr),
+            "exp_gt": str(target_expr),
+            "tree_cur1": expr_to_tree(curr_expr),
+            "exp_cur1": str(curr_expr),
+            "alignment_vector": alignment_vector
+        }
+        samples.append(sample)
+
+    # 打印维度分布
+    print(f"\n样本维度分布:")
+    for dim, count in sorted(dimension_count.items()):
+        print(f"{dim}维: {count} 个样本")
+
+    return samples
+
+
+def compute_expression_alignment(curr_expr: sp.Expr, target_expr: sp.Expr) -> Dict:
+    """计算两个表达式之间的对齐路径"""
+    curr_tokens = expr_to_tree(curr_expr).split(',')
+    target_tokens = expr_to_tree(target_expr).split(',')
+
+    # 使用简化的编辑距离算法
+    alignment = levenshtein_alignment(curr_tokens, target_tokens)
+
+    return {
+        'curr_tokens': curr_tokens,
+        'target_tokens': target_tokens,
+        'alignment': alignment,
+        'edit_distance': len([op for op, _, _ in alignment if op != 'keep'])
+    }
+
+
+def levenshtein_alignment(tokens1: List[str], tokens2: List[str]) -> List[Tuple[str, str, str]]:
+    """计算两个token序列的Levenshtein对齐路径"""
+    m, n = len(tokens1), len(tokens2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    # 初始化DP表
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    # 填充DP表
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if tokens1[i-1] == tokens2[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min(
+                    dp[i-1][j],    # 删除
+                    dp[i][j-1],    # 插入
+                    dp[i-1][j-1]   # 替换
+                )
+
+    # 回溯得到对齐路径
+    alignment = []
+    i, j = m, n
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and tokens1[i-1] == tokens2[j-1]:
+            alignment.append(('keep', tokens1[i-1], tokens2[j-1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+            alignment.append(('substitute', tokens1[i-1], tokens2[j-1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+            alignment.append(('delete', tokens1[i-1], ''))
+            i -= 1
+        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
+            alignment.append(('insert', '', tokens2[j-1]))
+            j -= 1
+
+    return list(reversed(alignment))
+
+
 def save_to_txt(samples: List[Dict], filename: str):
     """将样本保存到txt文件"""
     # 确保data目录存在
@@ -201,6 +317,24 @@ def save_to_txt(samples: List[Dict], filename: str):
             f.write(line)
 
     print(f"已保存 {len(samples)} 个样本到 {filepath}")
+
+
+def save_triplets_to_txt(samples: List[Dict], filename: str):
+    """将三元组样本保存到txt文件"""
+    # 确保data目录存在
+    data_dir = "/home/xyh/SGB-EF/data"
+    os.makedirs(data_dir, exist_ok=True)
+
+    # 完整文件路径
+    filepath = os.path.join(data_dir, filename)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        for sample in samples:
+            # 简化的三元组格式保存
+            line = f'{{"x_values":{sample["x_values"]},"residuals":{sample["residuals"]},"curr_tree":"{sample["tree_cur1"]}","target_tree":"{sample["tree_gt"]}","alignment":{sample["alignment_vector"]}}}\n'
+            f.write(line)
+
+    print(f"已保存 {len(samples)} 个三元组样本到 {filepath}")
 
 if __name__ == "__main__":
     # 测试数据生成器
