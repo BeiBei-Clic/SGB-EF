@@ -2,6 +2,7 @@
 条件编码器 - 使用Hugging Face嵌入模型编码残差点集
 """
 
+import os
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
@@ -10,40 +11,31 @@ from transformers import AutoModel, AutoTokenizer
 class ConditionEncoder(nn.Module):
     """使用Hugging Face模型编码残差点集为条件向量"""
 
-    def __init__(self, model_name: str = "distilbert-base-uncased"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
         super().__init__()
 
-        # 加载预训练模型和tokenizer
-        self.model = AutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # 设置本地缓存目录
+        cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "huggingface_cache")
+        os.makedirs(cache_dir, exist_ok=True)
 
-        # 添加padding token如果不存在
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # 加载Qwen模型和tokenizer到本地缓存
+        self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left')
 
         self.output_dim = self.model.config.hidden_size
 
     def points_to_text(self, points: torch.Tensor) -> list[str]:
-        """
-        将点集直接转换为文本序列
-        Args:
-            points: (batch_size, num_points, 2) 点集数据 (x, r)
-        Returns:
-            texts: 文本序列列表
-        """
         batch_size = points.shape[0]
         texts = []
 
         for b in range(batch_size):
-            # 直接将点对转换为文本
-            point_pairs = []
+            point_texts = []
             for i in range(points.shape[1]):
                 x_val = points[b, i, 0].item()
                 r_val = points[b, i, 1].item()
-                point_pairs.append(f"{x_val:.6f},{r_val:.6f}")
+                point_texts.append(f"Data point: x={x_val:.6f}, r={r_val:.6f}")
 
-            # 用空格分隔所有点对
-            text = " ".join(point_pairs)
+            text = " ".join(point_texts)
             texts.append(text)
 
         return texts
@@ -68,28 +60,26 @@ class ConditionEncoder(nn.Module):
         # 转换为文本
         texts = self.points_to_text(points)
 
+        # 添加任务指令
+        task = "Generate numerical embeddings for symbolic regression data points"
+        texts = [f"Instruct: {task}\nQuery: {text}" for text in texts]
+
         # 编码文本
         inputs = self.tokenizer(
             texts,
-            return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
+            return_tensors="pt"
         )
 
-        # 移动到正确设备
         device = points.device
         for key in inputs:
             inputs[key] = inputs[key].to(device)
 
-        # 通过模型获取嵌入
         outputs = self.model(**inputs)
-
-        # 使用pooled output或最后一个hidden state的平均值
-        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-            condition = outputs.pooler_output
-        else:
-            condition = outputs.last_hidden_state.mean(dim=1)
+        embeddings = outputs.last_hidden_state[:, -1]
+        condition = torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
         return condition
 
@@ -97,7 +87,7 @@ class ConditionEncoder(nn.Module):
 # 测试代码
 if __name__ == "__main__":
     # 创建条件编码器
-    encoder = ConditionEncoder(model_name="distilbert-base-uncased")
+    encoder = ConditionEncoder(model_name="Qwen/Qwen3-Embedding-0.6B")
 
     # 测试数据
     batch_size = 2
