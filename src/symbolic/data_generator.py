@@ -208,9 +208,9 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
-    # 生成x值
+    # 生成x值，统一为2D数组格式
     if input_dimension == 1:
-        x_values = np.linspace(-5.0, 5.0, n_points)
+        x_values = np.linspace(-5.0, 5.0, n_points).reshape(-1, 1)  # 确保是2D: (n_points, 1)
     else:
         x_values = np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
 
@@ -267,9 +267,9 @@ def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int =
         dim = random.randint(1, max_dim)
         dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
-        # 生成x值
+        # 生成x值，统一为2D数组格式
         if dim == 1:
-            x_values = np.linspace(-5.0, 5.0, n_points)
+            x_values = np.linspace(-5.0, 5.0, n_points).reshape(-1, 1)  # 确保是2D: (n_points, 1)
         else:
             x_values = np.random.uniform(-5.0, 5.0, (n_points, dim))
 
@@ -289,7 +289,7 @@ def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int =
 
         sample = {
             "input_dimension": dim,
-            "x_values": x_values.tolist() if dim == 1 else x_values.tolist(),
+            "x_values": x_values.tolist(),
             "y_target": y_target.tolist(),
             "y_curr": y_curr.tolist(),
             "residuals": residuals.tolist(),

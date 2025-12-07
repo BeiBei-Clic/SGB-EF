@@ -51,8 +51,8 @@ class ConditionEncoder(nn.Module):
         """
         编码残差点集
         Args:
-            x_values: (batch_size, num_points) x值
-            residuals: (batch_size, num_points) 残差值
+            x_values: (batch_size, num_points, input_dim) x值
+            residuals: (batch_size, num_points, 1) 残差值
         Returns:
             condition: (batch_size, output_dim) 条件向量
         """
@@ -60,9 +60,13 @@ class ConditionEncoder(nn.Module):
         if x_values.dim() == 2:
             x_values = x_values.unsqueeze(-1)  # (batch_size, num_points, 1)
 
+        # residuals 应该已经是 (batch_size, num_points, 1)
+        if residuals.dim() == 2:
+            residuals = residuals.unsqueeze(-1)  # (batch_size, num_points, 1)
+
         # 拼接x值和残差
-        points = torch.cat([x_values, residuals.unsqueeze(-1)], dim=-1)
-        # (batch_size, num_points, 2)
+        points = torch.cat([x_values, residuals], dim=-1)
+        # (batch_size, num_points, input_dim + 1)
 
         # 转换为文本
         texts = self.points_to_text(points)

@@ -67,6 +67,10 @@ class TripletDataset(torch.utils.data.Dataset):
         x_values = torch.FloatTensor(sample['x_values'])
         residuals = torch.FloatTensor(sample['residuals'])
 
+        # 确保residuals是2D格式: (n_points, 1) - 对应标量输出
+        if residuals.dim() == 1:
+            residuals = residuals.unsqueeze(-1)  # (n_points,) -> (n_points, 1)
+
         # Token化表达式
         curr_tokens = self._tokenize_expression(sample['tree_cur1'])
         target_tokens = self._tokenize_expression(sample['tree_gt'])
@@ -195,11 +199,31 @@ class EditFlowLoss:
         return loss.mean()
 
 
+
+
 def sample_conditional_path(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, scheduler) -> torch.Tensor:
     """从x0到x1的条件路径采样"""
     # 简化的线性插值
     t = t.view(-1, 1, 1)
     return ((1 - scheduler(t)) * x0 + scheduler(t) * x1).long()
+
+
+def custom_collate_fn(batch):
+    """自定义collate函数，处理不同长度的alignment数据"""
+    # 分离不同字段
+    x_values = torch.stack([item['x_values'] for item in batch])
+    residuals = torch.stack([item['residuals'] for item in batch])
+    curr_token_ids = torch.stack([item['curr_token_ids'] for item in batch])
+    target_token_ids = torch.stack([item['target_token_ids'] for item in batch])
+    alignment = [item['alignment'] for item in batch]  # 保持为列表
+
+    return {
+        'x_values': x_values,
+        'residuals': residuals,
+        'curr_token_ids': curr_token_ids,
+        'target_token_ids': target_token_ids,
+        'alignment': alignment
+    }
 
 
 class EditFlowTrainer:
@@ -220,8 +244,9 @@ class EditFlowTrainer:
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
+    
     def prepare_data(self):
-        """准备训练数据"""
+        """准备训练数据，按维度分组"""
         print("生成三元组训练数据...")
         samples = generate_triplet_samples(
             num_samples=self.args.num_samples,
@@ -230,15 +255,32 @@ class EditFlowTrainer:
             max_depth=self.args.max_depth
         )
 
-        dataset = TripletDataset(samples, vocab_size=self.args.vocab_size)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=2
-        )
+        # 按维度分组样本
+        dimension_groups = {}
+        for sample in samples:
+            dim = sample['input_dimension']
+            if dim not in dimension_groups:
+                dimension_groups[dim] = []
+            dimension_groups[dim].append(sample)
 
-        return dataloader, dataset
+        # 为每个维度创建独立的DataLoader
+        dataloaders = {}
+        datasets = {}
+
+        for dim, dim_samples in dimension_groups.items():
+            print(f"维度 {dim}: {len(dim_samples)} 个样本")
+            dataset = TripletDataset(dim_samples, vocab_size=self.args.vocab_size)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=0,  # 设为0避免多进程问题
+                collate_fn=custom_collate_fn
+            )
+            dataloaders[dim] = dataloader
+            datasets[dim] = dataset
+
+        return dataloaders, datasets, dimension_groups
 
     def setup_models(self):
         """设置模型和损失函数"""
@@ -271,7 +313,7 @@ class EditFlowTrainer:
 
         return model, condition_encoder, criterion, optimizer
 
-    def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch):
+    def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
         """训练一个epoch"""
         model.train()
         condition_encoder.train()
@@ -279,11 +321,11 @@ class EditFlowTrainer:
         total_loss = 0.0
         num_batches = 0
 
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs}")
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
 
         for batch in progress_bar:
             # 提取数据
-            x_values = batch['x_values'].to(self.device)  # (batch_size, n_points)
+            x_values = batch['x_values'].to(self.device)  # (batch_size, n_points, dimension)
             residuals = batch['residuals'].to(self.device)  # (batch_size, n_points)
             curr_token_ids = batch['curr_token_ids'].to(self.device)  # (batch_size, seq_len)
             target_token_ids = batch['target_token_ids'].to(self.device)  # (batch_size, seq_len)
@@ -339,7 +381,7 @@ class EditFlowTrainer:
                 'avg_loss': f'{total_loss/num_batches:.4f}'
             })
 
-        return total_loss / num_batches
+        return total_loss / num_batches, num_batches
 
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
         """保存检查点"""
@@ -364,7 +406,7 @@ class EditFlowTrainer:
         print(f"使用设备: {self.device}")
 
         # 准备数据
-        dataloader, dataset = self.prepare_data()
+        dataloaders, datasets, dimension_groups = self.prepare_data()
 
         # 设置模型
         model, condition_encoder, criterion, optimizer = self.setup_models()
@@ -376,12 +418,23 @@ class EditFlowTrainer:
         print(f"开始训练 ({self.args.num_epochs} epochs)...")
 
         for epoch in range(self.args.num_epochs):
-            avg_loss = self.train_epoch(
-                model, condition_encoder, criterion, optimizer,
-                dataloader, dataset, epoch
-            )
+            total_loss = 0.0
+            total_batches = 0
 
-            print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 平均损失: {avg_loss:.4f}")
+            # 按维度分别训练
+            for dim, dataloader in dataloaders.items():
+                print(f"\n训练维度 {dim} 的数据...")
+                dataset = datasets[dim]
+                dim_loss, dim_batches = self.train_epoch(
+                    model, condition_encoder, criterion, optimizer,
+                    dataloader, dataset, epoch, dim
+                )
+                total_loss += dim_loss * dim_batches
+                total_batches += dim_batches
+                print(f"维度 {dim} 平均损失: {dim_loss:.4f}")
+
+            avg_loss = total_loss / total_batches
+            print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 总体平均损失: {avg_loss:.4f}")
 
             # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:

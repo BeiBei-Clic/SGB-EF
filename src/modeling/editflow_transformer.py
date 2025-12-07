@@ -165,7 +165,15 @@ class EditFlowTransformer(PreTrainedModel):
         self.post_init()
 
     def forward(self, input_ids, time_steps, condition, attention_mask=None):
-        batch_size, seq_len = input_ids.shape
+        print(f"EditFlow input_ids.shape: {input_ids.shape}")
+        print(f"EditFlow input_ids.ndim: {input_ids.ndim}")
+        if input_ids.ndim == 2:
+            batch_size, seq_len = input_ids.shape
+        elif input_ids.ndim == 3:
+            batch_size, seq_len, _ = input_ids.shape
+            input_ids = input_ids.squeeze(-1)  # 移除多余的维度
+        else:
+            raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
         # 时间嵌入
         if self.config.time_embedding_type == "sinusoidal":
@@ -179,7 +187,7 @@ class EditFlowTransformer(PreTrainedModel):
         extra_pos_emb = self.extra_position_embedding(positions)
 
         # 获取基础模型的嵌入并添加时间/位置信息
-        base_outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        base_outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = base_outputs.last_hidden_state
 
         # 添加时间和位置嵌入
