@@ -93,16 +93,24 @@ class EditFlowLoss:
         self.func_map = self._build_function_map() if tokenizer else {}
 
     def _build_function_map(self):
-        """使用分词器构建函数token映射"""
+        """使用分词器构建函数token映射（增强验证）"""
         function_names = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
         func_map = {}
 
         for func_name in function_names:
             # 使用分词器编码函数名，获取token ID
             tokens = self.tokenizer.encode(func_name, add_special_tokens=False)
-            if tokens:
-                # 使用第一个token的ID作为映射
+            if len(tokens) == 1:
+                # 理想情况：函数名被分词为单个token
                 func_map[func_name] = tokens[0]
+                print(f"Function '{func_name}' mapped to token {tokens[0]} (single token)")
+            elif len(tokens) > 1:
+                # 警告：函数名被拆分为多个token
+                print(f"Warning: Function '{func_name}' tokenized as {len(tokens)} tokens: {tokens}")
+                print(f"Token texts: {[self.tokenizer.decode([t]) for t in tokens]}")
+                # 仍然使用第一个token，但记录警告
+                func_map[func_name] = tokens[0]
+                print(f"Using first token {tokens[0]} for function '{func_name}'")
             else:
                 print(f"Warning: Function '{func_name}' not found in tokenizer vocabulary")
 
