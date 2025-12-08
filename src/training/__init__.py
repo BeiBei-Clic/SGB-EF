@@ -2,7 +2,7 @@
 训练模块
 """
 
-from .editflow_trainer import ContinuousFlowTrainer, FlowDataset, ContinuousFlowLoss
+from .editflow_manager import EditFlowManager, FlowDataset, ContinuousFlowLoss
 from .euler_sampler import EulerSampler
 
-__all__ = ['ContinuousFlowTrainer', 'FlowDataset', 'ContinuousFlowLoss', 'EulerSampler']
+__all__ = ['EditFlowManager', 'FlowDataset', 'ContinuousFlowLoss', 'EulerSampler']

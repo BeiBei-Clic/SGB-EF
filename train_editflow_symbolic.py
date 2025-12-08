@@ -9,7 +9,7 @@ import random
 import numpy as np
 import torch
 
-from src.training.editflow_trainer import ContinuousFlowTrainer
+from src.training.editflow_manager import EditFlowManager
 from src.utils.gpu_monitor import display_gpu_info
 
 
@@ -66,11 +66,11 @@ def main():
     # 设置随机种子
     set_seed(args.seed)
 
-    # 创建连续流训练器并开始训练
-    trainer = ContinuousFlowTrainer(args)
-    model, condition_encoder = trainer.train()
+    # 创建EditFlow管理器并开始训练
+    manager = EditFlowManager(args)
+    model, condition_encoder = manager.train()
 
-    print("\n连续流训练完成!")
+    print("\nEditFlow训练完成!")
 
 
 if __name__ == "__main__":

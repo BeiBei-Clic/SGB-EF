@@ -4,7 +4,7 @@ import sys
 sys.path.append('/home/xyh/SGB-EF')
 
 from src.symbolic.data_generator import generate_triplet_samples
-from src.training.editflow_trainer import TripletDataset
+from src.training.editflow_manager import TripletDataset
 import torch
 
 # 生成小批量数据
@@ -46,7 +46,7 @@ for dim, dim_samples in dim_groups.items():
 
     # 尝试创建DataLoader
     try:
-        from src.training.editflow_trainer import custom_collate_fn
+        from src.training.editflow_manager import custom_collate_fn
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=2, shuffle=False, num_workers=0, collate_fn=custom_collate_fn
         )

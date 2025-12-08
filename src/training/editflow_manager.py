@@ -299,8 +299,8 @@ def custom_collate_fn(batch):
     }
 
 
-class ContinuousFlowTrainer:
-    """连续流EditFlow模型训练器"""
+class EditFlowManager:
+    """EditFlow模型管理器 - 支持训练和推理功能"""
 
     def __init__(self, args):
         self.args = args
@@ -413,6 +413,118 @@ class ContinuousFlowTrainer:
             return model.module.config
         return model.config
 
+    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config):
+        """
+        执行模型前向传播，返回预测结果和损失计算所需的所有数据
+
+        Args:
+            model: EditFlow模型
+            condition_embeddings: 预计算的条件嵌入向量
+            z0_token_ids: 起始token序列
+            z1_token_ids: 目标token序列
+            dataset: 数据集对象
+            config: 模型配置
+
+        Returns:
+            dict: 包含预测结果和损失计算所需数据的字典
+        """
+        # 随机采样时间步
+        batch_size = z0_token_ids.size(0)
+        t = torch.rand(batch_size, 1, device=self.device)
+
+        # 计算词汇表大小（包括gap token）
+        effective_vocab_size = max(dataset.gap_token + 1, config.vocab_size + 200)
+
+        # 在Z空间中插值采样
+        z0_probs = tokens_to_prob(z0_token_ids, effective_vocab_size)
+        z1_probs = tokens_to_prob(z1_token_ids, effective_vocab_size)
+        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
+
+        # 移除gap token，得到x_t
+        gap_token = dataset.gap_token
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
+            z_t, effective_vocab_size, dataset.pad_token, gap_token
+        )
+
+        # 模型前向传播
+        attention_mask = (~x_pad_mask).float()
+        pred_rates, pred_ins_probs, pred_sub_probs = model(
+            input_ids=x_t, time_steps=t, condition=condition_embeddings, attention_mask=attention_mask
+        )
+
+        return {
+            'pred_rates': pred_rates,
+            'pred_ins_probs': pred_ins_probs,
+            'pred_sub_probs': pred_sub_probs,
+            'x_t': x_t,
+            'z_t': z_t,
+            'z1_token_ids': z1_token_ids,
+            'z_gap_mask': z_gap_mask,
+            'z_pad_mask': z_pad_mask,
+            't': t,
+            'effective_vocab_size': effective_vocab_size,
+            'gap_token': gap_token
+        }
+
+    def compute_loss(self, forward_results, criterion, dataset):
+        """
+        根据前向传播结果计算损失
+
+        Args:
+            forward_results: forward_pass返回的结果字典
+            criterion: 损失函数
+            dataset: 数据集对象
+
+        Returns:
+            torch.Tensor: 计算得到的损失
+        """
+        pred_rates = forward_results['pred_rates']
+        pred_ins_probs = forward_results['pred_ins_probs']
+        pred_sub_probs = forward_results['pred_sub_probs']
+        x_t = forward_results['x_t']
+        z_t = forward_results['z_t']
+        z1_token_ids = forward_results['z1_token_ids']
+        z_gap_mask = forward_results['z_gap_mask']
+        z_pad_mask = forward_results['z_pad_mask']
+        t = forward_results['t']
+        effective_vocab_size = forward_results['effective_vocab_size']
+        gap_token = forward_results['gap_token']
+
+        # 构建编辑操作率张量
+        lambda_ins = pred_rates[:, :, 0:1]
+        lambda_sub = pred_rates[:, :, 1:2]
+        lambda_del = pred_rates[:, :, 2:3]
+
+        # 计算插入和替换的概率
+        ins_probs = lambda_ins * pred_ins_probs
+        sub_probs = lambda_sub * pred_sub_probs
+
+        # 扩展到完整的词汇表大小
+        extended_ins_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
+        extended_ins_probs[:, :, :pred_ins_probs.size(-1)] = ins_probs
+
+        extended_sub_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
+        extended_sub_probs[:, :, :pred_sub_probs.size(-1)] = sub_probs
+
+        # 组合所有操作率 (batch_size, seq_len, 2*vocab_size+1)
+        u_cat = torch.cat([
+            lambda_ins * extended_ins_probs,  # 插入操作
+            lambda_sub * extended_sub_probs,  # 替换操作
+            lambda_del                        # 删除操作
+        ], dim=-1)
+
+        # 将x_t的输出扩展到z_t空间
+        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
+
+        # 计算目标mask
+        u_mask = criterion.make_ut_mask_from_z(
+            z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.pad_token
+        )
+
+        # 计算损失
+        loss = criterion(u_z, u_mask, t, effective_vocab_size)
+        return loss
+
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
         model.train()
         condition_encoder.train()
@@ -437,76 +549,23 @@ class ContinuousFlowTrainer:
             residuals = batch['residuals'].to(self.device)
             z0_token_ids = batch['z0_token_ids'].to(self.device)
             z1_token_ids = batch['z1_token_ids'].to(self.device)
-            gap_token = batch['gap_token']
 
-            # 随机采样时间步
-            t = torch.rand(z0_token_ids.size(0), 1, device=self.device)
+            # 预计算条件嵌入（在训练循环外部一次性计算）
+            condition_embeddings = condition_encoder(x_values, residuals)
 
-            try:
-                condition = condition_encoder(x_values, residuals)
-            except Exception as e:
-                print(f"❌ 条件编码器计算错误: {e}")
-                continue
-
-            # 计算词汇表大小（包括gap token）
-            effective_vocab_size = max(dataset.gap_token + 1, config.vocab_size + 200)
-
-            # 在Z空间中插值采样
-            z0_probs = tokens_to_prob(z0_token_ids, effective_vocab_size)
-            z1_probs = tokens_to_prob(z1_token_ids, effective_vocab_size)
-            z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
-
-            # 移除gap token，得到x_t
-            x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-                z_t, effective_vocab_size, dataset.pad_token, gap_token
-            )
-
-            # 模型前向传播
-            attention_mask = (~x_pad_mask).float()
-            pred_rates, pred_ins_probs, pred_sub_probs = model(
-                input_ids=x_t, time_steps=t, condition=condition, attention_mask=attention_mask
-            )
-
-            # 构建编辑操作率张量
-            lambda_ins = pred_rates[:, :, 0:1]
-            lambda_sub = pred_rates[:, :, 1:2]
-            lambda_del = pred_rates[:, :, 2:3]
-
-            # 计算插入和替换的概率
-            ins_probs = lambda_ins * pred_ins_probs
-            sub_probs = lambda_sub * pred_sub_probs
-
-            # 扩展到完整的词汇表大小
-            extended_ins_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
-            extended_ins_probs[:, :, :pred_ins_probs.size(-1)] = ins_probs
-
-            extended_sub_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
-            extended_sub_probs[:, :, :pred_sub_probs.size(-1)] = sub_probs
-
-            # 组合所有操作率 (batch_size, seq_len, 2*vocab_size+1)
-            u_cat = torch.cat([
-                lambda_ins * extended_ins_probs,  # 插入操作
-                lambda_sub * extended_sub_probs,  # 替换操作
-                lambda_del                        # 删除操作
-            ], dim=-1)
-
-            # 将x_t的输出扩展到z_t空间
-            u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
-
-            # 计算目标mask
-            u_mask = criterion.make_ut_mask_from_z(
-                z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.pad_token
+            # 前向传播
+            forward_results = self.forward_pass(
+                model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config
             )
 
             # 计算损失
-            loss = criterion(u_z, u_mask, t, effective_vocab_size)
+            loss = self.compute_loss(forward_results, criterion, dataset)
 
             # 梯度累积
             loss = loss / gradient_accumulation_steps
             optimizer.zero_grad()
 
             if torch.isnan(loss):
-                print(f"❌ 损失为NaN，跳过反向传播")
                 continue
 
             loss.backward()
@@ -514,26 +573,13 @@ class ContinuousFlowTrainer:
             # 执行优化步骤
             if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
                 # 梯度检查
-                has_nan_gradients = False
-                if hasattr(model, 'module'):
-                    for name, param in model.module.named_parameters():
-                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                            has_nan_gradients = True
-                            print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
-                            break
-                else:
-                    for name, param in model.named_parameters():
-                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                            has_nan_gradients = True
-                            print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
-                            break
+                has_nan_gradients = self._check_gradients(model, condition_encoder)
 
                 if not has_nan_gradients:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
                     optimizer.step()
                 else:
-                    print("❌ 跳过参数更新 due to NaN/Inf gradients")
                     optimizer.zero_grad()
 
             total_loss += loss.item() * gradient_accumulation_steps
@@ -549,6 +595,41 @@ class ContinuousFlowTrainer:
             progress_bar.set_postfix(postfix_dict)
 
         return total_loss / num_batches, num_batches
+
+    def _check_gradients(self, model, condition_encoder):
+        """检查模型和条件编码器的梯度是否包含NaN或Inf"""
+        has_nan_gradients = False
+
+        # 检查模型梯度
+        if hasattr(model, 'module'):
+            for name, param in model.module.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    has_nan_gradients = True
+                    print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
+                    break
+        else:
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    has_nan_gradients = True
+                    print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
+                    break
+
+        # 检查条件编码器梯度
+        if not has_nan_gradients:
+            if hasattr(condition_encoder, 'module'):
+                for name, param in condition_encoder.module.named_parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        has_nan_gradients = True
+                        print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
+                        break
+            else:
+                for name, param in condition_encoder.named_parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        has_nan_gradients = True
+                        print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
+                        break
+
+        return has_nan_gradients
 
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
         import os

@@ -8,7 +8,7 @@ import numpy as np
 from typing import Optional, Tuple
 from tqdm import tqdm
 
-from .editflow_trainer import KappaScheduler, remove_gap_tokens, fill_gap_tokens_with_repeats
+from .editflow_manager import KappaScheduler, remove_gap_tokens, fill_gap_tokens_with_repeats
 
 
 class EulerSampler:
