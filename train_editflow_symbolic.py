@@ -35,13 +35,17 @@ def main():
     parser.add_argument("--base_model_name", type=str, default="openai-community/gpt2", help="基础模型名称")
 
     # 训练参数
-    parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
+    parser.add_argument("--batch_size", type=int, default=6, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--save_every", type=int, default=10, help="每多少轮保存一次")
+
+    # 多GPU参数
+    parser.add_argument("--use_data_parallel", action="store_true", default=True, help="是否使用多GPU并行训练")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
 
     args = parser.parse_args()
 
@@ -52,6 +56,20 @@ def main():
     print(f"训练轮数: {args.num_epochs}")
     print(f"学习率: {args.learning_rate}")
     print(f"基础模型: {args.base_model_name}")
+    print(f"多GPU并行: {args.use_data_parallel}")
+    print(f"梯度累积步数: {args.gradient_accumulation_steps}")
+
+    # 显示GPU信息
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        print(f"\n=== GPU信息 ===")
+        print(f"GPU数量: {gpu_count}")
+        for i in range(gpu_count):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            print(f"GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
+    else:
+        print("\n警告: 未检测到GPU，将使用CPU训练")
 
     # 设置随机种子
     set_seed(args.seed)

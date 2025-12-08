@@ -12,6 +12,7 @@ from ..symbolic.data_generator import generate_triplet_samples
 from ..modeling.condition_encoder import ConditionEncoder
 from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
 from ..utils.special_tokens import SpecialTokensManager
+from ..utils.gpu_monitor import get_gpu_memory_info, get_gpu_memory_usage_string
 
 
 class TripletDataset(torch.utils.data.Dataset):
@@ -209,6 +210,16 @@ class EditFlowTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.set_seed(args.seed)
 
+        # 多GPU设置
+        self.use_data_parallel = getattr(args, 'use_data_parallel', False) and torch.cuda.is_available()
+        if self.use_data_parallel:
+            self.gpu_count = torch.cuda.device_count()
+            self.device_ids = list(range(self.gpu_count))
+            print(f"多GPU模式: 使用 {self.gpu_count} 块GPU")
+        else:
+            self.gpu_count = 1
+            self.device_ids = [0] if torch.cuda.is_available() else None
+
     def set_seed(self, seed: int):
         import random
         random.seed(seed)
@@ -272,7 +283,15 @@ class EditFlowTrainer:
         # vocab_size 将从tokenizer动态获取
         config.vocab_size = tokenizer.vocab_size
         model = EditFlowTransformer(config).to(self.device)
-        print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
+
+        # 使用DataParallel包装模型以支持多GPU
+        if self.use_data_parallel and self.gpu_count > 1:
+            print(f"使用DataParallel包装模型...")
+            model = torch.nn.DataParallel(model, device_ids=self.device_ids)
+            condition_encoder = torch.nn.DataParallel(condition_encoder, device_ids=self.device_ids)
+
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"EditFlow模型参数数量: {total_params:,}")
 
         criterion = EditFlowLoss(scheduler_type='cubic', tokenizer=tokenizer)
         optimizer = torch.optim.AdamW(
@@ -281,7 +300,20 @@ class EditFlowTrainer:
             weight_decay=self.args.weight_decay
         )
 
+        # 多GPU设置优化
+        if self.use_data_parallel and self.gpu_count > 1:
+            # 为多GPU训练优化batch size
+            effective_batch_size = self.args.batch_size * self.gpu_count
+            print(f"有效批次大小: {effective_batch_size} (每个GPU: {self.args.batch_size})")
+            # 如果需要，可以在这里添加梯度累积逻辑
+
         return model, condition_encoder, criterion, optimizer, tokenizer
+
+    def _get_model_config(self, model):
+        """获取模型配置，处理DataParallel包装"""
+        if hasattr(model, 'module'):
+            return model.module.config
+        return model.config
 
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
         model.train()
@@ -289,7 +321,19 @@ class EditFlowTrainer:
 
         total_loss = 0.0
         num_batches = 0
+        gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
+
+        # 获取模型配置
+        config = self._get_model_config(model)
+
+        # 如果使用多GPU，添加GPU使用率显示
+        if self.use_data_parallel and self.gpu_count > 1:
+            progress_bar.set_postfix({
+                'loss': '0.0000',
+                'avg_loss': '0.0000',
+                'gpus': f'{self.gpu_count}xRTX3090'
+            })
 
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
@@ -319,8 +363,11 @@ class EditFlowTrainer:
 
             loss = criterion(
                 pred_rates=pred_rates, pred_ins_probs=pred_ins_probs, pred_sub_probs=pred_sub_probs,
-                alignment=alignment, t=t, vocab_size=model.config.vocab_size
+                alignment=alignment, t=t, vocab_size=config.vocab_size
             )
+
+            # 梯度累积
+            loss = loss / gradient_accumulation_steps
 
             optimizer.zero_grad()
 
@@ -331,29 +378,69 @@ class EditFlowTrainer:
 
             loss.backward()
 
-            # 梯度检查
-            has_nan_gradients = False
-            for name, param in model.named_parameters():
-                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                    has_nan_gradients = True
-                    break
-            for name, param in condition_encoder.named_parameters():
-                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                    has_nan_gradients = True
-                    break
+            # 每gradient_accumulation_steps步或最后一个batch，执行优化步骤
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
 
-            # 如果没有NaN梯度，进行梯度裁剪和参数更新
-            if not has_nan_gradients:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
-                optimizer.step()
-            else:
-                print("❌ 跳过参数更新 due to NaN/Inf gradients")
-                optimizer.zero_grad()
+                # 梯度检查
+                has_nan_gradients = False
+                # 检查模型梯度
+                if hasattr(model, 'module'):
+                    # 如果是DataParallel，检查module的参数
+                    for name, param in model.module.named_parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            has_nan_gradients = True
+                            print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
+                            break
+                else:
+                    for name, param in model.named_parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            has_nan_gradients = True
+                            print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
+                            break
 
-            total_loss += loss.item()
+                # 检查条件编码器梯度
+                if not has_nan_gradients:
+                    if hasattr(condition_encoder, 'module'):
+                        for name, param in condition_encoder.module.named_parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                has_nan_gradients = True
+                                print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
+                                break
+                    else:
+                        for name, param in condition_encoder.named_parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                has_nan_gradients = True
+                                print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
+                                break
+
+                # 如果没有NaN梯度，进行梯度裁剪和参数更新
+                if not has_nan_gradients:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
+                    optimizer.step()
+                else:
+                    print("❌ 跳过参数更新 due to NaN/Inf gradients")
+                    optimizer.zero_grad()
+
+            total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
-            progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'avg_loss': f'{total_loss/num_batches:.4f}'})
+
+            # 显示实时进度和GPU信息
+            postfix_dict = {
+                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
+                'avg_loss': f'{total_loss/num_batches:.4f}'
+            }
+
+            # 添加多GPU信息
+            if self.use_data_parallel and self.gpu_count > 1:
+                postfix_dict['gpus'] = f'{self.gpu_count}x'
+                postfix_dict['mem'] = get_gpu_memory_usage_string(max_gpus=3)
+                if gradient_accumulation_steps > 1:
+                    postfix_dict['grad_accum'] = f'{gradient_accumulation_steps}x'
+            elif gradient_accumulation_steps > 1:
+                postfix_dict['grad_accum'] = f'{gradient_accumulation_steps}x'
+
+            progress_bar.set_postfix(postfix_dict)
 
         return total_loss / num_batches, num_batches
 
@@ -362,11 +449,27 @@ class EditFlowTrainer:
         checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
+        # 处理DataParallel模型的状态字典
+        if hasattr(model, 'module'):
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
+
+        if hasattr(condition_encoder, 'module'):
+            condition_encoder_state = condition_encoder.module.state_dict()
+        else:
+            condition_encoder_state = condition_encoder.state_dict()
+
         torch.save({
-            'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
-            'condition_encoder_state_dict': condition_encoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(), 'loss': loss,
-            'config': config, 'args': self.args
+            'epoch': epoch + 1,
+            'model_state_dict': model_state,
+            'condition_encoder_state_dict': condition_encoder_state,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
+            'config': config,
+            'args': self.args,
+            'use_data_parallel': self.use_data_parallel,
+            'gpu_count': self.gpu_count
         }, checkpoint_path)
 
         return checkpoint_path
@@ -403,8 +506,9 @@ class EditFlowTrainer:
             print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 总体平均损失: {avg_loss:.4f}")
 
             if (epoch + 1) % self.args.save_every == 0:
+                config = self._get_model_config(model)
                 checkpoint_path = self.save_checkpoint(
-                    model, condition_encoder, optimizer, avg_loss, epoch, model.config
+                    model, condition_encoder, optimizer, avg_loss, epoch, config
                 )
                 print(f"检查点已保存到: {checkpoint_path}")
 
@@ -412,13 +516,27 @@ class EditFlowTrainer:
         final_model_path = os.path.join(self.args.save_dir, "editflow_final.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
+        # 处理DataParallel模型的状态字典
+        if hasattr(model, 'module'):
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
+
+        if hasattr(condition_encoder, 'module'):
+            condition_encoder_state = condition_encoder.module.state_dict()
+        else:
+            condition_encoder_state = condition_encoder.state_dict()
+
+        config = self._get_model_config(model)
         torch.save({
             'epoch': self.args.num_epochs,
-            'model_state_dict': model.state_dict(),
-            'condition_encoder_state_dict': condition_encoder.state_dict(),
+            'model_state_dict': model_state,
+            'condition_encoder_state_dict': condition_encoder_state,
             'optimizer_state_dict': optimizer.state_dict(),
-            'config': model.config,
-            'args': self.args
+            'config': config,
+            'args': self.args,
+            'use_data_parallel': self.use_data_parallel,
+            'gpu_count': self.gpu_count
         }, final_model_path)
 
         print(f"最终模型已保存到: {final_model_path}")
