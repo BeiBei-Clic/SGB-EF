@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from src.training.editflow_trainer import EditFlowTrainer
+from src.utils.gpu_monitor import display_gpu_info
 
 
 def set_seed(seed: int):
@@ -60,16 +61,7 @@ def main():
     print(f"梯度累积步数: {args.gradient_accumulation_steps}")
 
     # 显示GPU信息
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        print(f"\n=== GPU信息 ===")
-        print(f"GPU数量: {gpu_count}")
-        for i in range(gpu_count):
-            gpu_name = torch.cuda.get_device_name(i)
-            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-            print(f"GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
-    else:
-        print("\n警告: 未检测到GPU，将使用CPU训练")
+    display_gpu_info()
 
     # 设置随机种子
     set_seed(args.seed)
