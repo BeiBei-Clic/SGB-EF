@@ -168,15 +168,7 @@ class EditFlowTransformer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(config.hidden_dim)
 
     def forward(self, input_ids, attention_mask=None, time_steps=None, condition=None):
-        print(f"EditFlow input_ids.shape: {input_ids.shape}")
-        print(f"EditFlow input_ids.ndim: {input_ids.ndim}")
-        if input_ids.ndim == 2:
-            batch_size, seq_len = input_ids.shape
-        elif input_ids.ndim == 3:
-            batch_size, seq_len, _ = input_ids.shape
-            input_ids = input_ids.squeeze(-1)  # 移除多余的维度
-        else:
-            raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
+        batch_size, seq_len = input_ids.shape
 
         # 自动生成时间嵌入（如果没有提供）
         if time_steps is None:

@@ -231,7 +231,6 @@ class EditFlowTrainer:
         datasets = {}
 
         for dim, dim_samples in dimension_groups.items():
-            print(f"维度 {dim}: {len(dim_samples)} 个样本")
             dataset = TripletDataset(dim_samples, tokenizer)
             dataloader = torch.utils.data.DataLoader(
                 dataset, batch_size=self.args.batch_size, shuffle=True,
@@ -315,9 +314,28 @@ class EditFlowTrainer:
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
-            optimizer.step()
+
+            # 检查梯度是否包含NaN
+            has_nan_gradients = False
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"Warning: NaN gradient detected in model parameter {name}")
+                    has_nan_gradients = True
+                    break
+
+            for name, param in condition_encoder.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"Warning: NaN gradient detected in condition_encoder parameter {name}")
+                    has_nan_gradients = True
+                    break
+
+            # 如果没有NaN梯度，进行梯度裁剪和参数更新
+            if not has_nan_gradients:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
+                optimizer.step()
+            else:
+                print("Skipping parameter update due to NaN gradients")
 
             total_loss += loss.item()
             num_batches += 1
