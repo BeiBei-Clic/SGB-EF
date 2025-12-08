@@ -136,6 +136,18 @@ class SpecialTokensManager:
             else:
                 print(f"  {op_name} -> multiple tokens: {tokens}")
 
+        # 打印变量映射
+        print("变量token映射:")
+        variables = self.get_variables()
+        for var_name in variables:
+            tokens = self.tokenizer.encode(var_name, add_special_tokens=False)
+            if len(tokens) == 1:
+                token_id = tokens[0]
+                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
+                print(f"  {var_name} -> {token_id} ('{token_text}')")
+            else:
+                print(f"  {var_name} -> multiple tokens: {tokens}")
+
     def is_function(self, token: str) -> bool:
         """检查token是否为函数"""
         return token in self.FUNCTIONS
