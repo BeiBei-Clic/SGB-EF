@@ -327,12 +327,11 @@ class EditFlowTrainer:
         # 获取模型配置
         config = self._get_model_config(model)
 
-        # 如果使用多GPU，添加GPU使用率显示
+        # 如果使用多GPU，添加GPU负载显示
         if self.use_data_parallel and self.gpu_count > 1:
             progress_bar.set_postfix({
                 'loss': '0.0000',
-                'avg_loss': '0.0000',
-                'gpus': f'{self.gpu_count}xRTX3090'
+                'gpu_load': get_gpu_memory_usage_string(max_gpus=3)
             })
 
         for batch_idx, batch in enumerate(progress_bar):
@@ -425,20 +424,14 @@ class EditFlowTrainer:
             total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
 
-            # 显示实时进度和GPU信息
+            # 显示实时进度和GPU负载信息
             postfix_dict = {
-                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                'avg_loss': f'{total_loss/num_batches:.4f}'
+                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}'
             }
 
-            # 添加多GPU信息
+            # 添加多GPU负载信息
             if self.use_data_parallel and self.gpu_count > 1:
-                postfix_dict['gpus'] = f'{self.gpu_count}x'
-                postfix_dict['mem'] = get_gpu_memory_usage_string(max_gpus=3)
-                if gradient_accumulation_steps > 1:
-                    postfix_dict['grad_accum'] = f'{gradient_accumulation_steps}x'
-            elif gradient_accumulation_steps > 1:
-                postfix_dict['grad_accum'] = f'{gradient_accumulation_steps}x'
+                postfix_dict['gpu_load'] = get_gpu_memory_usage_string(max_gpus=3)
 
             progress_bar.set_postfix(postfix_dict)
 
