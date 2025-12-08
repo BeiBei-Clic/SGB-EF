@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 from ..symbolic.data_generator import generate_triplet_samples
 from ..modeling.condition_encoder import ConditionEncoder
 from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
+from ..utils.special_tokens import SpecialTokensManager
 
 
 class TripletDataset(torch.utils.data.Dataset):
@@ -23,39 +24,16 @@ class TripletDataset(torch.utils.data.Dataset):
         self.pad_token = tokenizer.pad_token_id if tokenizer.pad_token is not None else tokenizer.eos_token_id
         self.bos_token = tokenizer.bos_token_id if tokenizer.bos_token is not None else tokenizer.cls_token_id
 
-        # 创建特殊token映射，使用预训练模型词汇表中的token
-        self.special_tokens = {
-            'add': 'add', 'sub': 'sub', 'mul': 'mul', 'div': 'div', 'pow': 'pow',
-            'sin': 'sin', 'cos': 'cos', 'tan': 'tan', 'exp': 'exp', 'log': 'log', 'sqrt': 'sqrt',
-        }
-        # 变量token
+        # 使用统一的特殊token管理器
         self.max_dim = 10
-        for i in range(self.max_dim):
-            self.special_tokens[f'x{i}'] = f'x{i}'
+        self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.max_dim)
 
     def __len__(self):
         return len(self.samples)
 
     def _tokenize_expression(self, tree_str: str) -> List[int]:
-        """将表达式树字符串转换为token序列，使用预训练模型的tokenizer"""
-        if not tree_str:
-            return []
-
-        # 构建表达式字符串
-        tokens = tree_str.split(',')
-        expression_tokens = []
-
-        for token in tokens:
-            if token in self.special_tokens:
-                # 使用预训练模型tokenizer处理特殊token
-                encoded = self.tokenizer.encode(self.special_tokens[token], add_special_tokens=False)
-                expression_tokens.extend(encoded)
-            elif token.replace('.', '').replace('-', '').isdigit():
-                # 处理数字
-                encoded = self.tokenizer.encode(token, add_special_tokens=False)
-                expression_tokens.extend(encoded)
-
-        return expression_tokens
+        """将表达式树字符串转换为token序列，使用统一的特殊token管理器"""
+        return self.special_tokens_manager.tokenize_expression(tree_str)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -89,42 +67,16 @@ class EditFlowLoss:
     def __init__(self, scheduler_type='cubic', tokenizer=None):
         self.scheduler_type = scheduler_type
         self.tokenizer = tokenizer
-        # 动态获取函数token映射，而不是硬编码
-        self.func_map = self._build_function_map() if tokenizer else {}
-
-    def _build_function_map(self):
-        """使用分词器构建函数token映射（增强验证）"""
-        function_names = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
-        func_map = {}
-
-        for func_name in function_names:
-            # 使用分词器编码函数名，获取token ID
-            tokens = self.tokenizer.encode(func_name, add_special_tokens=False)
-            if len(tokens) == 1:
-                # 理想情况：函数名被分词为单个token
-                func_map[func_name] = tokens[0]
-                print(f"Function '{func_name}' mapped to token {tokens[0]} (single token)")
-            elif len(tokens) > 1:
-                # 警告：函数名被拆分为多个token
-                print(f"Warning: Function '{func_name}' tokenized as {len(tokens)} tokens: {tokens}")
-                print(f"Token texts: {[self.tokenizer.decode([t]) for t in tokens]}")
-                # 仍然使用第一个token，但记录警告
-                func_map[func_name] = tokens[0]
-                print(f"Using first token {tokens[0]} for function '{func_name}'")
-            else:
-                print(f"Warning: Function '{func_name}' not found in tokenizer vocabulary")
-
-        return func_map
+        # 使用统一的特殊token管理器
+        self.special_tokens_manager = SpecialTokensManager(tokenizer) if tokenizer else None
+        self.func_map = self.special_tokens_manager.get_function_token_map() if self.special_tokens_manager else {}
 
     def print_function_mapping(self):
         """打印函数映射信息，用于调试"""
-        if self.func_map:
-            print("函数token映射:")
-            for func_name, token_id in self.func_map.items():
-                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
-                print(f"  {func_name} -> {token_id} ('{token_text}')")
+        if self.special_tokens_manager:
+            self.special_tokens_manager.print_function_mapping()
         else:
-            print("警告: 没有可用的函数映射")
+            print("警告: 没有可用的特殊token管理器")
 
     def scheduler(self, t: torch.Tensor) -> torch.Tensor:
         return 3 * t**2 - 2 * t**3 if self.scheduler_type == 'cubic' else t
