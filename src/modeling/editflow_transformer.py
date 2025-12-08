@@ -218,8 +218,10 @@ class EditFlowTransformer(nn.Module):
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(-1)
             rates = rates * mask
-            insert_logits = insert_logits.masked_fill(~attention_mask.bool().unsqueeze(-1), -float('inf'))
-            substitute_logits = substitute_logits.masked_fill(~attention_mask.bool().unsqueeze(-1), -float('inf'))
+            # 使用一个很大的负数替代-inf，提高softmax的数值稳定性
+            invalid_mask = ~attention_mask.bool().unsqueeze(-1)
+            insert_logits = insert_logits.masked_fill(invalid_mask, -1e9)
+            substitute_logits = substitute_logits.masked_fill(invalid_mask, -1e9)
 
         insert_probs = F.softmax(insert_logits, dim=-1)
         substitute_probs = F.softmax(substitute_logits, dim=-1)
