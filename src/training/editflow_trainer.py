@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from typing import List, Dict, Tuple
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from ..symbolic.data_generator import generate_triplet_samples
 from ..modeling.condition_encoder import ConditionEncoder
@@ -15,37 +16,46 @@ from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
 class TripletDataset(torch.utils.data.Dataset):
     """三元组数据集 (E_curr, E_target, r, z)"""
 
-    def __init__(self, samples: List[Dict], vocab_size: int = 1000):
+    def __init__(self, samples: List[Dict], tokenizer):
         self.samples = samples
-        self.vocab_size = vocab_size
-        self.pad_token = vocab_size - 1
-        self.bos_token = vocab_size - 2
-        self.max_dim = 10
-        self.token_to_id = {
-            'add': 1, 'sub': 2, 'mul': 3, 'div': 4, 'pow': 5,
-            'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11,
-            **{f'x{i}': 12 + i for i in range(self.max_dim)}
+        self.tokenizer = tokenizer
+        self.vocab_size = tokenizer.vocab_size
+        self.pad_token = tokenizer.pad_token_id if tokenizer.pad_token is not None else tokenizer.eos_token_id
+        self.bos_token = tokenizer.bos_token_id if tokenizer.bos_token is not None else tokenizer.cls_token_id
+
+        # 创建特殊token映射，使用预训练模型词汇表中的token
+        self.special_tokens = {
+            'add': 'add', 'sub': 'sub', 'mul': 'mul', 'div': 'div', 'pow': 'pow',
+            'sin': 'sin', 'cos': 'cos', 'tan': 'tan', 'exp': 'exp', 'log': 'log', 'sqrt': 'sqrt',
         }
+        # 变量token
+        self.max_dim = 10
+        for i in range(self.max_dim):
+            self.special_tokens[f'x{i}'] = f'x{i}'
 
     def __len__(self):
         return len(self.samples)
 
     def _tokenize_expression(self, tree_str: str) -> List[int]:
-        """将表达式树字符串转换为token序列"""
+        """将表达式树字符串转换为token序列，使用预训练模型的tokenizer"""
         if not tree_str:
             return []
 
-        token_ids = []
-        for token in tree_str.split(','):
-            if token in self.token_to_id:
-                token_ids.append(self.token_to_id[token])
-            elif token.replace('.', '').replace('-', '').isdigit():
-                const_id = 50 + int(abs(float(token))) % 50
-                token_ids.append(min(const_id, self.vocab_size - 3))
-            else:
-                token_ids.append(min(200, self.vocab_size - 3))
+        # 构建表达式字符串
+        tokens = tree_str.split(',')
+        expression_tokens = []
 
-        return token_ids
+        for token in tokens:
+            if token in self.special_tokens:
+                # 使用预训练模型tokenizer处理特殊token
+                encoded = self.tokenizer.encode(self.special_tokens[token], add_special_tokens=False)
+                expression_tokens.extend(encoded)
+            elif token.replace('.', '').replace('-', '').isdigit():
+                # 处理数字
+                encoded = self.tokenizer.encode(token, add_special_tokens=False)
+                expression_tokens.extend(encoded)
+
+        return expression_tokens
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -167,7 +177,7 @@ class EditFlowTrainer:
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
-    def prepare_data(self):
+    def prepare_data(self, tokenizer):
         print("生成三元组训练数据...")
         samples = generate_triplet_samples(
             num_samples=self.args.num_samples,
@@ -186,7 +196,7 @@ class EditFlowTrainer:
 
         for dim, dim_samples in dimension_groups.items():
             print(f"维度 {dim}: {len(dim_samples)} 个样本")
-            dataset = TripletDataset(dim_samples, vocab_size=self.args.vocab_size)
+            dataset = TripletDataset(dim_samples, tokenizer)
             dataloader = torch.utils.data.DataLoader(
                 dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -197,33 +207,31 @@ class EditFlowTrainer:
         return dataloaders, datasets, dimension_groups
 
     def setup_models(self):
+        print("初始化tokenizer和模型...")
+
+        # 首先初始化tokenizer，获取预训练模型的词汇表
+        model_name = getattr(self.args, 'base_model_name', "openai-community/gpt2")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # 确保tokenizer有pad token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        print(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
+
         print("初始化条件编码器...")
         condition_encoder = ConditionEncoder().to(self.device)
 
         print("初始化EditFlow模型...")
-        temp_config = EditFlowConfig(
-            vocab_size=self.args.vocab_size,
-            hidden_dim=self.args.hidden_dim,
-            num_layers=self.args.num_layers,
-            num_heads=self.args.num_heads,
-            max_seq_len=64,
-            condition_dim=condition_encoder.output_dim,
-            use_condition_injection=True,
-            base_model_name="openai-community/gpt2"
-        )
-        temp_model = EditFlowTransformer(temp_config)
-        actual_vocab_size = temp_model.base_model.config.vocab_size
-        print(f"模型实际vocab_size: {actual_vocab_size}")
-
         config = EditFlowConfig(
-            vocab_size=actual_vocab_size,
+            vocab_size=tokenizer.vocab_size,
             hidden_dim=self.args.hidden_dim,
             num_layers=self.args.num_layers,
             num_heads=self.args.num_heads,
             max_seq_len=64,
             condition_dim=condition_encoder.output_dim,
             use_condition_injection=True,
-            base_model_name="openai-community/gpt2"
+            base_model_name=model_name
         )
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
@@ -235,7 +243,7 @@ class EditFlowTrainer:
             weight_decay=self.args.weight_decay
         )
 
-        return model, condition_encoder, criterion, optimizer, actual_vocab_size
+        return model, condition_encoder, criterion, optimizer, tokenizer
 
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
         model.train()
@@ -299,13 +307,11 @@ class EditFlowTrainer:
     def train(self):
         print(f"使用设备: {self.device}")
 
-        dataloaders, datasets, dimension_groups = self.prepare_data()
-        model, condition_encoder, criterion, optimizer, actual_vocab_size = self.setup_models()
+        # 首先设置模型获取tokenizer
+        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models()
 
-        for dataset in datasets.values():
-            dataset.vocab_size = actual_vocab_size
-            dataset.pad_token = actual_vocab_size - 1
-            dataset.bos_token = actual_vocab_size - 2
+        # 使用tokenizer准备数据
+        dataloaders, datasets, dimension_groups = self.prepare_data(tokenizer)
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
