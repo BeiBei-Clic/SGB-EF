@@ -32,10 +32,7 @@ def main():
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")
 
     # 模型参数
-    parser.add_argument("--vocab_size", type=int, default=50257, help="词汇表大小")
-    parser.add_argument("--hidden_dim", type=int, default=768, help="隐藏层维度")
-    parser.add_argument("--num_layers", type=int, default=12, help="Transformer层数")
-    parser.add_argument("--num_heads", type=int, default=12, help="注意力头数")
+    parser.add_argument("--base_model_name", type=str, default="openai-community/gpt2", help="基础模型名称")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
@@ -54,10 +51,7 @@ def main():
     print(f"批次大小: {args.batch_size}")
     print(f"训练轮数: {args.num_epochs}")
     print(f"学习率: {args.learning_rate}")
-    print(f"词汇表大小: {args.vocab_size}")
-    print(f"隐藏层维度: {args.hidden_dim}")
-    print(f"Transformer层数: {args.num_layers}")
-    print(f"注意力头数: {args.num_heads}")
+    print(f"基础模型: {args.base_model_name}")
 
     # 设置随机种子
     set_seed(args.seed)

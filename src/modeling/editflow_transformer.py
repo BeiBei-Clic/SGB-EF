@@ -12,21 +12,22 @@ import math
 class EditFlowConfig:
     """EditFlow Transformer配置类 - 不继承PretrainedConfig以避免AutoModel系统冲突"""
 
-    def __init__(self, vocab_size=50265, hidden_dim=768, num_layers=6, num_heads=12,
-                 max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
+    def __init__(self, max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
                  base_model_name="openai-community/gpt2", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.pad_token_id = pad_token_id
-        self.condition_dim = condition_dim or hidden_dim
+        self.condition_dim = condition_dim  # 需要从外部设置
         self.base_model_name = base_model_name
         self.use_condition_injection = use_condition_injection
         self.time_embedding_type = time_embedding_type
+
+        # 这些参数将从预训练模型动态获取
+        self.vocab_size = None
+        self.hidden_dim = None
+        self.num_layers = None
+        self.num_heads = None
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -112,9 +113,10 @@ class EditFlowTransformer(nn.Module):
 
             # 自动获取模型配置
             self.model_config = self.base_model.config
-            config.hidden_dim = getattr(self.model_config, 'hidden_size', config.hidden_dim)
-            config.num_heads = getattr(self.model_config, 'num_attention_heads', config.num_heads)
-            config.num_layers = getattr(self.model_config, 'num_hidden_layers', config.num_layers)
+            config.vocab_size = getattr(self.model_config, 'vocab_size', tokenizer.vocab_size if hasattr(self, 'tokenizer') else 50265)
+            config.hidden_dim = getattr(self.model_config, 'hidden_size', 768)
+            config.num_heads = getattr(self.model_config, 'num_attention_heads', 12)
+            config.num_layers = getattr(self.model_config, 'num_hidden_layers', 6)
         else:
             raise ValueError("必须指定base_model_name")
 
@@ -231,37 +233,3 @@ class EditFlowTransformer(nn.Module):
         substitute_probs = F.softmax(substitute_logits, dim=-1)
 
         return rates, insert_probs, substitute_probs
-
-
-# 测试代码
-if __name__ == "__main__":
-    config = EditFlowConfig(vocab_size=1000, hidden_dim=256, num_layers=4, num_heads=8)
-    model = EditFlowTransformer(config)
-
-    # 验证基础模型确实是真正的GPT2而不是EditFlowTransformer
-    print(f"Base model type: {type(model.base_model)}")
-
-    # 测试数据
-    input_ids = torch.randint(0, config.vocab_size, (2, 64))
-    time_steps = torch.rand(2, 1)
-    condition = torch.randn(2, config.condition_dim)
-    attention_mask = torch.ones(2, 64)
-
-    # 前向传播
-    model.eval()
-    with torch.no_grad():
-        try:
-            rates, insert_probs, substitute_probs = model(input_ids, time_steps, condition, attention_mask)
-            print(f"✓ 前向传播成功")
-            model_params = sum(p.numel() for p in model.parameters())
-            print(f"模型参数数量: {model_params:,}")
-            print(f"输入形状: {input_ids.shape}")
-            print(f"速率输出形状: {rates.shape}")
-            print(f"插入概率形状: {insert_probs.shape}")
-            print(f"替换概率形状: {substitute_probs.shape}")
-        except RecursionError as e:
-            print(f"✗ 递归错误仍然存在: {e}")
-        except Exception as e:
-            print(f"✗ 其他错误: {e}")
-            import traceback
-            traceback.print_exc()

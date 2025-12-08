@@ -86,9 +86,37 @@ class TripletDataset(torch.utils.data.Dataset):
 class EditFlowLoss:
     """EditFlow训练损失函数"""
 
-    def __init__(self, scheduler_type='cubic'):
+    def __init__(self, scheduler_type='cubic', tokenizer=None):
         self.scheduler_type = scheduler_type
-        self.func_map = {'sin': 6, 'cos': 7, 'tan': 8, 'exp': 9, 'log': 10, 'sqrt': 11}
+        self.tokenizer = tokenizer
+        # 动态获取函数token映射，而不是硬编码
+        self.func_map = self._build_function_map() if tokenizer else {}
+
+    def _build_function_map(self):
+        """使用分词器构建函数token映射"""
+        function_names = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
+        func_map = {}
+
+        for func_name in function_names:
+            # 使用分词器编码函数名，获取token ID
+            tokens = self.tokenizer.encode(func_name, add_special_tokens=False)
+            if tokens:
+                # 使用第一个token的ID作为映射
+                func_map[func_name] = tokens[0]
+            else:
+                print(f"Warning: Function '{func_name}' not found in tokenizer vocabulary")
+
+        return func_map
+
+    def print_function_mapping(self):
+        """打印函数映射信息，用于调试"""
+        if self.func_map:
+            print("函数token映射:")
+            for func_name, token_id in self.func_map.items():
+                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
+                print(f"  {func_name} -> {token_id} ('{token_text}')")
+        else:
+            print("警告: 没有可用的函数映射")
 
     def scheduler(self, t: torch.Tensor) -> torch.Tensor:
         return 3 * t**2 - 2 * t**3 if self.scheduler_type == 'cubic' else t
@@ -104,13 +132,13 @@ class EditFlowLoss:
                 target_mask[i, 1] = 0.1
             elif op == 'insert':
                 target_mask[i, 0] = 1.0
-                if tgt in self.func_map:
+                if tgt in self.func_map and 0 <= self.func_map[tgt] < vocab_size:
                     target_mask[i, 3 + self.func_map[tgt]] = 1.0
             elif op == 'delete':
                 target_mask[i, 2] = 1.0
             elif op == 'substitute':
                 target_mask[i, 1] = 1.0
-                if tgt in self.func_map:
+                if tgt in self.func_map and 0 <= self.func_map[tgt] < vocab_size:
                     target_mask[i, 3 + vocab_size + self.func_map[tgt]] = 1.0
 
         return target_mask
@@ -224,19 +252,18 @@ class EditFlowTrainer:
 
         print("初始化EditFlow模型...")
         config = EditFlowConfig(
-            vocab_size=tokenizer.vocab_size,
-            hidden_dim=self.args.hidden_dim,
-            num_layers=self.args.num_layers,
-            num_heads=self.args.num_heads,
             max_seq_len=64,
             condition_dim=condition_encoder.output_dim,
             use_condition_injection=True,
             base_model_name=model_name
         )
+        # vocab_size 将从tokenizer动态获取
+        config.vocab_size = tokenizer.vocab_size
         model = EditFlowTransformer(config).to(self.device)
         print(f"EditFlow模型参数数量: {sum(p.numel() for p in model.parameters())}")
 
-        criterion = EditFlowLoss(scheduler_type='cubic')
+        criterion = EditFlowLoss(scheduler_type='cubic', tokenizer=tokenizer)
+        criterion.print_function_mapping()  # 打印函数映射用于调试
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate,
