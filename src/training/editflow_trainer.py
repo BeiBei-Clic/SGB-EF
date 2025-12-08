@@ -1,22 +1,157 @@
 """
-EditFlow训练器 - 实现基于残差条件的编辑流模型训练
+EditFlow连续流训练器 - 实现基于连续时间流匹配的编辑流模型训练
 """
 
 import torch
 import numpy as np
-from typing import List, Dict, Tuple
+import time
+from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from ..symbolic.data_generator import generate_triplet_samples
+from ..symbolic.data_generator import generate_flow_samples
 from ..modeling.condition_encoder import ConditionEncoder
 from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
 from ..utils.special_tokens import SpecialTokensManager
 from ..utils.gpu_monitor import get_gpu_memory_info, get_gpu_memory_usage_string
 
 
-class TripletDataset(torch.utils.data.Dataset):
-    """三元组数据集 (E_curr, E_target, r, z)"""
+class KappaScheduler:
+    """时间调度器，用于控制流的插值"""
+
+    def __init__(self, scheduler_type='cubic'):
+        self.scheduler_type = scheduler_type
+
+    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+        """返回时间t的调度系数"""
+        if self.scheduler_type == 'cubic':
+            return 3 * t**2 - 2 * t**3
+        elif self.scheduler_type == 'linear':
+            return t
+        else:
+            return t
+
+    def derivative(self, t: torch.Tensor) -> torch.Tensor:
+        """返回时间t的调度系数导数"""
+        if self.scheduler_type == 'cubic':
+            return 6 * t - 6 * t**2
+        elif self.scheduler_type == 'linear':
+            return torch.ones_like(t)
+        else:
+            return torch.ones_like(t)
+
+
+def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor, scheduler: KappaScheduler) -> torch.Tensor:
+    """在给定时间t采样条件路径"""
+    # 确保p0和p1的形状一致
+    if p0.shape != p1.shape:
+        # 如果形状不一致，调整到较大的形状
+        max_seq_len = max(p0.size(1), p1.size(1))
+        max_vocab_size = max(p0.size(2), p1.size(2))
+        batch_size = p0.size(0)
+
+        # 扩展p0
+        if p0.size(1) < max_seq_len or p0.size(2) < max_vocab_size:
+            p0_expanded = torch.zeros(batch_size, max_seq_len, max_vocab_size, device=p0.device)
+            p0_expanded[:, :p0.size(1), :p0.size(2)] = p0
+            p0 = p0_expanded
+
+        # 扩展p1
+        if p1.size(1) < max_seq_len or p1.size(2) < max_vocab_size:
+            p1_expanded = torch.zeros(batch_size, max_seq_len, max_vocab_size, device=p1.device)
+            p1_expanded[:, :p1.size(1), :p1.size(2)] = p1
+            p1 = p1_expanded
+
+    batch_size, seq_len, vocab_size = p0.shape
+    t = t.view(-1, 1, 1) if t.dim() == 1 else t
+    kappa_t = scheduler(t)
+
+    # 确保kappa_t的形状与p0和p1匹配
+    if kappa_t.dim() == 3 and kappa_t.shape[1] == 1 and kappa_t.shape[2] == 1:
+        # 扩展到序列长度维度
+        kappa_t = kappa_t.expand(-1, seq_len, -1)
+    elif kappa_t.dim() == 2:
+        kappa_t = kappa_t.unsqueeze(-1).expand(-1, seq_len, -1)
+
+    pt = (1 - kappa_t) * p0 + kappa_t * p1
+
+    # 数值稳定性：归一化概率
+    pt = pt / (pt.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # 采样
+    pt_flat = pt.view(-1, pt.size(-1))
+    sampled = torch.multinomial(pt_flat, 1)
+    return sampled.view(batch_size, seq_len)
+
+
+def tokens_to_prob(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """将token序列转换为概率分布"""
+    batch_size, seq_len = tokens.shape
+    probs = torch.zeros(batch_size, seq_len, vocab_size, device=tokens.device)
+
+    # 只处理有效的token IDs
+    valid_tokens = torch.clamp(tokens, 0, vocab_size - 1)
+    probs.scatter_(2, valid_tokens.unsqueeze(-1), 1.0)
+    return probs
+
+
+def remove_gap_tokens(z_t: torch.Tensor, vocab_size: int, pad_token_id: int, gap_token_id: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """移除gap token并返回处理后的序列"""
+    if gap_token_id is None:
+        # 如果没有明确的gap token，使用词汇表外的一个值
+        gap_token_id = vocab_size + 1
+
+    batch_size, z_seq_len = z_t.shape
+    device = z_t.device
+
+    # 找到gap token的位置
+    gap_mask = (z_t == gap_token_id)
+    z_gap_mask = gap_mask
+    z_pad_mask = (z_t == pad_token_id)
+
+    # 移除gap token
+    x_t_list = []
+    x_pad_mask_list = []
+
+    for i in range(batch_size):
+        z_row = z_t[i]
+        non_gap_indices = ~gap_mask[i]
+        x_row = z_row[non_gap_indices]
+        x_t_list.append(x_row)
+        x_pad_mask_list.append((x_row == pad_token_id))
+
+    # 填充到相同长度
+    max_x_len = max(len(x) for x in x_t_list)
+    x_t_padded = torch.full((batch_size, max_x_len), pad_token_id, dtype=torch.long, device=device)
+    x_pad_mask_padded = torch.zeros((batch_size, max_x_len), dtype=torch.bool, device=device)
+
+    for i, x_row in enumerate(x_t_list):
+        x_t_padded[i, :len(x_row)] = x_row
+        x_pad_mask_padded[i, :len(x_row)] = x_pad_mask_list[i]
+
+    return x_t_padded, x_pad_mask_padded, z_gap_mask, z_pad_mask
+
+
+def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z_pad_mask: torch.Tensor) -> torch.Tensor:
+    """用重复值填充gap token位置"""
+    batch_size, z_seq_len = z_gap_mask.shape
+    _, x_seq_len, vocab_size = x_ut.shape
+
+    # 计算每个位置对应的非gap位置
+    non_gap_mask = ~z_gap_mask
+    indices = non_gap_mask.cumsum(dim=1) - 1
+    indices = indices.clamp(min=0, max=x_seq_len-1)
+
+    # 收集对应的特征
+    batch_indices = torch.arange(batch_size, device=x_ut.device).unsqueeze(1)
+    result = x_ut[batch_indices, indices]
+    result[z_pad_mask] = 0
+
+    return result
+
+
+class FlowDataset(torch.utils.data.Dataset):
+    """连续流数据集 (z0, z1, x_values, residuals)"""
 
     def __init__(self, samples: List[Dict], tokenizer):
         self.samples = samples
@@ -25,25 +160,35 @@ class TripletDataset(torch.utils.data.Dataset):
         self.pad_token = tokenizer.pad_token_id if tokenizer.pad_token is not None else tokenizer.eos_token_id
         self.bos_token = tokenizer.bos_token_id if tokenizer.bos_token is not None else tokenizer.cls_token_id
 
-        # 使用统一的特殊token管理器
+        # gap token - 使用词汇表外的一个ID
+        self.gap_token = self.vocab_size + 100  # 确保不与正常token冲突
+
+        # 特殊token管理器
         self.max_dim = 10
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.max_dim)
 
     def __len__(self):
         return len(self.samples)
 
-    def _tokenize_expression(self, tree_str: str) -> List[int]:
-        """将表达式树字符串转换为token序列，使用统一的特殊token管理器"""
-        return self.special_tokens_manager.tokenize_expression(tree_str)
+    def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
+        """将token列表转换为token ID列表"""
+        token_ids = []
+        for token in tokens:
+            if token == "<gap>":
+                token_ids.append(self.gap_token)
+            else:
+                # 使用special_tokens_manager处理其他tokens
+                tree_str = token if ',' in token else token
+                tokenized = self.special_tokens_manager.tokenize_expression(tree_str)
+                token_ids.extend(tokenized)
+        return token_ids
 
     def validate_data_sample(self, sample: dict, idx: int) -> dict:
         """验证数据样本的合理性"""
-        # 检查x_values
         x_values = torch.FloatTensor(sample['x_values'])
         if torch.isnan(x_values).any() or torch.isinf(x_values).any():
             raise ValueError(f"样本 {idx} 的 x_values 包含 NaN 或 Inf 值")
 
-        # 检查residuals
         residuals = torch.FloatTensor(sample['residuals'])
         if residuals.dim() == 1:
             residuals = residuals.unsqueeze(-1)
@@ -54,8 +199,6 @@ class TripletDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-
-        # 数据验证
         sample = self.validate_data_sample(sample, idx)
 
         x_values = torch.FloatTensor(sample['x_values'])
@@ -63,147 +206,101 @@ class TripletDataset(torch.utils.data.Dataset):
         if residuals.dim() == 1:
             residuals = residuals.unsqueeze(-1)
 
-        curr_tokens = self._tokenize_expression(sample['tree_cur1'])
-        target_tokens = self._tokenize_expression(sample['tree_gt'])
+        # 对齐后的Z空间序列
+        z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
+        z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
 
-        max_len = 64
-        def pad_sequence(tokens):
+        # 添加BOS token并填充
+        max_len = 128
+        def pad_z_sequence(tokens):
             tokens = [self.bos_token] + tokens[:max_len-1]
             tokens.extend([self.pad_token] * (max_len - len(tokens)))
             return torch.LongTensor(tokens)
 
-        curr_token_ids = pad_sequence(curr_tokens)
-        target_token_ids = pad_sequence(target_tokens)
+        z0_token_ids = pad_z_sequence(z0_tokens)
+        z1_token_ids = pad_z_sequence(z1_tokens)
 
-        # 验证token ID范围
-        if curr_token_ids.max() >= self.vocab_size or target_token_ids.max() >= self.vocab_size:
-            raise ValueError(f"样本 {idx} 的 token ID 超出词汇表范围")
-
-        result = {
+        return {
             'x_values': x_values,
             'residuals': residuals,
-            'curr_token_ids': curr_token_ids,
-            'target_token_ids': target_token_ids,
-            'alignment': sample['alignment_vector']['alignment']
+            'z0_token_ids': z0_token_ids,
+            'z1_token_ids': z1_token_ids,
+            'gap_token': self.gap_token
         }
 
-        return result
 
+class ContinuousFlowLoss:
+    """连续时间流匹配损失函数"""
 
-class EditFlowLoss:
-    """EditFlow训练损失函数"""
+    def __init__(self, scheduler_type='cubic'):
+        self.scheduler = KappaScheduler(scheduler_type)
 
-    def __init__(self, scheduler_type='cubic', tokenizer=None):
-        self.scheduler_type = scheduler_type
-        self.tokenizer = tokenizer
-        # 使用统一的特殊token管理器
-        self.special_tokens_manager = SpecialTokensManager(tokenizer) if tokenizer else None
-        self.func_map = self.special_tokens_manager.get_function_token_map() if self.special_tokens_manager else {}
+    def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
+                           gap_token: int, pad_token: int) -> torch.Tensor:
+        """
+        创建用于计算损失的目标mask
+        对于每个位置i，指示哪些操作可以将z_t[i]转换为z_1[i]
+        """
+        batch_size, z_seq_len = z_t.shape
+        n_ops = 2 * vocab_size + 1  # insert + substitute + delete
 
-    def scheduler(self, t: torch.Tensor) -> torch.Tensor:
-        return 3 * t**2 - 2 * t**3 if self.scheduler_type == 'cubic' else t
+        z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
+        z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq
+        z_del = (z_t != gap_token) & (z_1 == gap_token) & z_neq
+        z_sub = z_neq & ~z_ins & ~z_del
 
-    def scheduler_derivative(self, t: torch.Tensor) -> torch.Tensor:
-        return 6 * t - 6 * t**2 if self.scheduler_type == 'cubic' else torch.ones_like(t)
+        # mask: (batch_size, z_seq_len, n_ops)
+        u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
 
-    def alignment_to_target_mask(self, alignment: List[Tuple], seq_len: int, vocab_size: int) -> torch.Tensor:
-        target_mask = torch.zeros(seq_len, 3 + 2 * vocab_size)
+        # Insert operations: target token at gap positions
+        u_mask[z_ins, z_1[z_ins]] = True
 
-        for i, (op, src, tgt) in enumerate(alignment[:seq_len]):
-            if i >= seq_len:
-                break
+        # Substitute operations: from current to target token
+        u_mask[z_sub, z_1[z_sub] + vocab_size] = True
 
-            try:
-                if op == 'keep':
-                    target_mask[i, 1] = 0.1
-                elif op == 'insert':
-                    target_mask[i, 0] = 1.0
-                    if tgt in self.func_map:
-                        func_idx = self.func_map[tgt]
-                        if 0 <= func_idx < vocab_size:
-                            target_mask[i, 3 + func_idx] = 1.0
-                elif op == 'delete':
-                    target_mask[i, 2] = 1.0
-                elif op == 'substitute':
-                    target_mask[i, 1] = 1.0
-                    if tgt in self.func_map:
-                        func_idx = self.func_map[tgt]
-                        if 0 <= func_idx < vocab_size:
-                            target_mask[i, 3 + vocab_size + func_idx] = 1.0
-            except Exception:
-                pass  # 静默忽略错误
+        # Delete operations: last position in operation space
+        u_mask[:, :, -1][z_del] = True
 
-        return target_mask
+        return u_mask
 
-    def debug_tensor_stats(self, tensor: torch.Tensor, name: str):
-        """打印张量的统计信息用于调试"""
-        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            raise ValueError(f"{name} 包含 NaN 或 Inf 值")
+    def __call__(self, u_cat: torch.Tensor, u_mask: torch.Tensor,
+                 t: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        """
+        计算连续流匹配损失
 
-    def __call__(self, pred_rates: torch.Tensor, pred_ins_probs: torch.Tensor,
-                 pred_sub_probs: torch.Tensor, alignment: List[Tuple],
-                 t: torch.Tensor, vocab_size: int, debug=False) -> torch.Tensor:
-        batch_size, seq_len, _ = pred_rates.shape
+        Args:
+            u_cat: 模型预测的编辑操作率 (batch_size, seq_len, 2*vocab_size+1)
+            u_mask: 目标操作mask (batch_size, seq_len, 2*vocab_size+1)
+            t: 时间步 (batch_size, 1)
+        """
+        # 总操作率
+        u_total = u_cat.sum(dim=(1, 2))
 
-        # 数值稳定性检查
-        self.debug_tensor_stats(pred_rates, "pred_rates")
-        self.debug_tensor_stats(pred_ins_probs, "pred_ins_probs")
-        self.debug_tensor_stats(pred_sub_probs, "pred_sub_probs")
+        # 调度器系数
+        sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
+        sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)
 
-        insert_rates = pred_rates[:, :, 0:1]
-        substitute_rates = pred_rates[:, :, 1:2]
-        delete_rates = pred_rates[:, :, 2:3]
-
-        ins_probs = insert_rates * pred_ins_probs
-        sub_probs = substitute_rates * pred_sub_probs
-
-        u_cat = torch.cat([insert_rates, substitute_rates, delete_rates, ins_probs, sub_probs], dim=-1)
-
-        # 数值稳定性处理
-        u_cat = torch.clamp(u_cat, min=1e-10, max=1e10)
-
-        target_masks = torch.stack([
-            self.alignment_to_target_mask(align, seq_len, vocab_size)
-            for align in alignment
-        ]).to(pred_rates.device)
-
-        u_total = pred_rates.sum(dim=(1, 2))
-
-        sched_t = self.scheduler(t)
-        sched_dt = self.scheduler_derivative(t)
-
-        # 调度器系数计算
-        denominator = (1 - sched_t + 1e-8)
-        sched_coeff_raw = sched_dt / denominator
-        sched_coeff = torch.clamp(sched_coeff_raw.squeeze(-1), min=-10, max=10)
-
-        # 交叉熵计算
+        # 交叉熵项，只计算需要的操作
         log_u_cat = torch.log(torch.clamp(u_cat, min=1e-12, max=1e12))
-        cross_entropy = (log_u_cat * target_masks).sum(dim=(1, 2))
+        cross_entropy = (log_u_cat * u_mask.float()).sum(dim=(1, 2))
 
+        # Bregman散度损失
         loss = u_total - cross_entropy * sched_coeff
-        final_loss = loss.mean()
-
-        return final_loss
-
-
-def sample_conditional_path(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, scheduler) -> torch.Tensor:
-    t = t.view(-1, 1).expand(-1, x0.size(1))
-    return ((1 - scheduler(t)) * x0 + scheduler(t) * x1).long()
+        return loss.mean()
 
 
 def custom_collate_fn(batch):
     return {
         'x_values': torch.stack([item['x_values'] for item in batch]),
         'residuals': torch.stack([item['residuals'] for item in batch]),
-        'curr_token_ids': torch.stack([item['curr_token_ids'] for item in batch]),
-        'target_token_ids': torch.stack([item['target_token_ids'] for item in batch]),
-        'alignment': [item['alignment'] for item in batch]
+        'z0_token_ids': torch.stack([item['z0_token_ids'] for item in batch]),
+        'z1_token_ids': torch.stack([item['z1_token_ids'] for item in batch]),
+        'gap_token': batch[0]['gap_token']
     }
 
 
-class EditFlowTrainer:
-    """EditFlow模型训练器"""
+class ContinuousFlowTrainer:
+    """连续流EditFlow模型训练器"""
 
     def __init__(self, args):
         self.args = args
@@ -220,6 +317,9 @@ class EditFlowTrainer:
             self.gpu_count = 1
             self.device_ids = [0] if torch.cuda.is_available() else None
 
+        # 时间调度器
+        self.scheduler = KappaScheduler(scheduler_type='cubic')
+
     def set_seed(self, seed: int):
         import random
         random.seed(seed)
@@ -230,14 +330,15 @@ class EditFlowTrainer:
             torch.cuda.manual_seed_all(seed)
 
     def prepare_data(self, tokenizer):
-        print("生成三元组训练数据...")
-        samples = generate_triplet_samples(
+        print("生成连续流训练数据...")
+        samples = generate_flow_samples(
             num_samples=self.args.num_samples,
             max_dim=self.args.max_dim,
             n_points=self.args.n_points,
             max_depth=self.args.max_depth
         )
 
+        # 按维度分组
         dimension_groups = {}
         for sample in samples:
             dim = sample['input_dimension']
@@ -247,7 +348,7 @@ class EditFlowTrainer:
         datasets = {}
 
         for dim, dim_samples in dimension_groups.items():
-            dataset = TripletDataset(dim_samples, tokenizer)
+            dataset = FlowDataset(dim_samples, tokenizer)
             dataloader = torch.utils.data.DataLoader(
                 dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -275,12 +376,11 @@ class EditFlowTrainer:
 
         print("初始化EditFlow模型...")
         config = EditFlowConfig(
-            max_seq_len=64,
+            max_seq_len=128,
             condition_dim=condition_encoder.output_dim,
             use_condition_injection=True,
             base_model_name=model_name
         )
-        # vocab_size 将从tokenizer动态获取
         config.vocab_size = tokenizer.vocab_size
         model = EditFlowTransformer(config).to(self.device)
 
@@ -293,7 +393,7 @@ class EditFlowTrainer:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"EditFlow模型参数数量: {total_params:,}")
 
-        criterion = EditFlowLoss(scheduler_type='cubic', tokenizer=tokenizer)
+        criterion = ContinuousFlowLoss(scheduler_type='cubic')
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate,
@@ -302,10 +402,8 @@ class EditFlowTrainer:
 
         # 多GPU设置优化
         if self.use_data_parallel and self.gpu_count > 1:
-            # 为多GPU训练优化batch size
             effective_batch_size = self.args.batch_size * self.gpu_count
             print(f"有效批次大小: {effective_batch_size} (每个GPU: {self.args.batch_size})")
-            # 如果需要，可以在这里添加梯度累积逻辑
 
         return model, condition_encoder, criterion, optimizer, tokenizer
 
@@ -337,54 +435,87 @@ class EditFlowTrainer:
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
             residuals = batch['residuals'].to(self.device)
-            curr_token_ids = batch['curr_token_ids'].to(self.device)
-            target_token_ids = batch['target_token_ids'].to(self.device)
-            alignment = batch['alignment']
+            z0_token_ids = batch['z0_token_ids'].to(self.device)
+            z1_token_ids = batch['z1_token_ids'].to(self.device)
+            gap_token = batch['gap_token']
 
-            t = torch.rand(curr_token_ids.size(0), 1, device=self.device)
+            # 随机采样时间步
+            t = torch.rand(z0_token_ids.size(0), 1, device=self.device)
 
-            # 检查条件编码器输出
             try:
                 condition = condition_encoder(x_values, residuals)
             except Exception as e:
                 print(f"❌ 条件编码器计算错误: {e}")
                 continue
 
-            import random
-            x_t = curr_token_ids if random.random() < 0.5 else sample_conditional_path(
-                curr_token_ids, target_token_ids, t, criterion.scheduler
+            # 计算词汇表大小（包括gap token）
+            effective_vocab_size = max(dataset.gap_token + 1, config.vocab_size + 200)
+
+            # 在Z空间中插值采样
+            z0_probs = tokens_to_prob(z0_token_ids, effective_vocab_size)
+            z1_probs = tokens_to_prob(z1_token_ids, effective_vocab_size)
+            z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
+
+            # 移除gap token，得到x_t
+            x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
+                z_t, effective_vocab_size, dataset.pad_token, gap_token
             )
 
-            attention_mask = (x_t != dataset.pad_token).float()
+            # 模型前向传播
+            attention_mask = (~x_pad_mask).float()
             pred_rates, pred_ins_probs, pred_sub_probs = model(
                 input_ids=x_t, time_steps=t, condition=condition, attention_mask=attention_mask
             )
 
-            loss = criterion(
-                pred_rates=pred_rates, pred_ins_probs=pred_ins_probs, pred_sub_probs=pred_sub_probs,
-                alignment=alignment, t=t, vocab_size=config.vocab_size
+            # 构建编辑操作率张量
+            lambda_ins = pred_rates[:, :, 0:1]
+            lambda_sub = pred_rates[:, :, 1:2]
+            lambda_del = pred_rates[:, :, 2:3]
+
+            # 计算插入和替换的概率
+            ins_probs = lambda_ins * pred_ins_probs
+            sub_probs = lambda_sub * pred_sub_probs
+
+            # 扩展到完整的词汇表大小
+            extended_ins_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
+            extended_ins_probs[:, :, :pred_ins_probs.size(-1)] = ins_probs
+
+            extended_sub_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
+            extended_sub_probs[:, :, :pred_sub_probs.size(-1)] = sub_probs
+
+            # 组合所有操作率 (batch_size, seq_len, 2*vocab_size+1)
+            u_cat = torch.cat([
+                lambda_ins * extended_ins_probs,  # 插入操作
+                lambda_sub * extended_sub_probs,  # 替换操作
+                lambda_del                        # 删除操作
+            ], dim=-1)
+
+            # 将x_t的输出扩展到z_t空间
+            u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
+
+            # 计算目标mask
+            u_mask = criterion.make_ut_mask_from_z(
+                z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.pad_token
             )
+
+            # 计算损失
+            loss = criterion(u_z, u_mask, t, effective_vocab_size)
 
             # 梯度累积
             loss = loss / gradient_accumulation_steps
-
             optimizer.zero_grad()
 
-            # 检查损失是否为NaN
             if torch.isnan(loss):
                 print(f"❌ 损失为NaN，跳过反向传播")
                 continue
 
             loss.backward()
 
-            # 每gradient_accumulation_steps步或最后一个batch，执行优化步骤
+            # 执行优化步骤
             if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-
                 # 梯度检查
                 has_nan_gradients = False
-                # 检查模型梯度
                 if hasattr(model, 'module'):
-                    # 如果是DataParallel，检查module的参数
                     for name, param in model.module.named_parameters():
                         if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
                             has_nan_gradients = True
@@ -397,22 +528,6 @@ class EditFlowTrainer:
                             print(f"❌ 模型参数 {name} 包含 NaN/Inf 梯度")
                             break
 
-                # 检查条件编码器梯度
-                if not has_nan_gradients:
-                    if hasattr(condition_encoder, 'module'):
-                        for name, param in condition_encoder.module.named_parameters():
-                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                has_nan_gradients = True
-                                print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
-                                break
-                    else:
-                        for name, param in condition_encoder.named_parameters():
-                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                has_nan_gradients = True
-                                print(f"❌ 条件编码器参数 {name} 包含 NaN/Inf 梯度")
-                                break
-
-                # 如果没有NaN梯度，进行梯度裁剪和参数更新
                 if not has_nan_gradients:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
@@ -424,12 +539,10 @@ class EditFlowTrainer:
             total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
 
-            # 显示实时进度和GPU负载信息
+            # 显示进度
             postfix_dict = {
                 'loss': f'{loss.item() * gradient_accumulation_steps:.4f}'
             }
-
-            # 添加多GPU负载信息
             if self.use_data_parallel and self.gpu_count > 1:
                 postfix_dict['gpu_load'] = get_gpu_memory_usage_string(max_gpus=3)
 
@@ -478,7 +591,7 @@ class EditFlowTrainer:
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
-        print(f"开始训练 ({self.args.num_epochs} epochs)...")
+        print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
 
         for epoch in range(self.args.num_epochs):
             total_loss = 0.0
@@ -506,7 +619,7 @@ class EditFlowTrainer:
                 print(f"检查点已保存到: {checkpoint_path}")
 
         import os
-        final_model_path = os.path.join(self.args.save_dir, "editflow_final.pth")
+        final_model_path = os.path.join(self.args.save_dir, "continuous_flow_final.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
         # 处理DataParallel模型的状态字典
@@ -529,7 +642,8 @@ class EditFlowTrainer:
             'config': config,
             'args': self.args,
             'use_data_parallel': self.use_data_parallel,
-            'gpu_count': self.gpu_count
+            'gpu_count': self.gpu_count,
+            'scheduler_type': 'cubic'
         }, final_model_path)
 
         print(f"最终模型已保存到: {final_model_path}")

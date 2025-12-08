@@ -184,23 +184,82 @@ def generate_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, ma
 
     return samples
 
-def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
-    """生成三元组样本 (E_curr, E_target, r, z) 用于EditFlow预训练"""
+def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
+    """使用Levenshtein距离计算两个token序列的对齐，返回包含gap token的等长序列"""
+    m, n = len(tokens1), len(tokens2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    # 初始化边界条件
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    # 填充DP表
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if tokens1[i-1] == tokens2[j-1]:
+                dp[i][j] = dp[i-1][j-1]  # 匹配，无代价
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])  # 插入、删除、替换
+
+    # 回溯构建对齐序列
+    z1, z2 = [], []
+    i, j = m, n
+
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and tokens1[i-1] == tokens2[j-1]:
+            # 匹配
+            z1.append(tokens1[i-1])
+            z2.append(tokens2[j-1])
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+            # 替换
+            z1.append(tokens1[i-1])
+            z2.append(tokens2[j-1])
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+            # 删除（从tokens1中删除）
+            z1.append(tokens1[i-1])
+            z2.append("<gap>")  # gap token标记
+            i -= 1
+        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
+            # 插入（向tokens1中插入）
+            z1.append("<gap>")  # gap token标记
+            z2.append(tokens2[j-1])
+            j -= 1
+
+    # 反转序列，因为我们是反向构建的
+    return list(reversed(z1)), list(reversed(z2))
+
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
+    """生成用于EditFlow连续流训练的样本"""
     samples = []
     dimension_count = {}
 
-    print(f"生成 {num_samples} 个三元组样本用于EditFlow预训练...")
+    print(f"生成 {num_samples} 个连续流训练样本...")
 
-    for i in tqdm(range(num_samples), desc="生成三元组数据"):
+    for i in tqdm(range(num_samples), desc="生成流数据"):
         dim = random.randint(1, max_dim)
         dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
+        # 生成数据点
         x_values = np.linspace(-5.0, 5.0, n_points).reshape(-1, 1) if dim == 1 else np.random.uniform(-5.0, 5.0, (n_points, dim))
 
+        # 生成目标表达式和当前表达式
         target_expr = generate_random_expr(dim, max_depth)
         y_target = evaluate_expr(target_expr, x_values)
         curr_expr = corrupt_expression(target_expr, corruption_prob=0.7)
         y_curr = evaluate_expr(curr_expr, x_values)
+
+        # 转换为token序列
+        target_tokens = expr_to_tree(target_expr).split(',')
+        curr_tokens = expr_to_tree(curr_expr).split(',')
+
+        # 对齐到Z空间，包含gap token
+        z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
 
         samples.append({
             "input_dimension": dim,
@@ -212,7 +271,11 @@ def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int =
             "exp_gt": str(target_expr),
             "tree_cur1": expr_to_tree(curr_expr),
             "exp_cur1": str(curr_expr),
-            "alignment_vector": compute_expression_alignment(curr_expr, target_expr)
+            "curr_tokens": curr_tokens,
+            "target_tokens": target_tokens,
+            "z0_tokens": z0_tokens,  # 对齐后的当前序列（包含gap）
+            "z1_tokens": z1_tokens,  # 对齐后的目标序列（包含gap）
+            "edit_distance": len([op for op in range(len(z0_tokens)) if z0_tokens[op] != z1_tokens[op]])
         })
 
     print(f"\n样本维度分布:")
@@ -221,56 +284,11 @@ def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int =
 
     return samples
 
+def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
+    """生成三元组样本 (E_curr, E_target, r, z) 用于EditFlow预训练（保持向后兼容）"""
+    return generate_flow_samples(num_samples, max_dim, n_points, max_depth)
 
-def compute_expression_alignment(curr_expr: sp.Expr, target_expr: sp.Expr) -> Dict:
-    """计算两个表达式之间的对齐路径"""
-    curr_tokens = expr_to_tree(curr_expr).split(',')
-    target_tokens = expr_to_tree(target_expr).split(',')
-    alignment = levenshtein_alignment(curr_tokens, target_tokens)
 
-    return {
-        'curr_tokens': curr_tokens,
-        'target_tokens': target_tokens,
-        'alignment': alignment,
-        'edit_distance': len([op for op, _, _ in alignment if op != 'keep'])
-    }
-
-def levenshtein_alignment(tokens1: List[str], tokens2: List[str]) -> List[Tuple[str, str, str]]:
-    """计算两个token序列的Levenshtein对齐路径"""
-    m, n = len(tokens1), len(tokens2)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if tokens1[i-1] == tokens2[j-1]:
-                dp[i][j] = dp[i-1][j-1]
-            else:
-                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
-
-    alignment = []
-    i, j = m, n
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and tokens1[i-1] == tokens2[j-1]:
-            alignment.append(('keep', tokens1[i-1], tokens2[j-1]))
-            i -= 1
-            j -= 1
-        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
-            alignment.append(('substitute', tokens1[i-1], tokens2[j-1]))
-            i -= 1
-            j -= 1
-        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
-            alignment.append(('delete', tokens1[i-1], ''))
-            i -= 1
-        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
-            alignment.append(('insert', '', tokens2[j-1]))
-            j -= 1
-
-    return list(reversed(alignment))
 
 
 def save_to_txt(samples: List[Dict], filename: str):

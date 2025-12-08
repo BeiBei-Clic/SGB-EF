@@ -1,6 +1,6 @@
 """
-EditFlow符号回归预训练主脚本
-实现基于残差条件的编辑流模型训练
+EditFlow连续流符号回归预训练主脚本
+实现基于多步连续流匹配的编辑流模型训练
 """
 
 import argparse
@@ -9,7 +9,7 @@ import random
 import numpy as np
 import torch
 
-from src.training.editflow_trainer import EditFlowTrainer
+from src.training.editflow_trainer import ContinuousFlowTrainer
 from src.utils.gpu_monitor import display_gpu_info
 
 
@@ -66,11 +66,11 @@ def main():
     # 设置随机种子
     set_seed(args.seed)
 
-    # 创建训练器并开始训练
-    trainer = EditFlowTrainer(args)
+    # 创建连续流训练器并开始训练
+    trainer = ContinuousFlowTrainer(args)
     model, condition_encoder = trainer.train()
 
-    print("\n训练完成!")
+    print("\n连续流训练完成!")
 
 
 if __name__ == "__main__":
