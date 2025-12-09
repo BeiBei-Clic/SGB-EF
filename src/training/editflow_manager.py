@@ -16,6 +16,7 @@ from ..modeling.condition_encoder import ConditionEncoder
 from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
 from ..utils.special_tokens import SpecialTokensManager
 from ..utils.gpu_monitor import get_gpu_memory_info, get_gpu_memory_usage_string
+from ..utils.misc_utils import find_latest_checkpoint
 
 
 class KappaScheduler:
@@ -273,21 +274,16 @@ class EditFlowManager:
         print("初始化tokenizer和模型...")
 
         # 首先初始化tokenizer，获取预训练模型的词汇表
-        model_name = getattr(self.args, 'base_model_name', "openai-community/gpt2")
+        model_name = getattr(self.args, 'base_model_name', "google-bert/bert-base-uncased")
 
         # 设置模型缓存目录
         cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
-        import os
         os.makedirs(cache_dir, exist_ok=True)
 
         print(f"正在加载tokenizer: {model_name}")
         print(f"模型缓存目录: {cache_dir}")
         tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         print(f"✓ Tokenizer加载完成")
-
-        # 确保tokenizer有pad token
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
 
         print(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
@@ -496,7 +492,6 @@ class EditFlowManager:
 
     
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
-        import os
         checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
@@ -526,40 +521,11 @@ class EditFlowManager:
 
         return checkpoint_path
 
-    def _find_latest_checkpoint(self):
-        """查找最新的检查点文件"""
-        import os
-        import glob
-
-        save_dir = getattr(self.args, 'save_dir', 'checkpoints')
-
-        # 查找所有epoch检查点
-        pattern = os.path.join(save_dir, "editflow_epoch_*.pth")
-        checkpoint_files = glob.glob(pattern)
-
-        if checkpoint_files:
-            # 提取epoch数字并排序
-            def get_epoch_number(filepath):
-                filename = os.path.basename(filepath)
-                epoch_str = filename.replace('editflow_epoch_', '').replace('.pth', '')
-                return int(epoch_str)
-
-            # 返回最新epoch的检查点
-            latest_checkpoint = max(checkpoint_files, key=get_epoch_number)
-            return latest_checkpoint
-
-        # 如果没有epoch检查点，尝试final模型
-        final_model = os.path.join(save_dir, "continuous_flow_final.pth")
-        if os.path.exists(final_model):
-            return final_model
-
-        return None
-
     def train(self):
         print(f"使用设备: {self.device}")
 
         # 检查是否有可用的检查点文件
-        checkpoint_path = self._find_latest_checkpoint()
+        checkpoint_path = find_latest_checkpoint(self.args)
         if checkpoint_path:
             print(f"找到检查点: {checkpoint_path}")
         else:
@@ -600,7 +566,6 @@ class EditFlowManager:
                 )
                 print(f"检查点已保存到: {checkpoint_path}")
 
-        import os
         final_model_path = os.path.join(self.args.save_dir, "continuous_flow_final.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 

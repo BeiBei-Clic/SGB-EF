@@ -13,7 +13,7 @@ class EditFlowConfig:
     """EditFlow Transformer配置类 - 不继承PretrainedConfig以避免AutoModel系统冲突"""
 
     def __init__(self, max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
-                 base_model_name="openai-community/gpt2", use_condition_injection=True,
+                 base_model_name="google-bert/bert-base-uncased", use_condition_injection=True,
                  time_embedding_type="sinusoidal", **kwargs):
         self.max_seq_len = max_seq_len
         self.dropout = dropout

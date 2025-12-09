@@ -11,7 +11,7 @@ from transformers import AutoModel, AutoTokenizer
 class ConditionEncoder(nn.Module):
     """使用Hugging Face模型编码残差点集为条件向量"""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
+    def __init__(self, model_name: str = "google/embeddinggemma-300m"):
         super().__init__()
 
         # 设置本地缓存目录

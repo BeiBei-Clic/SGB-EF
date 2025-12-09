@@ -12,7 +12,7 @@ from src.training.editflow_manager import EditFlowManager
 class SimpleArgs:
     def __init__(self):
         self.seed = 42
-        self.base_model_name = "openai-community/gpt2"
+        self.base_model_name = "google-bert/bert-base-uncased"
         self.use_data_parallel = False
         self.learning_rate = 1e-4
         self.weight_decay = 1e-5

@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")
 
     # 模型参数
-    parser.add_argument("--base_model_name", type=str, default="openai-community/gpt2", help="基础模型名称")
+    parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=6, help="批次大小 (每个GPU)")
