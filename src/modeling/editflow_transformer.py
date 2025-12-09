@@ -1,30 +1,28 @@
 """
 EditFlow Transformer - 基于Transformer的符号回归编辑流模型
 """
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
 import math
+from pathlib import Path
 
 
 class EditFlowConfig:
     """EditFlow Transformer配置类 - 不继承PretrainedConfig以避免AutoModel系统冲突"""
 
-    def __init__(self, max_seq_len=1024, dropout=0.1, pad_token_id=1, condition_dim=None,
-                 base_model_name="google-bert/bert-base-uncased", use_condition_injection=True,
-                 time_embedding_type="sinusoidal", **kwargs):
+    def __init__(self, max_seq_len=128, dropout=0.1, pad_token_id=1, condition_dim=None,
+                 base_model_name="google-bert/bert-base-uncased", use_condition_injection=True, **kwargs):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.pad_token_id = pad_token_id
         self.condition_dim = condition_dim  # 需要从外部设置
         self.base_model_name = base_model_name
         self.use_condition_injection = use_condition_injection
-        self.time_embedding_type = time_embedding_type
 
         # 这些参数将从预训练模型动态获取
-        self.vocab_size = None
         self.hidden_dim = None
         self.num_layers = None
         self.num_heads = None
@@ -93,10 +91,7 @@ class EditFlowTransformer(nn.Module):
         # 加载预训练的transformer模型
         if hasattr(config, 'base_model_name') and config.base_model_name:
             # 设置缓存目录
-            import os
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(current_dir))
-            cache_dir = os.path.join(project_root, "models", "huggingface_cache")
+            cache_dir = Path("../../../models/huggingface_cache").resolve()
             os.makedirs(cache_dir, exist_ok=True)
 
             print(f"正在加载基础模型: {config.base_model_name}")
@@ -113,30 +108,19 @@ class EditFlowTransformer(nn.Module):
 
             # 自动获取模型配置
             self.model_config = self.base_model.config
-            config.vocab_size = getattr(self.model_config, 'vocab_size', tokenizer.vocab_size if hasattr(self, 'tokenizer') else 50265)
-            config.hidden_dim = getattr(self.model_config, 'hidden_size', 768)
-            config.num_heads = getattr(self.model_config, 'num_attention_heads', 12)
-            config.num_layers = getattr(self.model_config, 'num_hidden_layers', 6)
+            config.vocab_size = getattr(self.model_config, 'vocab_size')
+            config.hidden_dim = getattr(self.model_config, 'hidden_size')
+            config.num_heads = getattr(self.model_config, 'num_attention_heads')
+            config.num_layers = getattr(self.model_config, 'num_hidden_layers')
         else:
             raise ValueError("必须指定base_model_name")
 
-        # 额外的位置嵌入（与基础模型的嵌入结合使用）
-        self.extra_position_embedding = nn.Embedding(config.max_seq_len, config.hidden_dim)
-
-        # 时间嵌入
-        if config.time_embedding_type == "sinusoidal":
-            self.time_embedding = nn.Sequential(
-                SinusoidalTimeEmbedding(config.hidden_dim),
-                nn.Linear(config.hidden_dim, config.hidden_dim),
-                nn.ReLU(),
-                nn.Linear(config.hidden_dim, config.hidden_dim)
-            )
-        else:
-            self.time_embedding = nn.Sequential(
-                nn.Linear(1, config.hidden_dim),
-                nn.ReLU(),
-                nn.Linear(config.hidden_dim, config.hidden_dim)
-            )
+        self.time_embedding = nn.Sequential(
+            SinusoidalTimeEmbedding(config.hidden_dim),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim)
+        )
 
         # 条件处理
         self.condition_projection = nn.Linear(config.condition_dim, config.hidden_dim)
@@ -175,21 +159,12 @@ class EditFlowTransformer(nn.Module):
             # 默认使用随机时间步或固定时间步
             time_steps = torch.rand(batch_size, 1, device=input_ids.device)
 
-        # 时间嵌入
-        if self.config.time_embedding_type == "sinusoidal":
-            time_emb = self.time_embedding(time_steps)
-        else:
-            time_emb = self.time_embedding(time_steps.float())
-        time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
+        time_emb = self.time_embedding(time_steps)
 
         # 自动生成条件嵌入（如果没有提供）
         if condition is None:
             # 默认使用零条件
             condition = torch.zeros(batch_size, self.config.condition_dim, device=input_ids.device)
-
-        # 额外的位置嵌入
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        extra_pos_emb = self.extra_position_embedding(positions)
 
         # 获取基础模型的输出
         base_outputs = self.base_model(
@@ -199,7 +174,7 @@ class EditFlowTransformer(nn.Module):
         hidden_states = base_outputs.last_hidden_state
 
         # 添加时间和位置嵌入
-        hidden_states = hidden_states + extra_pos_emb + time_emb
+        hidden_states = hidden_states + time_emb
 
         # 条件注入
         condition_proj = self.condition_projection(condition)

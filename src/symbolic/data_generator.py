@@ -93,7 +93,7 @@ def apply_unary_op(op: str, operand: sp.Expr) -> sp.Expr:
     if op == 'sin': return sp.sin(operand)
     elif op == 'cos': return sp.cos(operand)
     elif op == 'tan': return sp.tan(operand)
-    elif op == 'exp': return sp.exp(operand) / (1 + sp.exp(operand-20))
+    elif op == 'exp': return sp.exp(operand)
     elif op == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
     elif op == 'sqrt': return sp.sqrt(abs(operand))
     return operand
@@ -288,9 +288,6 @@ def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int =
     """生成三元组样本 (E_curr, E_target, r, z) 用于EditFlow预训练（保持向后兼容）"""
     return generate_flow_samples(num_samples, max_dim, n_points, max_depth)
 
-
-
-
 def save_to_txt(samples: List[Dict], filename: str):
     """将样本保存到txt文件"""
     os.makedirs("/home/xyh/SGB-EF/data", exist_ok=True)
@@ -310,7 +307,7 @@ def save_triplets_to_txt(samples: List[Dict], filename: str):
 
     with open(filepath, 'w', encoding='utf-8') as f:
         for sample in samples:
-            line = f'{{"x_values":{sample["x_values"]},"residuals":{sample["residuals"]},"curr_tree":"{sample["tree_cur1"]}","target_tree":"{sample["tree_gt"]}","alignment":{sample["alignment_vector"]}}}\n'
+            line = f'{{"x_values":{sample["x_values"]},"residuals":{sample["residuals"]},"curr_tree":"{sample["tree_cur1"]}","target_tree":"{sample["tree_gt"]}","z0_tokens":{sample["z0_tokens"]},"z1_tokens":{sample["z1_tokens"]}}}\n'
             f.write(line)
 
     print(f"已保存 {len(samples)} 个三元组样本到 {filepath}")

@@ -8,10 +8,11 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 
+
 class ConditionEncoder(nn.Module):
     """使用Hugging Face模型编码残差点集为条件向量"""
 
-    def __init__(self, model_name: str = "google/embeddinggemma-300m"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
         super().__init__()
 
         # 设置本地缓存目录
@@ -34,9 +35,11 @@ class ConditionEncoder(nn.Module):
         Returns:
             condition: (batch_size, output_dim) 条件向量
         """
-        # 确保输入为3维
-        x_values = x_values.unsqueeze(-1) if x_values.dim() == 2 else x_values
-        residuals = residuals.unsqueeze(-1) if residuals.dim() == 2 else residuals
+        if x_values.dim()==2 and residuals.dim()==2:
+            x_values = x_values.unsqueeze(-1)
+            residuals = residuals.unsqueeze(-1)
+        else:
+            raise ValueError(f"x_values and residuals must be 2D tensors,but got x_values.shape={x_values.shape} and residuals.shape={residuals.shape}")
 
         # 拼接并转换为文本
         points = torch.cat([x_values, residuals], dim=-1)
@@ -48,6 +51,7 @@ class ConditionEncoder(nn.Module):
                           for i in range(points.shape[1])]
             texts.append(f"Instruct: {task}\nQuery: {' '.join(point_texts)}")
 
+        print(texts)
         # 编码文本
         inputs = self.tokenizer(
             texts,

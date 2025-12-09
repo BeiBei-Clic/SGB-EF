@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from tqdm import tqdm
 
 from .editflow_manager import KappaScheduler, remove_gap_tokens, fill_gap_tokens_with_repeats
+from ..utils.special_tokens import SpecialTokensManager
 
 
 class EulerSampler:
@@ -32,7 +33,8 @@ class EulerSampler:
         # 特殊token
         self.pad_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         self.bos_token = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
-        self.gap_token = self.config.vocab_size + 100  # 与训练时一致
+        self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
+        self.gap_token = self.special_tokens_manager.get_gap_token_id()
 
     def get_adaptive_step_size(self, h: float, t: torch.Tensor) -> torch.Tensor:
         """自适应步长，避免超过t=1"""

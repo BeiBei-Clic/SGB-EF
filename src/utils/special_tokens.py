@@ -15,6 +15,9 @@ class SpecialTokensManager:
     # 函数定义
     FUNCTIONS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
 
+    # 占位符定义
+    GAP_TOKEN = '<gap>'
+
     # 默认最大变量维度
     DEFAULT_MAX_DIM = 10
 
@@ -32,11 +35,7 @@ class SpecialTokensManager:
         # 构建所有特殊token的映射
         self.special_tokens = {}
         self.token_to_id = {}  # 添加token到ID的映射
-        self._build_token_mappings()
 
-    def _build_token_mappings(self):
-        """构建token映射"""
-        # 添加运算符
         for op in self.OPERATORS:
             self.special_tokens[op] = op
 
@@ -49,9 +48,23 @@ class SpecialTokensManager:
             var_name = f'x{i}'
             self.special_tokens[var_name] = var_name
 
+        # 添加占位符token
+        self.special_tokens[self.GAP_TOKEN] = self.GAP_TOKEN
+
     def get_special_tokens(self) -> Dict[str, str]:
         """获取所有特殊token映射"""
         return self.special_tokens.copy()
+
+    def get_gap_token_id(self) -> int:
+        """
+        获取gap token的ID
+
+        Returns:
+            gap token的ID
+        """
+        # 使用tokenizer编码gap token获取ID
+        tokens = self.tokenizer.encode(self.GAP_TOKEN, add_special_tokens=False)
+        return tokens[0]
 
     def get_function_token_map(self) -> Dict[str, int]:
         """
