@@ -5,6 +5,8 @@ EditFlow连续流训练器 - 实现基于连续时间流匹配的编辑流模型
 import torch
 import numpy as np
 import time
+import argparse
+import os
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -358,12 +360,30 @@ class EditFlowManager:
 
         return dataloaders, datasets, dimension_groups
 
-    def setup_models(self):
+    def setup_models(self, checkpoint_path=None):
+        """
+        初始化模型和tokenizer，支持从检查点加载
+
+        Args:
+            checkpoint_path: 检查点文件路径，如果为None则创建新模型
+
+        Returns:
+            model, condition_encoder, criterion, optimizer, tokenizer
+        """
         print("初始化tokenizer和模型...")
 
         # 首先初始化tokenizer，获取预训练模型的词汇表
         model_name = getattr(self.args, 'base_model_name', "openai-community/gpt2")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # 设置模型缓存目录
+        cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
+        import os
+        os.makedirs(cache_dir, exist_ok=True)
+
+        print(f"正在加载tokenizer: {model_name}")
+        print(f"模型缓存目录: {cache_dir}")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        print(f"✓ Tokenizer加载完成")
 
         # 确保tokenizer有pad token
         if tokenizer.pad_token is None:
@@ -390,6 +410,57 @@ class EditFlowManager:
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
             condition_encoder = torch.nn.DataParallel(condition_encoder, device_ids=self.device_ids)
 
+        # 如果提供了检查点路径，加载预训练模型
+        checkpoint = None
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            print(f"正在加载预训练模型: {checkpoint_path}")
+
+            # 添加安全全局类以支持weights_only加载
+            torch.serialization.add_safe_globals([
+                EditFlowConfig,
+                argparse.Namespace
+            ])
+
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+
+            # 获取保存时的状态信息
+            saved_model_was_dataparallel = checkpoint.get('model_was_dataparallel', False)
+            saved_encoder_was_dataparallel = checkpoint.get('encoder_was_dataparallel', False)
+
+            # 加载模型状态
+            if 'model_state_dict' in checkpoint:
+                model_state = checkpoint['model_state_dict']
+
+                # 根据保存和当前状态的差异，调整键名
+                current_model_is_dataparallel = hasattr(model, 'module')
+
+                if saved_model_was_dataparallel and not current_model_is_dataparallel:
+                    # 保存时是DataParallel，当前不是：移除module.前缀
+                    model_state = {key.replace('module.', ''): value for key, value in model_state.items()}
+                elif not saved_model_was_dataparallel and current_model_is_dataparallel:
+                    # 保存时不是DataParallel，当前是：添加module.前缀
+                    model_state = {f'module.{key}': value for key, value in model_state.items()}
+
+                model.load_state_dict(model_state)
+                print("✓ EditFlow模型加载完成")
+
+            # 加载条件编码器状态
+            if 'condition_encoder_state_dict' in checkpoint:
+                encoder_state = checkpoint['condition_encoder_state_dict']
+
+                # 根据保存和当前状态的差异，调整键名
+                current_encoder_is_dataparallel = hasattr(condition_encoder, 'module')
+
+                if saved_encoder_was_dataparallel and not current_encoder_is_dataparallel:
+                    # 保存时是DataParallel，当前不是：移除module.前缀
+                    encoder_state = {key.replace('module.', ''): value for key, value in encoder_state.items()}
+                elif not saved_encoder_was_dataparallel and current_encoder_is_dataparallel:
+                    # 保存时不是DataParallel，当前是：添加module.前缀
+                    encoder_state = {f'module.{key}': value for key, value in encoder_state.items()}
+
+                condition_encoder.load_state_dict(encoder_state)
+                print("✓ 条件编码器加载完成")
+
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"EditFlow模型参数数量: {total_params:,}")
 
@@ -399,6 +470,11 @@ class EditFlowManager:
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay
         )
+
+        # 如果有检查点，也加载优化器状态
+        if checkpoint and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("✓ 优化器状态加载完成")
 
         # 多GPU设置优化
         if self.use_data_parallel and self.gpu_count > 1:
@@ -636,16 +712,13 @@ class EditFlowManager:
         checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
-        # 处理DataParallel模型的状态字典
-        if hasattr(model, 'module'):
-            model_state = model.module.state_dict()
-        else:
-            model_state = model.state_dict()
+        # 检查模型是否被DataParallel包装
+        model_is_dataparallel = hasattr(model, 'module')
+        encoder_is_dataparallel = hasattr(condition_encoder, 'module')
 
-        if hasattr(condition_encoder, 'module'):
-            condition_encoder_state = condition_encoder.module.state_dict()
-        else:
-            condition_encoder_state = condition_encoder.state_dict()
+        # 保存原始状态字典（保持DataParallel的module.前缀）
+        model_state = model.state_dict()
+        condition_encoder_state = condition_encoder.state_dict()
 
         torch.save({
             'epoch': epoch + 1,
@@ -656,16 +729,56 @@ class EditFlowManager:
             'config': config,
             'args': self.args,
             'use_data_parallel': self.use_data_parallel,
-            'gpu_count': self.gpu_count
+            'gpu_count': self.gpu_count,
+            # 添加保存时的状态信息
+            'model_was_dataparallel': model_is_dataparallel,
+            'encoder_was_dataparallel': encoder_is_dataparallel,
+            'saved_with_dataparallel_setting': self.use_data_parallel and self.gpu_count > 1
         }, checkpoint_path)
 
         return checkpoint_path
 
+    def _find_latest_checkpoint(self):
+        """查找最新的检查点文件"""
+        import os
+        import glob
+
+        save_dir = getattr(self.args, 'save_dir', 'checkpoints')
+
+        # 查找所有epoch检查点
+        pattern = os.path.join(save_dir, "editflow_epoch_*.pth")
+        checkpoint_files = glob.glob(pattern)
+
+        if checkpoint_files:
+            # 提取epoch数字并排序
+            def get_epoch_number(filepath):
+                filename = os.path.basename(filepath)
+                epoch_str = filename.replace('editflow_epoch_', '').replace('.pth', '')
+                return int(epoch_str)
+
+            # 返回最新epoch的检查点
+            latest_checkpoint = max(checkpoint_files, key=get_epoch_number)
+            return latest_checkpoint
+
+        # 如果没有epoch检查点，尝试final模型
+        final_model = os.path.join(save_dir, "continuous_flow_final.pth")
+        if os.path.exists(final_model):
+            return final_model
+
+        return None
+
     def train(self):
         print(f"使用设备: {self.device}")
 
-        # 首先设置模型获取tokenizer
-        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models()
+        # 检查是否有可用的检查点文件
+        checkpoint_path = self._find_latest_checkpoint()
+        if checkpoint_path:
+            print(f"找到检查点: {checkpoint_path}")
+        else:
+            print("未找到检查点，将从基础模型开始训练")
+
+        # 使用setup_models加载模型（优先检查点，然后本地缓存，最后下载）
+        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 使用tokenizer准备数据
         dataloaders, datasets, dimension_groups = self.prepare_data(tokenizer)
@@ -703,16 +816,13 @@ class EditFlowManager:
         final_model_path = os.path.join(self.args.save_dir, "continuous_flow_final.pth")
         os.makedirs(self.args.save_dir, exist_ok=True)
 
-        # 处理DataParallel模型的状态字典
-        if hasattr(model, 'module'):
-            model_state = model.module.state_dict()
-        else:
-            model_state = model.state_dict()
+        # 检查模型是否被DataParallel包装
+        model_is_dataparallel = hasattr(model, 'module')
+        encoder_is_dataparallel = hasattr(condition_encoder, 'module')
 
-        if hasattr(condition_encoder, 'module'):
-            condition_encoder_state = condition_encoder.module.state_dict()
-        else:
-            condition_encoder_state = condition_encoder.state_dict()
+        # 保存原始状态字典（保持DataParallel的module.前缀）
+        model_state = model.state_dict()
+        condition_encoder_state = condition_encoder.state_dict()
 
         config = self._get_model_config(model)
         torch.save({
@@ -724,8 +834,161 @@ class EditFlowManager:
             'args': self.args,
             'use_data_parallel': self.use_data_parallel,
             'gpu_count': self.gpu_count,
-            'scheduler_type': 'cubic'
+            'scheduler_type': 'cubic',
+            # 添加保存时的状态信息
+            'model_was_dataparallel': model_is_dataparallel,
+            'encoder_was_dataparallel': encoder_is_dataparallel,
+            'saved_with_dataparallel_setting': self.use_data_parallel and self.gpu_count > 1
         }, final_model_path)
 
         print(f"最终模型已保存到: {final_model_path}")
         return model, condition_encoder
+
+    def inference_multi_step(self, model, condition_encoder, tokenizer, x_values, y_values,
+                           n_steps=50, device=None):
+        """多步推理算法 - 从空白表达式开始构建"""
+        if device is None:
+            device = self.device
+
+        model.eval()
+        condition_encoder.eval()
+
+        # 准备输入数据
+        x_values = torch.FloatTensor(x_values).unsqueeze(0).to(device)  # (1, n_points, dim)
+        y_values = torch.FloatTensor(y_values).unsqueeze(0).to(device)  # (1, n_points)
+
+        # 初始残差就是目标值本身（因为从空白开始）
+        residuals = y_values
+
+        # 计算条件嵌入
+        condition = condition_encoder(x_values, residuals)
+
+        # 从空白表达式开始
+        current_tokens = []
+
+        # 多步迭代推理
+        for step in range(n_steps):
+            print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
+
+            # 将当前表达式转换为token IDs
+            special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
+
+            if current_tokens:
+                tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
+            else:
+                tokenized_expr = []
+
+            # 添加BOS token并填充
+            max_len = 128
+            if len(tokenized_expr) > max_len - 1:
+                tokenized_expr = tokenized_expr[:max_len-1]
+
+            tokenized_expr = [tokenizer.bos_token_id if tokenizer.bos_token_id else tokenizer.cls_token_id] + tokenized_expr
+            tokenized_expr = tokenized_expr + [tokenizer.pad_token_id] * (max_len - len(tokenized_expr))
+
+            input_ids = torch.LongTensor([tokenized_expr]).to(device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).float()
+
+            # 时间步从0到1递增
+            t = torch.tensor([[step / n_steps]], dtype=torch.float32, device=device)
+
+            with torch.no_grad():
+                # 模型预测
+                rates, insert_probs, substitute_probs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    time_steps=t,
+                    condition=condition
+                )
+
+                # 解析预测结果
+                lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入率
+                lambda_sub = rates[0, :, 1].cpu().numpy()  # 替换率
+                lambda_del = rates[0, :, 2].cpu().numpy()  # 删除率
+
+                # 根据概率决定编辑操作
+                effective_length = int(attention_mask[0].sum().item())
+
+                # 找到最可能的编辑操作
+                best_pos = 0
+                best_action = None
+                best_score = -1
+
+                for pos in range(1, effective_length):
+                    # 检查插入操作
+                    if lambda_ins[pos] > best_score:
+                        best_score = lambda_ins[pos]
+                        best_action = ('insert', pos)
+
+                    # 检查替换操作（如果位置有token）
+                    if pos-1 < len(current_tokens) and lambda_sub[pos] > best_score:
+                        best_score = lambda_sub[pos]
+                        best_action = ('substitute', pos-1)
+
+                    # 检查删除操作（如果位置有token）
+                    if pos-1 < len(current_tokens) and lambda_del[pos] > best_score:
+                        best_score = lambda_del[pos]
+                        best_action = ('delete', pos-1)
+
+                # 执行最佳操作
+                if best_action and best_score > 0.1:  # 设置阈值避免过频繁编辑
+                    action_type, pos = best_action
+
+                    if action_type == 'insert':
+                        # 插入最高概率的token
+                        best_token = torch.argmax(insert_probs[0, pos]).item()
+                        if best_token < len(special_tokens_manager.token_to_id):
+                            for expr_elem, token_id in special_tokens_manager.token_to_id.items():
+                                if token_id == best_token:
+                                    current_tokens.insert(pos, expr_elem)
+                                    break
+
+                    elif action_type == 'substitute' and pos < len(current_tokens):
+                        # 替换为最高概率的token
+                        best_token = torch.argmax(substitute_probs[0, pos]).item()
+                        if best_token < len(special_tokens_manager.token_to_id):
+                            for expr_elem, token_id in special_tokens_manager.token_to_id.items():
+                                if token_id == best_token:
+                                    current_tokens[pos] = expr_elem
+                                    break
+
+                    elif action_type == 'delete' and pos < len(current_tokens):
+                        # 删除token
+                        del current_tokens[pos]
+
+            # 限制表达式长度
+            if len(current_tokens) > 50:
+                current_tokens = current_tokens[:50]
+
+        # 返回最终的表达式
+        final_expression = ','.join(current_tokens) if current_tokens else ""
+        print(f"最终表达式: {final_expression}")
+
+        return final_expression
+
+    def symbolic_regression(self, model_path, x_data, y_data):
+        """符号回归主函数 - 接收数据点对，输出表达式"""
+        print("开始符号回归推理...")
+        print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
+
+        # 检查模型路径是否存在
+        checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
+        if checkpoint_path:
+            print(f"使用检查点: {checkpoint_path}")
+        else:
+            print("未找到检查点，将使用基础模型进行推理")
+
+        # 使用setup_models加载所有模型组件
+        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+
+        # 执行多步推理
+        final_expression = self.inference_multi_step(
+            model=model,
+            condition_encoder=condition_encoder,
+            tokenizer=tokenizer,
+            x_values=x_data,
+            y_values=y_data,
+            n_steps=30  # 推理步数
+        )
+
+        return final_expression

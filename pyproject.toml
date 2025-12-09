@@ -5,6 +5,7 @@ description = "SGB-EF Symbolic Regression Data Generation"
 dependencies = [
     "sympy>=1.12",
     "numpy>=1.24",
+    "nvidia-ml-py>=13.590.44",
 ]
 
 [tool.uv]
