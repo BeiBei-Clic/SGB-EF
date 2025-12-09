@@ -165,25 +165,6 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
         "exp_cur1": str(curr_expr)
     }
 
-def generate_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
-    """生成多样维度的样本"""
-    samples = []
-    dimension_count = {}
-
-    for i in range(num_samples):
-        dim = random.randint(1, max_dim)
-        dimension_count[dim] = dimension_count.get(dim, 0) + 1
-        samples.append(generate_sample(dim, n_points, max_depth))
-
-        if (i + 1) % 10 == 0:
-            print(f"已生成 {i + 1}/{num_samples} 个样本")
-
-    print(f"\n样本维度分布:")
-    for dim, count in sorted(dimension_count.items()):
-        print(f"{dim}维: {count} 个样本")
-
-    return samples
-
 def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
     """使用Levenshtein距离计算两个token序列的对齐，返回包含gap token的等长序列"""
     m, n = len(tokens1), len(tokens2)
@@ -284,31 +265,5 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     return samples
 
-def generate_triplet_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
-    """生成三元组样本 (E_curr, E_target, r, z) 用于EditFlow预训练（保持向后兼容）"""
-    return generate_flow_samples(num_samples, max_dim, n_points, max_depth)
 
-def save_to_txt(samples: List[Dict], filename: str):
-    """将样本保存到txt文件"""
-    os.makedirs("/home/xyh/SGB-EF/data", exist_ok=True)
-    filepath = os.path.join("/home/xyh/SGB-EF/data", filename)
-
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for sample in samples:
-            line = f'{{x:{sample["x"]},y:{sample["y"]},tree_gt:"{sample["tree_gt"]}",exp_gt:"{sample["exp_gt"]}",tree_cur1:"{sample["tree_cur1"]}",exp_cur1:"{sample["exp_cur1"]}"}}\n'
-            f.write(line)
-
-    print(f"已保存 {len(samples)} 个样本到 {filepath}")
-
-def save_triplets_to_txt(samples: List[Dict], filename: str):
-    """将三元组样本保存到txt文件"""
-    os.makedirs("/home/xyh/SGB-EF/data", exist_ok=True)
-    filepath = os.path.join("/home/xyh/SGB-EF/data", filename)
-
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for sample in samples:
-            line = f'{{"x_values":{sample["x_values"]},"residuals":{sample["residuals"]},"curr_tree":"{sample["tree_cur1"]}","target_tree":"{sample["tree_gt"]}","z0_tokens":{sample["z0_tokens"]},"z1_tokens":{sample["z1_tokens"]}}}\n'
-            f.write(line)
-
-    print(f"已保存 {len(samples)} 个三元组样本到 {filepath}")
 
