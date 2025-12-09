@@ -28,30 +28,31 @@ class ConditionEncoder(nn.Module):
 
     def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
         """
-        编码残差点集
+        编码残差点集 - 支持任意维度输入
         Args:
-            x_values: (batch_size, num_points) x值
+            x_values: (batch_size, num_points, input_dim) x值列表，input_dim可以是1,2,3,4...任意维度
             residuals: (batch_size, num_points) 残差值
         Returns:
             condition: (batch_size, output_dim) 条件向量
         """
-        if x_values.dim()==2 and residuals.dim()==2:
-            x_values = x_values.unsqueeze(-1)
-            residuals = residuals.unsqueeze(-1)
-        else:
-            raise ValueError(f"x_values and residuals must be 2D tensors,but got x_values.shape={x_values.shape} and residuals.shape={residuals.shape}")
+        batch_size, num_points = residuals.shape
+        input_dim = x_values.shape[2]  # 可以是1,2,3,4...任意维度
 
-        # 拼接并转换为文本
-        points = torch.cat([x_values, residuals], dim=-1)
+        # 将数据点转换为文本
         task = "Generate numerical embeddings for symbolic regression data points"
-
         texts = []
-        for b in range(points.shape[0]):
-            point_texts = [f"Data point: x={points[b, i, 0].item():.6f}, r={points[b, i, 1].item():.6f}"
-                          for i in range(points.shape[1])]
+
+        for b in range(batch_size):
+            point_texts = []
+            for i in range(num_points):
+                # 统一处理：将x的所有维度作为一个列表，支持任意维度(1D,2D,3D,4D,...)
+                x_vals = [x_values[b, i, d].item() for d in range(input_dim)]
+                x_str = ','.join(f"{x_val:.6f}" for x_val in x_vals)
+                r_val = residuals[b, i].item()
+                point_texts.append(f"Data point: [{x_str}], r={r_val:.6f}")
+
             texts.append(f"Instruct: {task}\nQuery: {' '.join(point_texts)}")
 
-        print(texts)
         # 编码文本
         inputs = self.tokenizer(
             texts,
@@ -59,7 +60,7 @@ class ConditionEncoder(nn.Module):
             truncation=True,
             max_length=512,
             return_tensors="pt"
-        ).to(points.device)
+        ).to(x_values.device)
 
         outputs = self.model(**inputs)
         embeddings = outputs.last_hidden_state[:, -1]

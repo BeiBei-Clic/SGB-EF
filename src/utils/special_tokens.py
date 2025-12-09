@@ -13,7 +13,7 @@ class SpecialTokensManager:
     OPERATORS = ['add', 'sub', 'mul', 'div', 'pow']
 
     # 函数定义
-    FUNCTIONS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
+    FUNCTIONS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
 
     # 占位符定义
     GAP_TOKEN = '<gap>'

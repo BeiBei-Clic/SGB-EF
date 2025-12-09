@@ -137,7 +137,7 @@ class FlowDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
         self.pad_token = tokenizer.pad_token_id
-        self.bos_token = tokenizer.bos_token_id
+        self.bos_token = tokenizer.cls_token_id  # BERT使用cls_token
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
         self.gap_token = self.special_tokens_manager.get_gap_token_id()
 
@@ -156,15 +156,18 @@ class FlowDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         x_values = torch.FloatTensor(sample['x_values'])
         residuals = torch.FloatTensor(sample['residuals'])
-        if residuals.dim() == 1:
-            residuals = residuals.unsqueeze(-1)
+        # residuals应该保持为1D张量，在collate_fn中会被正确地堆叠为2D
 
         z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
         z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
 
         max_len = 128
         def pad_z_sequence(tokens):
-            tokens = [self.bos_token] + tokens[:max_len-1]
+            # 过滤掉None值，并确保所有token都是整数
+            filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
+            if len(filtered_tokens) != len(tokens):
+                print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token (原始: {tokens})")
+            tokens = [self.bos_token] + filtered_tokens[:max_len-1]
             tokens.extend([self.pad_token] * (max_len - len(tokens)))
             return torch.LongTensor(tokens)
 

@@ -91,7 +91,7 @@ class EditFlowTransformer(nn.Module):
         # 加载预训练的transformer模型
         if hasattr(config, 'base_model_name') and config.base_model_name:
             # 设置缓存目录
-            cache_dir = Path("../../../models/huggingface_cache").resolve()
+            cache_dir = Path("models/huggingface_cache").resolve()
             os.makedirs(cache_dir, exist_ok=True)
 
             print(f"正在加载基础模型: {config.base_model_name}")

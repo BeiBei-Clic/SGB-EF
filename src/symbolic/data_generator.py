@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt']
+UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
 BINARY_OPS = ['add', 'sub', 'mul', 'div', 'pow']
 
 def timed_simplify(expr: sp.Expr, max_time: float = 1) -> sp.Expr:
@@ -64,6 +64,8 @@ def expr_to_tree(expr: sp.Expr) -> str:
         return f'log,{expr_to_tree(args[0])}'
     elif 'sqrt' in func_name:
         return f'sqrt,{expr_to_tree(args[0])}'
+    elif 'abs' in func_name:
+        return f'abs,{expr_to_tree(args[0])}'  # Abs(x) -> abs,x
     else:
         return str(expr)
 
@@ -96,6 +98,7 @@ def apply_unary_op(op: str, operand: sp.Expr) -> sp.Expr:
     elif op == 'exp': return sp.exp(operand)
     elif op == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
     elif op == 'sqrt': return sp.sqrt(abs(operand))
+    elif op == 'abs': return abs(operand)
     return operand
 
 def apply_binary_op(op: str, left: sp.Expr, right: sp.Expr) -> sp.Expr:
@@ -149,15 +152,20 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
-    x_values = np.linspace(-5.0, 5.0, n_points).reshape(-1, 1) if input_dimension == 1 else np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
+    # 统一生成数据点，确保每个数据点是[x1, x2, x3, ...]的形式
+    x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
+    x_values = [list(point) for point in x_values_raw]  # 转换为[[x1, x2, x3], [x4, x5, x6], ...]的形式
+
+    # 转换为numpy数组用于表达式计算
+    x_array = np.array(x_values)
 
     target_expr = generate_random_expr(input_dimension, max_depth)
-    y_values = evaluate_expr(target_expr, x_values)
+    y_values = evaluate_expr(target_expr, x_array)
     curr_expr = corrupt_expression(target_expr, 0.5)
 
     return {
         "input_dimension": input_dimension,
-        "x": x_values.tolist(),
+        "x": x_values,  # 现在是[[x1, x2, x3], [x4, x5, x6], ...]的形式
         "y": y_values.tolist(),
         "tree_gt": expr_to_tree(target_expr),
         "exp_gt": str(target_expr),
@@ -226,14 +234,16 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         dim = random.randint(1, max_dim)
         dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
-        # 生成数据点
-        x_values = np.linspace(-5.0, 5.0, n_points).reshape(-1, 1) if dim == 1 else np.random.uniform(-5.0, 5.0, (n_points, dim))
+        # 生成数据点，统一处理确保每个数据点是[x1, x2, x3, ...]的形式
+        x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
+        x_values = [list(point) for point in x_values_raw]  # 转换为[[x1, x2, x3], [x4, x5, x6], ...]的形式
+        x_array = np.array(x_values)  # 用于表达式计算
 
         # 生成目标表达式和当前表达式
         target_expr = generate_random_expr(dim, max_depth)
-        y_target = evaluate_expr(target_expr, x_values)
+        y_target = evaluate_expr(target_expr, x_array)
         curr_expr = corrupt_expression(target_expr, corruption_prob=0.7)
-        y_curr = evaluate_expr(curr_expr, x_values)
+        y_curr = evaluate_expr(curr_expr, x_array)
 
         # 转换为token序列
         target_tokens = expr_to_tree(target_expr).split(',')
@@ -244,7 +254,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
         samples.append({
             "input_dimension": dim,
-            "x_values": x_values.tolist(),
+            "x_values": x_values,  # 已经是列表格式
             "y_target": y_target.tolist(),
             "y_curr": y_curr.tolist(),
             "residuals": (y_target - y_curr).tolist(),

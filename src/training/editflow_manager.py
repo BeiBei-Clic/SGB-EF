@@ -219,7 +219,8 @@ class EditFlowManager:
         gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
 
-        config = model.config
+        # 处理DataParallel包装的情况
+        config = model.module.config
 
         if self.use_data_parallel and self.gpu_count > 1:
             progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
@@ -395,10 +396,10 @@ class EditFlowManager:
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
 
-            bos_token = tokenizer.bos_token_id
+            cls_token = tokenizer.cls_token_id  # BERT使用cls_token
             pad_token = tokenizer.pad_token_id
 
-            tokenized_expr = [bos_token] + tokenized_expr
+            tokenized_expr = [cls_token] + tokenized_expr
             tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
 
             input_ids = torch.LongTensor([tokenized_expr]).to(device)
