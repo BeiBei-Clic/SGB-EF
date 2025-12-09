@@ -863,8 +863,8 @@ class EditFlowManager:
         # 计算条件嵌入
         condition = condition_encoder(x_values, residuals)
 
-        # 从空白表达式开始
-        current_tokens = []
+        # 从x0开始，而不是空白表达式
+        current_tokens = ['x0']
 
         # 多步迭代推理
         for step in range(n_steps):
@@ -883,14 +883,28 @@ class EditFlowManager:
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
 
-            tokenized_expr = [tokenizer.bos_token_id if tokenizer.bos_token_id else tokenizer.cls_token_id] + tokenized_expr
-            tokenized_expr = tokenized_expr + [tokenizer.pad_token_id] * (max_len - len(tokenized_expr))
+            bos_token = tokenizer.bos_token_id if tokenizer.bos_token_id else tokenizer.cls_token_id
+            pad_token = tokenizer.pad_token_id if tokenizer.pad_token_id else tokenizer.eos_token_id
+
+            tokenized_expr = [bos_token] + tokenized_expr
+            tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
 
             input_ids = torch.LongTensor([tokenized_expr]).to(device)
-            attention_mask = (input_ids != tokenizer.pad_token_id).float()
 
-            # 时间步从0到1递增
-            t = torch.tensor([[step / n_steps]], dtype=torch.float32, device=device)
+            # 正确构建attention_mask：只有实际有内容的位置才为1
+            # 即使BOS和PAD是同一个token，我们也要区分哪些位置是"有意义"的
+            seq_len = 1 + len(tokenized_expr)  # BOS + 实际tokens
+            attention_mask = torch.zeros(max_len, dtype=torch.float)
+            attention_mask[:seq_len] = 1.0  # 前seq_len个位置是有效的
+            attention_mask = attention_mask.unsqueeze(0).to(device)  # (1, max_len)
+
+            # 调试信息
+            if step < 3:
+                print(f"  调试: BOS={bos_token}, PAD={pad_token}, 实际seq_len={seq_len}")
+                print(f"  调试: attention_mask前10个={attention_mask[0][:10].tolist()}")
+
+            # 时间步使用更合理的分布，从0.1开始递增
+            t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 # 模型预测
@@ -901,56 +915,121 @@ class EditFlowManager:
                     condition=condition
                 )
 
+                # 调试信息：打印模型输出
+                if step < 3:
+                    print(f"  调试: input_ids={input_ids[0][:10].tolist()}")
+                    print(f"  调试: attention_mask={attention_mask[0][:10].tolist()}")
+                    print(f"  调试: time_step={t.item():.4f}")
+                    print(f"  调试: condition shape={condition.shape}, condition sum={condition.sum().item():.4f}")
+                    print(f"  调试: rates shape={rates.shape}, rates min={rates.min().item():.6f}, max={rates.max().item():.6f}")
+                    print(f"  调试: rates前3个位置={rates[0, :3, :].cpu().numpy()}")
+                    print(f"  调试: insert_probs shape={insert_probs.shape}, min={insert_probs.min().item():.6f}, max={insert_probs.max().item():.6f}")
+                    print(f"  调试: substitute_probs shape={substitute_probs.shape}, min={substitute_probs.min().item():.6f}, max={substitute_probs.max().item():.6f}")
+
                 # 解析预测结果
                 lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入率
                 lambda_sub = rates[0, :, 1].cpu().numpy()  # 替换率
                 lambda_del = rates[0, :, 2].cpu().numpy()  # 删除率
 
                 # 根据概率决定编辑操作
-                effective_length = int(attention_mask[0].sum().item())
+                # 修复：确保至少有几个位置可用于编辑，即使原始序列很短
+                base_length = int(attention_mask[0].sum().item())
+                effective_length = max(base_length, min(10, input_ids.size(1)))  # 至少10个位置或最大长度
 
                 # 找到最可能的编辑操作
                 best_pos = 0
                 best_action = None
                 best_score = -1
 
+                # 调试信息：打印当前rates
+                if step < 5:  # 只在前5步打印调试信息
+                    print(f"  调试: effective_length={effective_length}, current_tokens={current_tokens}")
+                    print(f"  调试: lambda_ins前5个={lambda_ins[:min(5, len(lambda_ins))]}")
+                    print(f"  调试: lambda_sub前5个={lambda_sub[:min(5, len(lambda_sub))]}")
+                    print(f"  调试: lambda_del前5个={lambda_del[:min(5, len(lambda_del))]}")
+
                 for pos in range(1, effective_length):
-                    # 检查插入操作
+                    # 检查插入操作（在当前位置前插入）
                     if lambda_ins[pos] > best_score:
                         best_score = lambda_ins[pos]
-                        best_action = ('insert', pos)
+                        best_action = ('insert', pos-1)  # 修正插入位置
 
                     # 检查替换操作（如果位置有token）
-                    if pos-1 < len(current_tokens) and lambda_sub[pos] > best_score:
+                    current_token_idx = pos - 1  # 对应current_tokens中的索引
+                    if current_token_idx < len(current_tokens) and lambda_sub[pos] > best_score:
                         best_score = lambda_sub[pos]
-                        best_action = ('substitute', pos-1)
+                        best_action = ('substitute', current_token_idx)
 
                     # 检查删除操作（如果位置有token）
-                    if pos-1 < len(current_tokens) and lambda_del[pos] > best_score:
+                    if current_token_idx < len(current_tokens) and lambda_del[pos] > best_score:
                         best_score = lambda_del[pos]
-                        best_action = ('delete', pos-1)
+                        best_action = ('delete', current_token_idx)
+
+                # 调试信息：打印找到的最佳操作
+                if step < 5:
+                    print(f"  调试: 找到的最佳操作: {best_action}, 分数: {best_score:.6f}")
 
                 # 执行最佳操作
-                if best_action and best_score > 0.1:  # 设置阈值避免过频繁编辑
+                if best_action and best_score > 0.01:  # 降低阈值允许更多编辑操作
                     action_type, pos = best_action
+                    if step < 5:
+                        print(f"  调试: 执行操作 {action_type} 在位置 {pos}")
 
                     if action_type == 'insert':
                         # 插入最高概率的token
                         best_token = torch.argmax(insert_probs[0, pos]).item()
-                        if best_token < len(special_tokens_manager.token_to_id):
-                            for expr_elem, token_id in special_tokens_manager.token_to_id.items():
-                                if token_id == best_token:
-                                    current_tokens.insert(pos, expr_elem)
-                                    break
+
+                        if step < 5:
+                            print(f"  调试: 插入操作，位置={pos}，最高概率token ID={best_token}")
+
+                        # 获取所有可能的token映射
+                        token_map = special_tokens_manager.get_function_token_map()
+                        # 添加变量映射
+                        for i in range(special_tokens_manager.max_dim):
+                            var_name = f'x{i}'
+                            tokens = special_tokens_manager.tokenizer.encode(var_name, add_special_tokens=False)
+                            if tokens:
+                                token_map[var_name] = tokens[0]
+
+                        # 添加运算符映射
+                        for op_name in special_tokens_manager.OPERATORS:
+                            tokens = special_tokens_manager.tokenizer.encode(op_name, add_special_tokens=False)
+                            if tokens:
+                                token_map[op_name] = tokens[0]
+
+                        # 查找对应的表达式元素
+                        found = False
+                        for expr_elem, token_id in token_map.items():
+                            if token_id == best_token:
+                                current_tokens.insert(pos, expr_elem)
+                                found = True
+                                if step < 5:
+                                    print(f"  调试: 成功插入 '{expr_elem}' (token ID={best_token})")
+                                break
+
+                        if not found and step < 5:
+                            print(f"  调试: 未找到token ID {best_token} 对应的表达式元素")
+                            # 如果找不到，插入一个默认的变量
+                            current_tokens.insert(pos, 'x0')
+                            print(f"  调试: 默认插入 'x0'")
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         # 替换为最高概率的token
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
-                        if best_token < len(special_tokens_manager.token_to_id):
-                            for expr_elem, token_id in special_tokens_manager.token_to_id.items():
-                                if token_id == best_token:
-                                    current_tokens[pos] = expr_elem
-                                    break
+                        # 获取所有可能的token映射
+                        token_map = special_tokens_manager.get_function_token_map()
+                        # 添加变量映射
+                        for i in range(special_tokens_manager.max_dim):
+                            var_name = f'x{i}'
+                            tokens = special_tokens_manager.tokenizer.encode(var_name, add_special_tokens=False)
+                            if tokens:
+                                token_map[var_name] = tokens[0]
+
+                        # 查找对应的表达式元素
+                        for expr_elem, token_id in token_map.items():
+                            if token_id == best_token:
+                                current_tokens[pos] = expr_elem
+                                break
 
                     elif action_type == 'delete' and pos < len(current_tokens):
                         # 删除token

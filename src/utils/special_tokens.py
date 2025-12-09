@@ -31,6 +31,7 @@ class SpecialTokensManager:
 
         # 构建所有特殊token的映射
         self.special_tokens = {}
+        self.token_to_id = {}  # 添加token到ID的映射
         self._build_token_mappings()
 
     def _build_token_mappings(self):
