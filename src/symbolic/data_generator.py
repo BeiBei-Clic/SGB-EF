@@ -36,6 +36,9 @@ def expr_to_tree(expr: sp.Expr) -> str:
         return str(expr)
     elif expr.is_Number:
         val = float(expr)
+        # 处理 NaN 值，使用 0 作为默认值（与其他代码保持一致）
+        if np.isnan(val):
+            return "0"
         return str(int(round(val))) if abs(val - round(val)) < 1e-6 else str(round(val, 6))
 
     if not hasattr(expr, 'args') or not expr.args:
@@ -73,7 +76,7 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
     """生成随机表达式"""
-    symbols = [sp.Symbol(f'x{i+1}') for i in range(input_dimension)]
+    symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
 
     def generate_expr(depth: int) -> sp.Expr:
         if depth >= max_depth:
@@ -236,7 +239,7 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
     expr = preprocess_expression(expr)
 
     n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
-    variables = [sp.Symbol(f'x{i+1}') for i in range(n_dims)]
+    variables = [sp.Symbol(f'x{i}') for i in range(n_dims)]
     expr_vars = [var for var in variables if var in expr.free_symbols]
 
     if not expr_vars:
@@ -254,9 +257,9 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
-    # 统一生成数据点，确保每个数据点是[x1, x2, x3, ...]的形式
+    # 统一生成数据点，确保每个数据点是[x0, x1, x2, ...]的形式
     x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
-    x_values = [list(point) for point in x_values_raw]  # 转换为[[x1, x2, x3], [x4, x5, x6], ...]的形式
+    x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
 
     # 转换为numpy数组用于表达式计算
     x_array = np.array(x_values)
@@ -267,7 +270,7 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
 
     return {
         "input_dimension": input_dimension,
-        "x": x_values,  # 现在是[[x1, x2, x3], [x4, x5, x6], ...]的形式
+        "x": x_values,  # 现在是[[x0, x1, x2], [x3, x4, x5], ...]的形式
         "y": y_values.tolist(),
         "tree_gt": expr_to_tree(target_expr),
         "exp_gt": str(target_expr),
@@ -378,9 +381,9 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         dim = random.randint(1, max_dim)
         dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
-        # 生成数据点，统一处理确保每个数据点是[x1, x2, x3, ...]的形式
+        # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
         x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
-        x_values = [list(point) for point in x_values_raw]  # 转换为[[x1, x2, x3], [x4, x5, x6], ...]的形式
+        x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
         x_array = np.array(x_values)  # 用于表达式计算
 
         # 生成目标表达式
