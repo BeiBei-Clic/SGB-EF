@@ -131,8 +131,25 @@ def corrupt_expression(expr: sp.Expr, corruption_prob: float = 0.5) -> sp.Expr:
 
     return expr
 
+def preprocess_expression(expr: sp.Expr) -> sp.Expr:
+    """预处理表达式，替换有问题的值"""
+    # 替换 zoo (复无穷大，SymPy中ComplexInfinity的实际名称)
+    expr = expr.replace(sp.zoo, sp.Integer(1))
+
+    # 替换其他无穷大形式
+    expr = expr.replace(sp.oo, sp.Integer(1000000))
+    expr = expr.replace(-sp.oo, sp.Integer(-1000000))
+
+    # 处理可能的 NaN 值
+    expr = expr.replace(sp.nan, sp.Integer(0))
+
+    return expr
+
 def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
     """在给定x值上计算表达式"""
+    # 预处理表达式，替换 ComplexInfinity 和其他有问题的值
+    expr = preprocess_expression(expr)
+
     n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
     variables = [sp.Symbol(f'x{i+1}') for i in range(n_dims)]
     expr_vars = [var for var in variables if var in expr.free_symbols]

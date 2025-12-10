@@ -27,7 +27,8 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
     """在给定时间t采样条件路径"""
     batch_size, seq_len, vocab_size = p0.shape
     t = t.view(-1, 1, 1) if t.dim() == 1 else t
-    kappa_t = scheduler(t).expand(-1, seq_len, -1)
+    kappa_t = scheduler(t)
+    kappa_t = kappa_t.view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
 
     pt = (1 - kappa_t) * p0 + kappa_t * p1
     pt = pt / pt.sum(dim=-1, keepdim=True)
@@ -42,7 +43,7 @@ def tokens_to_prob(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
     batch_size, seq_len = tokens.shape
     probs = torch.zeros(batch_size, seq_len, vocab_size, device=tokens.device)
 
-    # 只处理有效的token IDs
+    # 确保token IDs在有效范围内，防止越界
     valid_tokens = torch.clamp(tokens, 0, vocab_size - 1)
     probs.scatter_(2, valid_tokens.unsqueeze(-1), 1.0)
     return probs
