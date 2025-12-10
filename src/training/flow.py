@@ -139,9 +139,10 @@ class ContinuousFlowLoss:
 class FlowDataset(torch.utils.data.Dataset):
     """连续流数据集 (z0, z1, x_values, residuals)"""
 
-    def __init__(self, samples: List[Dict], tokenizer, max_dim=10):
+    def __init__(self, samples: List[Dict], tokenizer, max_dim=10, max_expr_length=128):
         self.samples = samples
         self.tokenizer = tokenizer
+        self.max_expr_length = max_expr_length
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
 
         # 设置分词器的特殊token属性
@@ -172,7 +173,7 @@ class FlowDataset(torch.utils.data.Dataset):
         z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
         z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
 
-        max_len = 128
+        max_len = self.max_expr_length
         def pad_z_sequence(tokens):
             # 过滤掉None值，并确保所有token都是整数
             filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]

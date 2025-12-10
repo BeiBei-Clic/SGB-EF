@@ -103,7 +103,7 @@ class EditFlowManager:
             print(f"维度 {dim}: 训练样本 {len(train_samples)}, 测试样本 {len(test_samples)}")
 
             # 创建训练集
-            train_dataset = FlowDataset(train_samples, tokenizer, max_dim=self.args.max_dim)
+            train_dataset = FlowDataset(train_samples, tokenizer, max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length)
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -113,7 +113,7 @@ class EditFlowManager:
             train_dimension_groups[dim] = train_samples
 
             # 创建测试集
-            test_dataset = FlowDataset(test_samples, tokenizer, max_dim=self.args.max_dim)
+            test_dataset = FlowDataset(test_samples, tokenizer, max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length)
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset, batch_size=self.args.batch_size, shuffle=False,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -166,6 +166,7 @@ class EditFlowManager:
         print("初始化EditFlow模型...")
         actual_vocab_size = len(tokenizer.get_vocab())  # 获取实际词表大小
         config = EditFlowConfig(
+            max_seq_len=self.args.max_expr_length,
             condition_dim=condition_encoder.output_dim,
             base_model_name=model_name,
             vocab_size=actual_vocab_size,  # 使用更新后的词表大小
@@ -460,7 +461,7 @@ class EditFlowManager:
         print(f"最终模型已保存到: {final_model_path}")
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None):
+    def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None, max_expr_length=None):
         """符号回归 - 接收数据点对，输出表达式
 
         Args:
@@ -470,6 +471,7 @@ class EditFlowManager:
             debug_mode: 是否显示详细调试信息
             n_steps: 推理步数
             input_dim: 输入维度，如果为None则自动推断
+            max_expr_length: 表达式最大token长度，如果为None则使用args中的值
         """
         print("开始符号回归推理...")
         print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
@@ -531,7 +533,7 @@ class EditFlowManager:
 
             tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
 
-            max_len = 128
+            max_len = getattr(self.args, 'max_expr_length', 128)
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
                 if debug_mode:
