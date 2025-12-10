@@ -362,39 +362,78 @@ class EditFlowManager:
         print(f"最终模型已保存到: {final_model_path}")
         return model, condition_encoder
 
-    def inference_multi_step(self, model, condition_encoder, tokenizer, x_values, y_values,
-                           n_steps=50, device=None):
-        """多步推理算法 - 从空白表达式开始构建"""
-        if device is None:
-            device = self.device
+    def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None):
+        """符号回归 - 接收数据点对，输出表达式
 
+        Args:
+            model_path: 模型检查点路径
+            x_data: 输入x数据
+            y_data: 目标y数据
+            debug_mode: 是否显示详细调试信息
+            n_steps: 推理步数
+            input_dim: 输入维度，如果为None则自动推断
+        """
+        print("开始符号回归推理...")
+        print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
+
+        # 加载模型
+        checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
+        if checkpoint_path:
+            print(f"使用检查点: {checkpoint_path}")
+        else:
+            print("未找到检查点，将使用基础模型进行推理")
+
+        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+
+        # 设置设备和模式
+        device = self.device
         model.eval()
         condition_encoder.eval()
 
         # 准备输入数据
-        x_values = torch.FloatTensor(x_values).unsqueeze(0).to(device)  # (1, n_points, dim)
-        y_values = torch.FloatTensor(y_values).unsqueeze(0).to(device)  # (1, n_points)
-
-        # 初始残差就是目标值本身（因为从空白开始）
+        x_values = torch.FloatTensor(x_data).unsqueeze(0).to(device)
+        y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)
         residuals = y_values
-
-        # 计算条件嵌入
         condition = condition_encoder(x_values, residuals)
 
-        # 从x0开始，而不是空白表达式
-        current_tokens = ['x0']
+        # 推断输入维度并生成初始表达式
+        if input_dim is None:
+            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
 
-        # 多步迭代推理
+        if input_dim == 1:
+            current_tokens = ['x0']
+        else:
+            current_tokens = []
+            for i in range(input_dim):
+                if i > 0:
+                    current_tokens.append('+')
+                current_tokens.append(f'x{i}')
+
+        # 初始化token管理器
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
 
+        if debug_mode:
+            print(f"调试模式: {'开启' if debug_mode else '关闭'}")
+            print(f"推理步数: {n_steps}")
+            print(f"输入数据形状: x_values={x_values.shape}, y_values={y_values.shape}")
+            print(f"条件嵌入形状: {condition.shape}")
+            print(f"初始表达式: {','.join(current_tokens)}")
+
         for step in range(n_steps):
-            print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
+            if not debug_mode:
+                print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
+
+            if debug_mode:
+                print(f"\n[DEBUG] === 推理步骤 {step + 1}/{n_steps} ===")
+                print(f"[DEBUG] 当前表达式: {','.join(current_tokens) if current_tokens else '<空白>'}")
 
             tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
 
             max_len = 128
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
+                if debug_mode:
+                    print(f"[DEBUG] 表达式过长，截断至 {max_len-1} 个token")
 
             cls_token = tokenizer.cls_token_id  # BERT使用cls_token
             pad_token = tokenizer.pad_token_id
@@ -407,6 +446,11 @@ class EditFlowManager:
             attention_mask = (input_ids != pad_token).float().to(device)
 
             t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
+
+            if debug_mode:
+                print(f"[DEBUG] 时间步t: {t[0,0]:.4f}")
+                print(f"[DEBUG] tokenized_expr长度: {len(tokenized_expr)}")
+                print(f"[DEBUG] 有效token数量: {attention_mask[0].sum().item()}")
 
             with torch.no_grad():
                 rates, insert_probs, substitute_probs = model(
@@ -421,10 +465,20 @@ class EditFlowManager:
                 base_length = int(attention_mask[0].sum().item())
                 effective_length = max(base_length, min(10, input_ids.size(1)))
 
+                if debug_mode:
+                    print(f"[DEBUG] 操作强度形状: lambda_ins={lambda_ins.shape}, lambda_sub={lambda_sub.shape}, lambda_del={lambda_del.shape}")
+                    print(f"[DEBUG] 基础长度: {base_length}, 有效长度: {effective_length}")
+
+                    # 显示前几个位置的操作强度
+                    print(f"[DEBUG] 前5个位置的操作强度:")
+                    for i in range(1, min(6, effective_length)):
+                        print(f"[DEBUG]   位置{i}: INS={lambda_ins[i]:.4f}, SUB={lambda_sub[i]:.4f}, DEL={lambda_del[i]:.4f}")
+
                 best_pos = 0
                 best_action = None
                 best_score = -1
 
+                # 寻找最佳操作
                 for pos in range(1, effective_length):
                     if lambda_ins[pos] > best_score:
                         best_score = lambda_ins[pos]
@@ -439,11 +493,20 @@ class EditFlowManager:
                         best_score = lambda_del[pos]
                         best_action = ('delete', current_token_idx)
 
+                if debug_mode:
+                    print(f"[DEBUG] 最佳操作: {best_action}, 分数: {best_score:.4f}")
+
                 if best_action and best_score > 0.01:
                     action_type, pos = best_action
 
+                    if debug_mode:
+                        print(f"[DEBUG] 执行操作: {action_type.upper()} 位置{pos}")
+
                     if action_type == 'insert':
                         best_token = torch.argmax(insert_probs[0, pos]).item()
+                        if debug_mode:
+                            print(f"[DEBUG] 选择插入的token ID: {best_token}")
+
                         token_map = special_tokens_manager.get_function_token_map()
 
                         for i in range(special_tokens_manager.max_dim):
@@ -457,18 +520,29 @@ class EditFlowManager:
                             if tokens:
                                 token_map[op_name] = tokens[0]
 
+                        if debug_mode:
+                            print(f"[DEBUG] Token映射表大小: {len(token_map)}")
+
                         found = False
                         for expr_elem, token_id in token_map.items():
                             if token_id == best_token:
                                 current_tokens.insert(pos, expr_elem)
+                                if debug_mode:
+                                    print(f"[DEBUG] 成功插入token: '{expr_elem}'")
                                 found = True
                                 break
 
                         if not found:
                             current_tokens.insert(pos, 'x0')
+                            if debug_mode:
+                                print(f"[DEBUG] 未找到对应token，插入默认'x0'")
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
+                        if debug_mode:
+                            print(f"[DEBUG] 选择替换的token ID: {best_token}")
+                            print(f"[DEBUG] 替换前: '{current_tokens[pos]}'")
+
                         token_map = special_tokens_manager.get_function_token_map()
 
                         for i in range(special_tokens_manager.max_dim):
@@ -480,43 +554,34 @@ class EditFlowManager:
                         for expr_elem, token_id in token_map.items():
                             if token_id == best_token:
                                 current_tokens[pos] = expr_elem
+                                if debug_mode:
+                                    print(f"[DEBUG] 成功替换为: '{expr_elem}'")
                                 break
 
                     elif action_type == 'delete' and pos < len(current_tokens):
+                        deleted_token = current_tokens[pos]
                         del current_tokens[pos]
+                        if debug_mode:
+                            print(f"[DEBUG] 删除token: '{deleted_token}'")
+                else:
+                    if debug_mode:
+                        print(f"[DEBUG] 未找到有效操作 (最高分数: {best_score:.4f} <= 0.01)")
 
             if len(current_tokens) > 50:
+                old_len = len(current_tokens)
                 current_tokens = current_tokens[:50]
+                if debug_mode:
+                    print(f"[DEBUG] 表达式过长，从{old_len}截断至50个token")
 
         # 返回最终的表达式
         final_expression = ','.join(current_tokens) if current_tokens else ""
-        print(f"最终表达式: {final_expression}")
-
-        return final_expression
-
-    def symbolic_regression(self, model_path, x_data, y_data):
-        """符号回归主函数 - 接收数据点对，输出表达式"""
-        print("开始符号回归推理...")
-        print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
-
-        # 检查模型路径是否存在
-        checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
-        if checkpoint_path:
-            print(f"使用检查点: {checkpoint_path}")
+        if debug_mode:
+            print(f"\n[DEBUG] 推理完成！")
+            print(f"[DEBUG] 最终表达式: {final_expression}")
+            print(f"[DEBUG] 最终表达式长度: {len(current_tokens)}")
         else:
-            print("未找到检查点，将使用基础模型进行推理")
-
-        # 使用setup_models加载所有模型组件
-        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
-
-        # 执行多步推理
-        final_expression = self.inference_multi_step(
-            model=model,
-            condition_encoder=condition_encoder,
-            tokenizer=tokenizer,
-            x_values=x_data,
-            y_values=y_data,
-            n_steps=100  # 推理步数
-        )
+            print(f"最终表达式: {final_expression}")
 
         return final_expression
+
+    
