@@ -133,6 +133,89 @@ def corrupt_expression(expr: sp.Expr, corruption_prob: float = 0.5) -> sp.Expr:
 
     return expr
 
+def reduce_expression(expr: sp.Expr) -> sp.Expr:
+    """对表达式进行一次删减操作，返回简化后的表达式"""
+    # 如果表达式已经是常数或符号，无法进一步删减
+    if expr.is_Number or expr.is_Symbol:
+        return expr
+
+    # 如果表达式没有参数（参数为空），返回常数1
+    if not hasattr(expr, 'args') or not expr.args:
+        return sp.Integer(1)
+
+    func_name = str(expr.func).lower()
+    args = expr.args
+
+    # 处理一元操作
+    if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
+        if len(args) >= 1:
+            # 一元操作删减：直接返回操作数
+            return args[0]
+        else:
+            return sp.Integer(1)
+
+    # 处理二元操作
+    elif 'add' in func_name or 'sub' in func_name:
+        if len(args) >= 2:
+            # 加减法删减：随机选择其中一个操作数
+            return random.choice(args)
+        else:
+            return args[0] if args else sp.Integer(0)
+
+    elif 'mul' in func_name or 'div' in func_name or 'truediv' in func_name:
+        if len(args) >= 2:
+            # 乘除法删减：随机选择其中一个操作数
+            return random.choice(args)
+        else:
+            return args[0] if args else sp.Integer(1)
+
+    elif 'pow' in func_name:
+        if len(args) >= 2:
+            # 幂运算删减：随机选择底数或指数
+            return random.choice(args)
+        else:
+            return args[0] if args else sp.Integer(1)
+
+    # 其他情况：随机选择一个参数
+    elif args:
+        return random.choice(args)
+    else:
+        return sp.Integer(1)
+
+def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:
+    """生成从目标表达式逐步删减的序列，直到得到最简表达式"""
+    reduction_sequence = []
+    current_expr = target_expr
+
+    # 持续删减直到表达式无法进一步简化
+    max_iterations = 20  # 防止无限循环
+    iterations = 0
+
+    while iterations < max_iterations:
+        reduction_sequence.append(current_expr)
+
+        # 检查是否已经是最简形式（常数或符号）
+        if current_expr.is_Number or current_expr.is_Symbol:
+            break
+
+        # 应用一次删减操作
+        reduced_expr = reduce_expression(current_expr)
+
+        # 如果删减后的表达式与原表达式相同，说明无法进一步删减
+        if reduced_expr == current_expr:
+            # 强制简化为常数
+            reduced_expr = sp.Integer(1)
+
+        current_expr = timed_simplify(reduced_expr, max_time=0.5)
+        iterations += 1
+
+    # 确保序列中包含最简形式
+    if not reduction_sequence or (reduction_sequence[-1].is_Number or reduction_sequence[-1].is_Symbol):
+        if reduction_sequence and reduction_sequence[-1] != current_expr:
+            reduction_sequence.append(current_expr)
+
+    return reduction_sequence
+
 def preprocess_expression(expr: sp.Expr) -> sp.Expr:
     """预处理表达式，替换有问题的值"""
     # 替换 zoo (复无穷大，SymPy中ComplexInfinity的实际名称)
@@ -288,7 +371,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     print(f"生成 {num_samples} 个连续流训练样本...")
 
-    for i in tqdm(range(num_samples), desc="生成流数据"):
+    sample_count = 0
+    pbar = tqdm(total=num_samples, desc="生成流数据")
+
+    while sample_count < num_samples:
         dim = random.randint(1, max_dim)
         dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
@@ -297,35 +383,54 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         x_values = [list(point) for point in x_values_raw]  # 转换为[[x1, x2, x3], [x4, x5, x6], ...]的形式
         x_array = np.array(x_values)  # 用于表达式计算
 
-        # 生成目标表达式和当前表达式
+        # 生成目标表达式
         target_expr = generate_random_expr(dim, max_depth)
         y_target = evaluate_expr(target_expr, x_array)
-        curr_expr = corrupt_expression(target_expr, corruption_prob=0.7)
-        y_curr = evaluate_expr(curr_expr, x_array)
 
-        # 转换为token序列
-        target_tokens = expr_to_tree(target_expr).split(',')
-        curr_tokens = expr_to_tree(curr_expr).split(',')
+        # 生成删减序列
+        reduction_sequence = generate_reduction_sequence(target_expr)
 
-        # 对齐到Z空间，包含gap token
-        z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+        # 为删减序列中的每个表达式创建样本
+        for reduced_expr in reduction_sequence:
+            if sample_count >= num_samples:
+                break
 
-        samples.append({
-            "input_dimension": dim,
-            "x_values": x_values,  # 已经是列表格式
-            "y_target": y_target.tolist(),
-            "y_curr": y_curr.tolist(),
-            "residuals": (y_target - y_curr).tolist(),
-            "tree_gt": expr_to_tree(target_expr),
-            "exp_gt": str(target_expr),
-            "tree_cur1": expr_to_tree(curr_expr),
-            "exp_cur1": str(curr_expr),
-            "curr_tokens": curr_tokens,
-            "target_tokens": target_tokens,
-            "z0_tokens": z0_tokens,  # 对齐后的当前序列（包含gap）
-            "z1_tokens": z1_tokens,  # 对齐后的目标序列（包含gap）
-            "edit_distance": len([op for op in range(len(z0_tokens)) if z0_tokens[op] != z1_tokens[op]])
-        })
+            # 对删减后的表达式应用额外的随机破坏
+            curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
+            y_curr = evaluate_expr(curr_expr, x_array)
+
+            # 转换为token序列
+            target_tokens = expr_to_tree(target_expr).split(',')
+            curr_tokens = expr_to_tree(curr_expr).split(',')
+
+            # 对齐到Z空间，包含gap token
+            z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+
+            samples.append({
+                "input_dimension": dim,
+                "x_values": x_values,  # 已经是列表格式
+                "y_target": y_target.tolist(),
+                "y_curr": y_curr.tolist(),
+                "residuals": (y_target - y_curr).tolist(),
+                "tree_gt": expr_to_tree(target_expr),
+                "exp_gt": str(target_expr),
+                "tree_cur1": expr_to_tree(curr_expr),
+                "exp_cur1": str(curr_expr),
+                "curr_tokens": curr_tokens,
+                "target_tokens": target_tokens,
+                "z0_tokens": z0_tokens,  # 对齐后的当前序列（包含gap）
+                "z1_tokens": z1_tokens,  # 对齐后的目标序列（包含gap）
+                "edit_distance": len([op for op in range(len(z0_tokens)) if z0_tokens[op] != z1_tokens[op]])
+            })
+
+            sample_count += 1
+            pbar.update(1)
+
+        # 如果还没有达到目标样本数，继续生成新的目标表达式
+        if sample_count >= num_samples:
+            break
+
+    pbar.close()
 
     print(f"\n样本维度分布:")
     for dim, count in sorted(dimension_count.items()):
