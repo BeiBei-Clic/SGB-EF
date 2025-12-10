@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--max_dim", type=int, default=10, help="最大输入维度")
     parser.add_argument("--n_points", type=int, default=100, help="数据点数量")
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")
+    parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
+    parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
 
     # 模型参数
     parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
@@ -58,6 +60,8 @@ def main():
     print(f"批次大小: {args.batch_size}")
     print(f"训练轮数: {args.num_epochs}")
     print(f"学习率: {args.learning_rate}")
+    print(f"测试集比例: {args.test_split}")
+    print(f"评估频率: 每{args.eval_every}轮")
     print(f"基础模型: {args.base_model_name}")
     print(f"条件嵌入模型: {args.condition_model_name}")
     print(f"多GPU并行: {args.use_data_parallel}")

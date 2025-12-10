@@ -54,7 +54,7 @@ class EditFlowManager:
             torch.cuda.manual_seed_all(seed)
 
     def prepare_data(self, tokenizer):
-        """准备训练数据，优先从本地缓存文件加载"""
+        """准备训练数据，优先从本地缓存文件加载，并划分训练集和测试集"""
         print("准备连续流训练数据...")
 
         # 检查是否存在缓存文件
@@ -82,21 +82,55 @@ class EditFlowManager:
             dim = sample['input_dimension']
             dimension_groups.setdefault(dim, []).append(sample)
 
-        dataloaders = {}
-        datasets = {}
+        # 划分训练集和测试集
+        test_split = getattr(self.args, 'test_split', 0.2)
+        train_dataloaders = {}
+        test_dataloaders = {}
+        train_datasets = {}
+        test_datasets = {}
+        train_dimension_groups = {}
+        test_dimension_groups = {}
 
         for dim, dim_samples in dimension_groups.items():
-            dataset = FlowDataset(dim_samples, tokenizer)
-            dataloader = torch.utils.data.DataLoader(
-                dataset, batch_size=self.args.batch_size, shuffle=True,
+            # 打乱数据
+            np.random.shuffle(dim_samples)
+
+            # 计算划分点
+            split_idx = int(len(dim_samples) * (1 - test_split))
+            train_samples = dim_samples[:split_idx]
+            test_samples = dim_samples[split_idx:]
+
+            print(f"维度 {dim}: 训练样本 {len(train_samples)}, 测试样本 {len(test_samples)}")
+
+            # 创建训练集
+            train_dataset = FlowDataset(train_samples, tokenizer)
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
             )
-            dataloaders[dim] = dataloader
-            datasets[dim] = dataset
+            train_dataloaders[dim] = train_dataloader
+            train_datasets[dim] = train_dataset
+            train_dimension_groups[dim] = train_samples
 
-        print(f"数据准备完成，共 {len(samples)} 个样本，分布在 {len(dimension_groups)} 个维度组中")
+            # 创建测试集
+            test_dataset = FlowDataset(test_samples, tokenizer)
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset, batch_size=self.args.batch_size, shuffle=False,
+                num_workers=0, collate_fn=custom_collate_fn
+            )
+            test_dataloaders[dim] = test_dataloader
+            test_datasets[dim] = test_dataset
+            test_dimension_groups[dim] = test_samples
 
-        return dataloaders, datasets, dimension_groups
+        total_train_samples = sum(len(samples) for samples in train_dimension_groups.values())
+        total_test_samples = sum(len(samples) for samples in test_dimension_groups.values())
+
+        print(f"数据划分完成:")
+        print(f"  训练集: {total_train_samples} 个样本")
+        print(f"  测试集: {total_test_samples} 个样本")
+        print(f"  分布在 {len(train_dimension_groups)} 个维度组中")
+
+        return train_dataloaders, train_datasets, train_dimension_groups, test_dataloaders, test_datasets, test_dimension_groups
 
     def setup_models(self, checkpoint_path=None):
         """
@@ -271,6 +305,34 @@ class EditFlowManager:
 
         return total_loss / num_batches, num_batches
 
+    def evaluate(self, model, condition_encoder, criterion, test_dataloaders, test_datasets):
+        """测试集评估"""
+        model.eval()
+        condition_encoder.eval()
+
+        total_loss = 0.0
+        num_batches = 0
+        config = model.module.config if hasattr(model, 'module') else model.config
+
+        with torch.no_grad():
+            for dim, dataloader in test_dataloaders.items():
+                dataset = test_datasets[dim]
+                for batch in dataloader:
+                    x_values = batch['x_values'].to(self.device)
+                    residuals = batch['residuals'].to(self.device)
+                    z0_token_ids = batch['z0_token_ids'].to(self.device)
+                    z1_token_ids = batch['z1_token_ids'].to(self.device)
+
+                    condition_embeddings = condition_encoder(x_values, residuals)
+                    forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config)
+                    loss = self.compute_loss(forward_results, criterion, dataset)
+
+                    if not torch.isnan(loss):
+                        total_loss += loss.item()
+                        num_batches += 1
+
+        return total_loss / num_batches if num_batches > 0 else float('inf')
+
     
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
         checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
@@ -316,7 +378,7 @@ class EditFlowManager:
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 使用tokenizer准备数据
-        dataloaders, datasets, dimension_groups = self.prepare_data(tokenizer)
+        train_dataloaders, train_datasets, train_dimension_groups, test_dataloaders, test_datasets, test_dimension_groups = self.prepare_data(tokenizer)
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
@@ -326,9 +388,9 @@ class EditFlowManager:
             total_loss = 0.0
             total_batches = 0
 
-            for dim, dataloader in dataloaders.items():
+            for dim, dataloader in train_dataloaders.items():
                 print(f"\n训练维度 {dim} 的数据...")
-                dataset = datasets[dim]
+                dataset = train_datasets[dim]
                 dim_loss, dim_batches = self.train_epoch(
                     model, condition_encoder, criterion, optimizer,
                     dataloader, dataset, epoch, dim
@@ -338,7 +400,14 @@ class EditFlowManager:
                 print(f"维度 {dim} 平均损失: {dim_loss:.4f}")
 
             avg_loss = total_loss / total_batches
-            print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 总体平均损失: {avg_loss:.4f}")
+            print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
+
+            # 测试集评估
+            eval_every = getattr(self.args, 'eval_every', 5)
+            if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:
+                print("开始测试集评估...")
+                test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloaders, test_datasets)
+                print(f"测试集损失: {test_loss:.4f}")
 
             if (epoch + 1) % self.args.save_every == 0:
                 config = model.module.config if hasattr(model, 'module') else model.config
