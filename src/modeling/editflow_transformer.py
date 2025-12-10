@@ -174,6 +174,8 @@ class EditFlowTransformer(nn.Module):
         hidden_states = base_outputs.last_hidden_state
 
         # 添加时间和位置嵌入
+        # 扩展时间嵌入以匹配序列长度维度
+        time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
         hidden_states = hidden_states + time_emb
 
         # 条件注入
