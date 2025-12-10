@@ -187,7 +187,7 @@ class EditFlowManager:
         z_gap_mask = forward_results['z_gap_mask']
         z_pad_mask = forward_results['z_pad_mask']
         t = forward_results['t']
-        effective_vocab_size = forward_results['effective_vocab_size']
+        effective_vocab_size = forward_results['vocab_size']
         gap_token = forward_results['gap_token']
 
         lambda_ins = pred_rates[:, :, 0:1]
