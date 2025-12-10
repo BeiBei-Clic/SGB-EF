@@ -212,9 +212,8 @@ class EditFlowManager:
         z1_probs = tokens_to_prob(z1_token_ids, config.vocab_size)
         z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
 
-        gap_token = dataset.gap_token
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z_t, dataset.pad_token, gap_token
+            z_t, dataset.special_tokens_manager
         )
 
         attention_mask = (~x_pad_mask).float()
@@ -233,8 +232,7 @@ class EditFlowManager:
             'z_pad_mask': z_pad_mask,
             't': t,
             'vocab_size': config.vocab_size,
-            'gap_token': gap_token
-        }
+                    }
 
     def compute_loss(self, forward_results, criterion, dataset):
         pred_rates = forward_results['pred_rates']
@@ -247,7 +245,7 @@ class EditFlowManager:
         z_pad_mask = forward_results['z_pad_mask']
         t = forward_results['t']
         effective_vocab_size = forward_results['vocab_size']
-        gap_token = forward_results['gap_token']
+        gap_token = dataset.special_tokens_manager.get_token_id('gap')
 
         lambda_ins = pred_rates[:, :, 0:1]
         lambda_sub = pred_rates[:, :, 1:2]
@@ -264,7 +262,7 @@ class EditFlowManager:
 
         u_cat = torch.cat([lambda_ins * extended_ins_probs, lambda_sub * extended_sub_probs, lambda_del], dim=-1)
         u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
-        u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.pad_token)
+        u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
 
         loss = criterion(u_z, u_mask, t, effective_vocab_size)
         return loss
@@ -533,10 +531,11 @@ class EditFlowManager:
                 if debug_mode:
                     print(f"[DEBUG] 表达式过长，截断至 {max_len-1} 个token")
 
-            cls_token = tokenizer.cls_token_id  # BERT使用cls_token
-            pad_token = tokenizer.pad_token_id
+            # 使用统一的特殊token管理
+            bos_token = special_tokens_manager.get_token_id('bos')
+            pad_token = special_tokens_manager.get_token_id('pad')
 
-            tokenized_expr = [cls_token] + tokenized_expr
+            tokenized_expr = [bos_token] + tokenized_expr
             tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
 
             input_ids = torch.LongTensor([tokenized_expr]).to(device)

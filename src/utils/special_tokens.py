@@ -18,6 +18,13 @@ class SpecialTokensManager:
     # 占位符定义
     GAP_TOKEN = '<gap>'
 
+    # BERT特殊token定义（如果分词器没有，我们会添加这些）
+    BOS_TOKEN = '<s>'  # 开始符号
+    EOS_TOKEN = '</s>'  # 结束符号
+    PAD_TOKEN = '<pad>'  # 填充符号
+    UNK_TOKEN = '<unk>'  # 未知符号
+    MASK_TOKEN = '<mask>'  # 掩码符号
+
     # 默认最大变量维度
     DEFAULT_MAX_DIM = 10
 
@@ -55,6 +62,13 @@ class SpecialTokensManager:
         # 添加占位符token
         self.special_tokens[self.GAP_TOKEN] = self.GAP_TOKEN
 
+        # 添加BERT特殊token（如果分词器没有对应的token）
+        self.special_tokens[self.BOS_TOKEN] = self.BOS_TOKEN
+        self.special_tokens[self.EOS_TOKEN] = self.EOS_TOKEN
+        self.special_tokens[self.PAD_TOKEN] = self.PAD_TOKEN
+        self.special_tokens[self.UNK_TOKEN] = self.UNK_TOKEN
+        self.special_tokens[self.MASK_TOKEN] = self.MASK_TOKEN
+
     def get_special_tokens(self) -> Dict[str, str]:
         """获取所有特殊token映射"""
         return self.special_tokens.copy()
@@ -65,19 +79,37 @@ class SpecialTokensManager:
             self._cached_vocab = self.tokenizer.get_vocab()
         return self._cached_vocab
 
-    def get_gap_token_id(self) -> int:
+    def get_token_id(self, token_name: str) -> int:
         """
-        获取gap token的ID
+        获取任意特殊token的ID
+
+        Args:
+            token_name: token名称，支持 'gap', 'pad', 'bos', 'eos', 'unk', 'mask'
 
         Returns:
-            gap token的ID
+            token的ID
         """
         # 确保特殊token已经被处理
         if not self._tokens_processed:
             self.ensure_special_tokens()
 
         vocab = self._get_cached_vocab()
-        return vocab[self.GAP_TOKEN]
+
+        # token名称映射
+        token_map = {
+            'gap': self.GAP_TOKEN,
+            'pad': self.PAD_TOKEN,
+            'bos': self.BOS_TOKEN,
+            'eos': self.EOS_TOKEN,
+            'unk': self.UNK_TOKEN,
+            'mask': self.MASK_TOKEN
+        }
+
+        if token_name not in token_map:
+            raise ValueError(f"未知的特殊token名称: {token_name}")
+
+        token = token_map[token_name]
+        return vocab[token]
 
     def get_operators(self) -> List[str]:
         """获取运算符列表"""
@@ -187,6 +219,71 @@ class SpecialTokensManager:
             print("=" * 30)
 
         return token_to_id
+
+    def setup_tokenizer_special_tokens(self):
+        """
+        设置分词器的特殊token属性，确保分词器使用我们的特殊token
+        如果分词器已经有对应的token，就使用分词器的；否则使用我们添加的
+        """
+        # 获取token映射
+        token_map = {
+            'pad': self.PAD_TOKEN,
+            'bos': self.BOS_TOKEN,
+            'eos': self.EOS_TOKEN,
+            'unk': self.UNK_TOKEN,
+            'mask': self.MASK_TOKEN
+        }
+
+        # 确保特殊token已添加
+        self.ensure_special_tokens()
+        vocab = self._get_cached_vocab()
+
+        # 设置分词器的特殊token属性
+        # 优先使用分词器原有的特殊token，如果没有才使用我们添加的
+        if hasattr(self.tokenizer, 'pad_token') and self.tokenizer.pad_token is not None:
+            self.tokenizer.pad_token_id = vocab[self.tokenizer.pad_token]
+        else:
+            self.tokenizer.pad_token = self.PAD_TOKEN
+            self.tokenizer.pad_token_id = vocab[self.PAD_TOKEN]
+
+        if hasattr(self.tokenizer, 'bos_token') and self.tokenizer.bos_token is not None:
+            self.tokenizer.bos_token_id = vocab[self.tokenizer.bos_token]
+        else:
+            self.tokenizer.bos_token = self.BOS_TOKEN
+            self.tokenizer.bos_token_id = vocab[self.BOS_TOKEN]
+
+        if hasattr(self.tokenizer, 'eos_token') and self.tokenizer.eos_token is not None:
+            self.tokenizer.eos_token_id = vocab[self.tokenizer.eos_token]
+        else:
+            self.tokenizer.eos_token = self.EOS_TOKEN
+            self.tokenizer.eos_token_id = vocab[self.EOS_TOKEN]
+
+        if hasattr(self.tokenizer, 'unk_token') and self.tokenizer.unk_token is not None:
+            self.tokenizer.unk_token_id = vocab[self.tokenizer.unk_token]
+        else:
+            self.tokenizer.unk_token = self.UNK_TOKEN
+            self.tokenizer.unk_token_id = vocab[self.UNK_TOKEN]
+
+        if hasattr(self.tokenizer, 'mask_token') and self.tokenizer.mask_token is not None:
+            self.tokenizer.mask_token_id = vocab[self.tokenizer.mask_token]
+        else:
+            self.tokenizer.mask_token = self.MASK_TOKEN
+            self.tokenizer.mask_token_id = vocab[self.MASK_TOKEN]
+
+        # 对于BERT，还需要设置cls_token和sep_token
+        if hasattr(self.tokenizer, 'cls_token'):
+            if self.tokenizer.cls_token is not None:
+                self.tokenizer.cls_token_id = vocab[self.tokenizer.cls_token]
+            else:
+                self.tokenizer.cls_token = self.BOS_TOKEN
+                self.tokenizer.cls_token_id = vocab[self.BOS_TOKEN]
+
+        if hasattr(self.tokenizer, 'sep_token'):
+            if self.tokenizer.sep_token is not None:
+                self.tokenizer.sep_token_id = vocab[self.tokenizer.sep_token]
+            else:
+                self.tokenizer.sep_token = self.EOS_TOKEN
+                self.tokenizer.sep_token_id = vocab[self.EOS_TOKEN]
 
     def ensure_special_tokens(self) -> Dict[str, int]:
         """

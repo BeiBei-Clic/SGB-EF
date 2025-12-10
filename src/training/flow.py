@@ -31,7 +31,10 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
     kappa_t = kappa_t.view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
 
     pt = (1 - kappa_t) * p0 + kappa_t * p1
-    pt = pt / pt.sum(dim=-1, keepdim=True)
+    pt_sum = pt.sum(dim=-1, keepdim=True)
+    # 防止除零，避免产生inf或nan值
+    pt_sum = torch.clamp(pt_sum, min=1e-8)
+    pt = pt / pt_sum
 
     pt_flat = pt.view(-1, pt.size(-1))
     sampled = torch.multinomial(pt_flat, 1)
@@ -49,9 +52,10 @@ def tokens_to_prob(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
     return probs
 
 
-def remove_gap_tokens(z_t: torch.Tensor, pad_token_id: int, gap_token_id: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def remove_gap_tokens(z_t: torch.Tensor, special_tokens_manager: SpecialTokensManager) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """移除gap token并返回处理后的序列"""
-    gap_token_id = gap_token_id
+    pad_token_id = special_tokens_manager.get_token_id('pad')
+    gap_token_id = special_tokens_manager.get_token_id('gap')
     batch_size, z_seq_len = z_t.shape
     device = z_t.device
 
@@ -101,9 +105,11 @@ class ContinuousFlowLoss:
         self.scheduler = KappaScheduler(scheduler_type)
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
-                           gap_token: int, pad_token: int) -> torch.Tensor:
+                           gap_token: int, special_tokens_manager: SpecialTokensManager) -> torch.Tensor:
         batch_size, z_seq_len = z_t.shape
         n_ops = 2 * vocab_size + 1
+
+        pad_token = special_tokens_manager.get_token_id('pad')
 
         z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
         z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq
@@ -136,11 +142,15 @@ class FlowDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[Dict], tokenizer, max_dim=10):
         self.samples = samples
         self.tokenizer = tokenizer
-        self.vocab_size = tokenizer.vocab_size
-        self.pad_token = tokenizer.pad_token_id
-        self.bos_token = tokenizer.cls_token_id  # BERT使用cls_token
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
-        self.gap_token = self.special_tokens_manager.get_gap_token_id()
+
+        # 设置分词器的特殊token属性
+        self.special_tokens_manager.setup_tokenizer_special_tokens()
+
+        self.vocab_size = self.special_tokens_manager.get_current_vocab_size()
+        self.pad_token = self.special_tokens_manager.get_token_id('pad')
+        self.bos_token = self.special_tokens_manager.get_token_id('bos')  # 使用统一的bos token
+        self.gap_token = self.special_tokens_manager.get_token_id('gap')
 
     def __len__(self):
         return len(self.samples)
