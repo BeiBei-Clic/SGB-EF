@@ -155,7 +155,7 @@ class EditFlowManager:
 
         gap_token = dataset.gap_token
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z_t, config.vocab_size, gap_token
+            z_t, dataset.pad_token, gap_token
         )
 
         attention_mask = (~x_pad_mask).float()
