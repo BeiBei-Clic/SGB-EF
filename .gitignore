@@ -1,7 +1,6 @@
 .venv
 data
 __pycache__/
-docs
 checkpoints/
 models
 claude-provider.sh
