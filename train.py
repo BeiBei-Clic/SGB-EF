@@ -25,10 +25,13 @@ def set_seed(seed: int):
 
 
 def main():
+    # 设置CUDA调试模式
+    # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
     parser = argparse.ArgumentParser(description="训练EditFlow符号回归模型")
 
     # 数据参数
-    parser.add_argument("--num_samples", type=int, default=1000, help="训练样本数")
+    parser.add_argument("--num_samples", type=int, default=10, help="训练样本数")
     parser.add_argument("--max_dim", type=int, default=10, help="最大输入维度")
     parser.add_argument("--n_points", type=int, default=100, help="数据点数量")
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")

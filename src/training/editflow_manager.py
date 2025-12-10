@@ -292,19 +292,25 @@ class EditFlowManager:
             forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config)
             loss = self.compute_loss(forward_results, criterion, dataset) / gradient_accumulation_steps
 
+            grad_norm = 0.0
             if not torch.isnan(loss):
                 optimizer.zero_grad()
                 loss.backward()
 
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
+                    # 计算梯度范数
+                    model_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    condition_encoder_grad_norm = torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
+                    grad_norm = max(model_grad_norm.item(), condition_encoder_grad_norm.item())
                     optimizer.step()
 
             total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
 
-            postfix_dict = {'loss': f'{loss.item() * gradient_accumulation_steps:.4f}'}
+            postfix_dict = {
+                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
+                'grad_norm': f'{grad_norm:.3f}'
+            }
             if self.use_data_parallel and self.gpu_count > 1:
                 postfix_dict['gpu_load'] = get_gpu_memory_usage_string(max_gpus=3)
 
