@@ -2,7 +2,7 @@
 特殊token管理器 - 统一管理运算符、函数和变量token
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from transformers import PreTrainedTokenizer
 
 
@@ -31,6 +31,8 @@ class SpecialTokensManager:
         """
         self.tokenizer = tokenizer
         self.max_dim = max_dim
+        self.original_vocab_size = tokenizer.vocab_size
+        self.added_tokens = set()  # 记录添加的新token
 
         # 构建所有特殊token的映射
         self.special_tokens = {}
@@ -65,28 +67,6 @@ class SpecialTokensManager:
         # 使用tokenizer编码gap token获取ID
         tokens = self.tokenizer.encode(self.GAP_TOKEN, add_special_tokens=False)
         return tokens[0]
-
-    def get_function_token_map(self) -> Dict[str, int]:
-        """
-        获取函数到token ID的映射
-
-        Returns:
-            函数名到token ID的映射字典
-        """
-        func_map = {}
-
-        for func_name in self.FUNCTIONS:
-            # 使用分词器编码函数名，获取token ID
-            tokens = self.tokenizer.encode(func_name, add_special_tokens=False)
-            if len(tokens) == 1:
-                # 理想情况：函数名被分词为单个token
-                func_map[func_name] = tokens[0]
-            elif len(tokens) > 1:
-                # 警告：函数名被拆分为多个token
-                # 仍然使用第一个token，但记录警告
-                func_map[func_name] = tokens[0]
-
-        return func_map
 
     def get_operators(self) -> List[str]:
         """获取运算符列表"""
@@ -128,52 +108,53 @@ class SpecialTokensManager:
 
         return token_ids
 
-    def print_function_mapping(self):
-        """打印函数映射信息，用于调试"""
-        func_map = self.get_function_token_map()
-        if func_map:
-            print("函数token映射:")
-            for func_name, token_id in func_map.items():
-                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
-                print(f"  {func_name} -> {token_id} ('{token_text}')")
-        else:
-            print("警告: 没有可用的函数映射")
-
-        # 打印运算符映射
-        print("运算符token映射:")
-        for op_name in self.OPERATORS:
-            tokens = self.tokenizer.encode(op_name, add_special_tokens=False)
-            if len(tokens) == 1:
-                token_id = tokens[0]
-                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
-                print(f"  {op_name} -> {token_id} ('{token_text}')")
-            else:
-                print(f"  {op_name} -> multiple tokens: {tokens}")
-
-        # 打印变量映射
-        print("变量token映射:")
-        variables = self.get_variables()
-        for var_name in variables:
-            tokens = self.tokenizer.encode(var_name, add_special_tokens=False)
-            if len(tokens) == 1:
-                token_id = tokens[0]
-                token_text = self.tokenizer.decode([token_id]) if self.tokenizer else f"ID: {token_id}"
-                print(f"  {var_name} -> {token_id} ('{token_text}')")
-            else:
-                print(f"  {var_name} -> multiple tokens: {tokens}")
-
-    def is_function(self, token: str) -> bool:
-        """检查token是否为函数"""
-        return token in self.FUNCTIONS
-
-    def is_operator(self, token: str) -> bool:
-        """检查token是否为运算符"""
-        return token in self.OPERATORS
-
-    def is_variable(self, token: str) -> bool:
-        """检查token是否为变量"""
-        return token in self.get_variables()
-
     def is_special_token(self, token: str) -> bool:
         """检查token是否为特殊token"""
         return token in self.special_tokens
+
+    def check_and_add_tokens(self, tokens_to_check: List[str]) -> Dict[str, int]:
+        """
+        检查token是否在分词器中存在，如果不存在则添加
+
+        Args:
+            tokens_to_check: 需要检查的token列表
+
+        Returns:
+            token到ID的映射字典
+        """
+        token_to_id = {}
+        added_tokens_info = []
+
+        for token in tokens_to_check:
+            token_ids = self.tokenizer.encode(token, add_special_tokens=False)
+            if len(token_ids) == 1 and self.tokenizer.decode([token_ids[0]]) == token:
+                token_to_id[token] = token_ids[0]
+            else:
+                self.tokenizer.add_tokens([token])
+                self.added_tokens.add(token)
+                new_id = self.tokenizer.encode(token, add_special_tokens=False)[0]
+                token_to_id[token] = new_id
+                added_tokens_info.append(f"{token} -> {new_id}")
+
+        if added_tokens_info:
+            print("添加的新token映射:")
+            for info in added_tokens_info:
+                print(f"  {info}")
+            current_vocab_size = self.original_vocab_size + len(added_tokens_info)
+            print(f"词表大小从 {self.original_vocab_size} 更新为 {current_vocab_size}")
+
+        return token_to_id
+
+    def ensure_special_tokens(self) -> Dict[str, int]:
+        """
+        确保所有特殊符号和变量都在分词器中存在
+
+        Returns:
+            完整的token到ID映射字典
+        """
+        all_tokens = list(self.special_tokens.keys())
+        return self.check_and_add_tokens(all_tokens)
+
+    def get_current_vocab_size(self) -> int:
+        """获取当前词表大小"""
+        return len(self.tokenizer.get_vocab())

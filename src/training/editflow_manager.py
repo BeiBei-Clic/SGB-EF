@@ -103,7 +103,7 @@ class EditFlowManager:
             print(f"维度 {dim}: 训练样本 {len(train_samples)}, 测试样本 {len(test_samples)}")
 
             # 创建训练集
-            train_dataset = FlowDataset(train_samples, tokenizer)
+            train_dataset = FlowDataset(train_samples, tokenizer, max_dim=self.args.max_dim)
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -113,7 +113,7 @@ class EditFlowManager:
             train_dimension_groups[dim] = train_samples
 
             # 创建测试集
-            test_dataset = FlowDataset(test_samples, tokenizer)
+            test_dataset = FlowDataset(test_samples, tokenizer, max_dim=self.args.max_dim)
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset, batch_size=self.args.batch_size, shuffle=False,
                 num_workers=0, collate_fn=custom_collate_fn
@@ -154,19 +154,28 @@ class EditFlowManager:
         print(f"正在加载tokenizer: {model_name}")
         print(f"模型缓存目录: {cache_dir}")
         tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-        print(f"✓ Tokenizer加载完成")
+        print(f"✓ Tokenizer加载完成，原始词表大小: {tokenizer.vocab_size}")
 
-        print(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
+        # 初始化特殊符号管理器并添加缺失的符号
+        special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.args.max_dim)
+        special_tokens_manager.ensure_special_tokens()
 
         print("初始化条件编码器...")
         condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name).to(self.device)
 
         print("初始化EditFlow模型...")
+        actual_vocab_size = len(tokenizer.get_vocab())  # 获取实际词表大小
         config = EditFlowConfig(
             condition_dim=condition_encoder.output_dim,
             base_model_name=model_name,
+            vocab_size=actual_vocab_size,  # 使用更新后的词表大小
         )
         model = EditFlowTransformer(config).to(self.device)
+
+        # 调整模型embedding层大小以匹配新的词表
+        if actual_vocab_size > model.base_model.get_input_embeddings().num_embeddings:
+            print(f"调整模型embedding层大小: {model.base_model.get_input_embeddings().num_embeddings} -> {actual_vocab_size}")
+            model.base_model.resize_token_embeddings(actual_vocab_size)
 
         # 创建优化器
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
@@ -270,7 +279,7 @@ class EditFlowManager:
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
 
         # 处理DataParallel包装的情况
-        config = model.module.config
+        config = model.module.config if hasattr(model, 'module') else model.config
 
         if self.use_data_parallel and self.gpu_count > 1:
             progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
@@ -494,8 +503,12 @@ class EditFlowManager:
                     current_tokens.append('+')
                 current_tokens.append(f'x{i}')
 
-        # 初始化token管理器
-        special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
+        # 初始化token管理器，确保覆盖数据维度
+        actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
+        special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=actual_max_dim)
+
+        # 确保所有需要的符号都在tokenizer中
+        special_tokens_manager.ensure_special_tokens()
 
         if debug_mode:
             print(f"调试模式: {'开启' if debug_mode else '关闭'}")

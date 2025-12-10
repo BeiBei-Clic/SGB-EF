@@ -133,13 +133,13 @@ class ContinuousFlowLoss:
 class FlowDataset(torch.utils.data.Dataset):
     """连续流数据集 (z0, z1, x_values, residuals)"""
 
-    def __init__(self, samples: List[Dict], tokenizer):
+    def __init__(self, samples: List[Dict], tokenizer, max_dim=10):
         self.samples = samples
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
         self.pad_token = tokenizer.pad_token_id
         self.bos_token = tokenizer.cls_token_id  # BERT使用cls_token
-        self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=10)
+        self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
         self.gap_token = self.special_tokens_manager.get_gap_token_id()
 
     def __len__(self):

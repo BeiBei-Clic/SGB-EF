@@ -14,13 +14,14 @@ class EditFlowConfig:
     """EditFlow Transformer配置类 - 不继承PretrainedConfig以避免AutoModel系统冲突"""
 
     def __init__(self, max_seq_len=128, dropout=0.1, pad_token_id=1, condition_dim=None,
-                 base_model_name="google-bert/bert-base-uncased", use_condition_injection=True, **kwargs):
+                 base_model_name="google-bert/bert-base-uncased", use_condition_injection=True, vocab_size=None, **kwargs):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.pad_token_id = pad_token_id
         self.condition_dim = condition_dim  # 需要从外部设置
         self.base_model_name = base_model_name
         self.use_condition_injection = use_condition_injection
+        self.vocab_size = vocab_size  # 词表大小，如果为None则从预训练模型获取
 
         # 这些参数将从预训练模型动态获取
         self.hidden_dim = None
@@ -108,7 +109,11 @@ class EditFlowTransformer(nn.Module):
 
             # 自动获取模型配置
             self.model_config = self.base_model.config
-            config.vocab_size = getattr(self.model_config, 'vocab_size')
+
+            # 如果指定了vocab_size则使用指定值，否则从预训练模型获取
+            if config.vocab_size is None:
+                config.vocab_size = getattr(self.model_config, 'vocab_size')
+
             config.hidden_dim = getattr(self.model_config, 'hidden_size')
             config.num_heads = getattr(self.model_config, 'num_attention_heads')
             config.num_layers = getattr(self.model_config, 'num_hidden_layers')
