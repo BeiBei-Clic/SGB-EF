@@ -12,7 +12,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from ..utils.special_tokens import SpecialTokensManager
-from ..symbolic.data_generator import generate_flow_samples
+from ..symbolic.data_generator import generate_flow_samples, get_data_filename
 from .flow import (
     KappaScheduler, sample_conditional_path, tokens_to_prob,
     remove_gap_tokens, fill_gap_tokens_with_repeats,
@@ -54,12 +54,26 @@ class EditFlowManager:
             torch.cuda.manual_seed_all(seed)
 
     def prepare_data(self, tokenizer):
-        print("生成连续流训练数据...")
-        samples = generate_flow_samples(
+        """准备训练数据，优先从本地缓存文件加载"""
+        print("准备连续流训练数据...")
+
+        # 检查是否存在缓存文件
+        cache_filename = get_data_filename(
             num_samples=self.args.num_samples,
             max_dim=self.args.max_dim,
             n_points=self.args.n_points,
             max_depth=self.args.max_depth
+        )
+
+        if os.path.exists(cache_filename):
+            print(f"发现缓存文件 {cache_filename}，将直接加载数据...")
+
+        samples = generate_flow_samples(
+            num_samples=self.args.num_samples,
+            max_dim=self.args.max_dim,
+            n_points=self.args.n_points,
+            max_depth=self.args.max_depth,
+            use_cache=True  # 启用缓存功能
         )
 
         # 按维度分组
@@ -79,6 +93,8 @@ class EditFlowManager:
             )
             dataloaders[dim] = dataloader
             datasets[dim] = dataset
+
+        print(f"数据准备完成，共 {len(samples)} 个样本，分布在 {len(dimension_groups)} 个维度组中")
 
         return dataloaders, datasets, dimension_groups
 
@@ -109,7 +125,7 @@ class EditFlowManager:
         print(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
         print("初始化条件编码器...")
-        condition_encoder = ConditionEncoder().to(self.device)
+        condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name).to(self.device)
 
         print("初始化EditFlow模型...")
         config = EditFlowConfig(

@@ -16,6 +16,8 @@ def main():
     args = type('Args', (), {
         'seed': 42,
         'base_model_name': "google-bert/bert-base-uncased",
+        'condition_model_name': "Qwen/Qwen3-Embedding-0.6B",  # 条件嵌入模型名称
+        'cache_dir': "models/huggingface_cache",  # 模型缓存目录
         'use_data_parallel': False,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5

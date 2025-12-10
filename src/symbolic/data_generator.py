@@ -8,6 +8,8 @@ import sympy as sp
 import os
 import warnings
 import time
+import json
+import pickle
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
@@ -240,8 +242,47 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
     # 反转序列，因为我们是反向构建的
     return list(reversed(z1)), list(reversed(z2))
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4) -> List[Dict]:
+def get_data_filename(num_samples: int, max_dim: int, n_points: int, max_depth: int) -> str:
+    """生成数据文件名"""
+    return f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
+
+def save_samples_to_txt(samples: List[Dict], filename: str):
+    """将样本保存到txt文件，每行一个样本"""
+    print(f"保存数据到 {filename}...")
+
+    with open(filename, 'w', encoding='utf-8') as f:
+        for sample in samples:
+            # 将样本转换为JSON格式并写入一行
+            sample_line = json.dumps(sample, ensure_ascii=False)
+            f.write(sample_line + '\n')
+
+    print(f"已保存 {len(samples)} 个样本到 {filename}")
+
+def load_samples_from_txt(filename: str) -> List[Dict]:
+    """从txt文件加载样本"""
+    print(f"从 {filename} 加载数据...")
+
+    samples = []
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                sample = json.loads(line)
+                samples.append(sample)
+
+    print(f"已加载 {len(samples)} 个样本")
+    return samples
+
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, use_cache: bool = True) -> List[Dict]:
     """生成用于EditFlow连续流训练的样本"""
+
+    # 检查是否存在缓存文件
+    filename = get_data_filename(num_samples, max_dim, n_points, max_depth)
+
+    if use_cache and os.path.exists(filename):
+        print(f"发现缓存文件 {filename}，直接加载数据...")
+        return load_samples_from_txt(filename)
+
     samples = []
     dimension_count = {}
 
@@ -289,6 +330,9 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     print(f"\n样本维度分布:")
     for dim, count in sorted(dimension_count.items()):
         print(f"{dim}维: {count} 个样本")
+
+    # 保存到文件
+    save_samples_to_txt(samples, filename)
 
     return samples
 

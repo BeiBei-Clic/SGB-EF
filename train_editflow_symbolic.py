@@ -34,6 +34,8 @@ def main():
 
     # 模型参数
     parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
+    parser.add_argument("--condition_model_name", type=str, default="Qwen/Qwen3-Embedding-0.6B", help="条件嵌入模型名称")
+    parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=6, help="批次大小 (每个GPU)")
@@ -57,6 +59,7 @@ def main():
     print(f"训练轮数: {args.num_epochs}")
     print(f"学习率: {args.learning_rate}")
     print(f"基础模型: {args.base_model_name}")
+    print(f"条件嵌入模型: {args.condition_model_name}")
     print(f"多GPU并行: {args.use_data_parallel}")
     print(f"梯度累积步数: {args.gradient_accumulation_steps}")
 
