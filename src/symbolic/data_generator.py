@@ -368,6 +368,11 @@ def load_samples_from_txt(filename: str) -> List[Dict]:
 def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, use_cache: bool = True) -> List[Dict]:
     """生成用于EditFlow连续流训练的样本"""
 
+    # 设置真正的随机种子，确保每次运行生成不同的数据
+    current_time = int(time.time()) % (2**32 - 1)  # 确保种子在有效范围内
+    random.seed(current_time)
+    np.random.seed(current_time)
+
     # 检查是否存在缓存文件
     filename = get_data_filename(num_samples, max_dim, n_points, max_depth)
 
