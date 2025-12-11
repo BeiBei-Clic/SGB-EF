@@ -35,11 +35,8 @@ def expr_to_tree(expr: sp.Expr) -> str:
     if expr.is_Symbol:
         return str(expr)
     elif expr.is_Number:
-        val = float(expr)
-        # 处理 NaN 值，使用 0 作为默认值（与其他代码保持一致）
-        if np.isnan(val):
-            return "0"
-        return str(int(round(val))) if abs(val - round(val)) < 1e-6 else str(round(val, 6))
+        # 所有数值常数都返回统一的 "constant" token
+        return "constant"
 
     if not hasattr(expr, 'args') or not expr.args:
         return str(expr)

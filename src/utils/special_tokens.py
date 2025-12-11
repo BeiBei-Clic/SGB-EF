@@ -18,6 +18,9 @@ class SpecialTokensManager:
     # 占位符定义
     GAP_TOKEN = '<gap>'
 
+    # 常数定义
+    CONSTANT_TOKEN = 'constant'
+
     # BERT特殊token定义（如果分词器没有，我们会添加这些）
     BOS_TOKEN = '<s>'  # 开始符号
     EOS_TOKEN = '</s>'  # 结束符号
@@ -62,6 +65,9 @@ class SpecialTokensManager:
         # 添加占位符token
         self.special_tokens[self.GAP_TOKEN] = self.GAP_TOKEN
 
+        # 添加常数token
+        self.special_tokens[self.CONSTANT_TOKEN] = self.CONSTANT_TOKEN
+
         # 添加BERT特殊token（如果分词器没有对应的token）
         self.special_tokens[self.BOS_TOKEN] = self.BOS_TOKEN
         self.special_tokens[self.EOS_TOKEN] = self.EOS_TOKEN
@@ -98,6 +104,7 @@ class SpecialTokensManager:
         # token名称映射
         token_map = {
             'gap': self.GAP_TOKEN,
+            'constant': self.CONSTANT_TOKEN,
             'pad': self.PAD_TOKEN,
             'bos': self.BOS_TOKEN,
             'eos': self.EOS_TOKEN,
@@ -153,9 +160,11 @@ class SpecialTokensManager:
                 else:
                     raise ValueError(f"特殊token '{token}' 未在词表中找到")
             elif token.replace('.', '').replace('-', '').isdigit():
-                # 处理数字
-                encoded = self.tokenizer.encode(token, add_special_tokens=False)
-                token_ids.extend(encoded)
+                # 处理数字：统一使用constant token
+                if self.CONSTANT_TOKEN in vocab:
+                    token_ids.append(vocab[self.CONSTANT_TOKEN])
+                else:
+                    raise ValueError(f"常数token '{self.CONSTANT_TOKEN}' 未在词表中找到")
 
         return token_ids
 
