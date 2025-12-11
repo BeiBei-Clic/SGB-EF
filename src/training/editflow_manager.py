@@ -280,6 +280,9 @@ class EditFlowManager:
         # 处理DataParallel包装的情况
         config = model.module.config if hasattr(model, 'module') else model.config
 
+        # 在epoch开始时清零梯度
+        optimizer.zero_grad()
+
         if self.use_data_parallel and self.gpu_count > 1:
             progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
 
@@ -295,22 +298,21 @@ class EditFlowManager:
 
             grad_norm = 0.0
             if not torch.isnan(loss):
-                optimizer.zero_grad()
                 loss.backward()
 
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-                    # 计算梯度范数
-                    model_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    condition_encoder_grad_norm = torch.nn.utils.clip_grad_norm_(condition_encoder.parameters(), 1.0)
-                    grad_norm = max(model_grad_norm.item(), condition_encoder_grad_norm.item())
+                    # 统一计算梯度范数并裁剪
+                    all_params = list(model.parameters()) + list(condition_encoder.parameters())
+                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params, 1.0)
                     optimizer.step()
+                    optimizer.zero_grad()  # 在step后清零梯度，为下一次累积做准备
 
             total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
 
             postfix_dict = {
                 'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                'grad_norm': f'{grad_norm:.3f}'
+                'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}'
             }
             if self.use_data_parallel and self.gpu_count > 1:
                 postfix_dict['gpu_load'] = get_gpu_memory_usage_string(max_gpus=3)
