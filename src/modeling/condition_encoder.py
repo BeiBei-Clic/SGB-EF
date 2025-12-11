@@ -22,8 +22,8 @@ class ConditionEncoder(nn.Module):
 
         print(f"加载模型: {model_name}")
 
-        self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left')
+        self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left', trust_remote_code=True)
         self.output_dim = self.model.config.hidden_size
 
     def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:

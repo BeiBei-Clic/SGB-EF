@@ -243,7 +243,9 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
     expr_vars = [var for var in variables if var in expr.free_symbols]
 
     if not expr_vars:
-        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), float(expr))
+        # 对于常数表达式，提取实数部分
+        value = float(sp.re(expr)) if expr.is_complex else float(expr)
+        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
 
     f = sp.lambdify(expr_vars, expr, 'numpy')
 
@@ -251,6 +253,10 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
         result = f(*[x_values[:, i] for i in range(len(expr_vars))])
     else:
         result = f(x_values)
+
+    # 处理复数结果：提取实数部分
+    if np.iscomplexobj(result):
+        result = np.real(result)
 
     result = np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6)
     return np.clip(result, -1e6, 1e6)
@@ -336,6 +342,9 @@ def save_samples_to_txt(samples: List[Dict], filename: str):
     """将样本保存到txt文件，每行一个样本"""
     print(f"保存数据到 {filename}...")
 
+    # 确保目录存在
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+
     with open(filename, 'w', encoding='utf-8') as f:
         for sample in samples:
             # 将样本转换为JSON格式并写入一行
@@ -369,80 +378,154 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         print(f"发现缓存文件 {filename}，直接加载数据...")
         return load_samples_from_txt(filename)
 
-    samples = []
-    dimension_count = {}
+    # 统一使用分批生成逻辑，小数据量时相当于直接生成
+    BATCH_SIZE = 50000  # 每批生成5万个样本
+    return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, BATCH_SIZE)
 
-    print(f"生成 {num_samples} 个连续流训练样本...")
 
-    sample_count = 0
-    pbar = tqdm(total=num_samples, desc="生成流数据")
+def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, max_depth: int, filename: str, batch_size: int) -> List[Dict]:
+    """分批生成数据样本，支持断点续传"""
+    all_samples = []
+    total_dimension_count = {}
 
-    while sample_count < num_samples:
-        dim = random.randint(1, max_dim)
-        dimension_count[dim] = dimension_count.get(dim, 0) + 1
+    print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
 
-        # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
-        x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
-        x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
-        x_array = np.array(x_values)  # 用于表达式计算
+    num_batches = (num_samples + batch_size - 1) // batch_size
 
-        # 生成目标表达式
-        target_expr = generate_random_expr(dim, max_depth)
-        y_target = evaluate_expr(target_expr, x_array)
+    # 检查已完成的批次
+    completed_batches = []
+    for batch_idx in range(num_batches):
+        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+        if os.path.exists(batch_filename):
+            completed_batches.append(batch_idx)
 
-        # 生成删减序列
-        reduction_sequence = generate_reduction_sequence(target_expr)
+    if completed_batches:
+        print(f"发现已完成 {len(completed_batches)} 个批次，将从第 {len(completed_batches) + 1} 批开始继续生成...")
+        start_batch = len(completed_batches)
+    else:
+        start_batch = 0
 
-        # 为删减序列中的每个表达式创建样本
-        for reduced_expr in reduction_sequence:
-            if sample_count >= num_samples:
+    for batch_idx in range(start_batch, num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, num_samples)
+        current_batch_size = end_idx - start_idx
+
+        print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
+
+        batch_samples = []
+        dimension_count = {}
+        sample_count = 0
+        pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
+
+        while sample_count < current_batch_size:
+            try:
+                dim = random.randint(1, max_dim)
+                dimension_count[dim] = dimension_count.get(dim, 0) + 1
+
+                # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
+                x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
+                x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
+                x_array = np.array(x_values)  # 用于表达式计算
+
+                # 生成目标表达式
+                target_expr = generate_random_expr(dim, max_depth)
+                y_target = evaluate_expr(target_expr, x_array)
+
+                # 生成删减序列
+                reduction_sequence = generate_reduction_sequence(target_expr)
+
+                # 为删减序列中的每个表达式创建样本
+                for reduced_expr in reduction_sequence:
+                    if sample_count >= current_batch_size:
+                        break
+
+                    # 对删减后的表达式应用额外的随机破坏
+                    curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
+                    y_curr = evaluate_expr(curr_expr, x_array)
+
+                    # 转换为token序列
+                    target_tokens = expr_to_tree(target_expr).split(',')
+                    curr_tokens = expr_to_tree(curr_expr).split(',')
+
+                    # 对齐到Z空间，包含gap token
+                    z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+
+                    batch_samples.append({
+                        "input_dimension": dim,
+                        "x_values": x_values,  # 保持与原代码一致的字段名
+                        "y_target": y_target.tolist(),
+                        "y_curr": y_curr.tolist(),
+                        "residuals": (y_target - y_curr).tolist(),
+                        "tree_gt": expr_to_tree(target_expr),
+                        "exp_gt": str(target_expr),
+                        "tree_cur1": expr_to_tree(curr_expr),
+                        "exp_cur1": str(curr_expr),
+                        "curr_tokens": curr_tokens,
+                        "target_tokens": target_tokens,
+                        "z0_tokens": z0_tokens,
+                        "z1_tokens": z1_tokens
+                    })
+
+                    sample_count += 1
+                    pbar.update(1)
+
+            except Exception as e:
+                # 跳过出错的样本，继续生成下一个
+                print(f"警告: 生成样本时出错，跳过该样本: {e}")
+                continue
+
+            if sample_count >= current_batch_size:
                 break
 
-            # 对删减后的表达式应用额外的随机破坏
-            curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
-            y_curr = evaluate_expr(curr_expr, x_array)
+        pbar.close()
 
-            # 转换为token序列
-            target_tokens = expr_to_tree(target_expr).split(',')
-            curr_tokens = expr_to_tree(curr_expr).split(',')
+        # 累积维度统计
+        for dim, count in dimension_count.items():
+            total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
 
-            # 对齐到Z空间，包含gap token
-            z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+        # 立即保存当前批次
+        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+        save_samples_to_txt(batch_samples, batch_filename)
 
-            samples.append({
-                "input_dimension": dim,
-                "x_values": x_values,  # 已经是列表格式
-                "y_target": y_target.tolist(),
-                "y_curr": y_curr.tolist(),
-                "residuals": (y_target - y_curr).tolist(),
-                "tree_gt": expr_to_tree(target_expr),
-                "exp_gt": str(target_expr),
-                "tree_cur1": expr_to_tree(curr_expr),
-                "exp_cur1": str(curr_expr),
-                "curr_tokens": curr_tokens,
-                "target_tokens": target_tokens,
-                "z0_tokens": z0_tokens,  # 对齐后的当前序列（包含gap）
-                "z1_tokens": z1_tokens,  # 对齐后的目标序列（包含gap）
-                "edit_distance": len([op for op in range(len(z0_tokens)) if z0_tokens[op] != z1_tokens[op]])
-            })
+        # 将批次样本添加到总样本中
+        all_samples.extend(batch_samples)
 
-            sample_count += 1
-            pbar.update(1)
+        print(f"第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
+        print(f"当前批次维度分布:")
+        for dim, count in sorted(dimension_count.items()):
+            print(f"  {dim}维: {count} 个样本")
 
-        # 如果还没有达到目标样本数，继续生成新的目标表达式
-        if sample_count >= num_samples:
-            break
+    # 加载已完成批次的样本
+    print(f"\n加载已完成批次的样本...")
+    for batch_idx in range(num_batches):
+        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+        if os.path.exists(batch_filename):
+            batch_samples = load_samples_from_txt(batch_filename)
+            all_samples.extend(batch_samples)
+            # 统计维度分布
+            for sample in batch_samples:
+                dim = sample['input_dimension']
+                total_dimension_count[dim] = total_dimension_count.get(dim, 0) + 1
 
-    pbar.close()
+    # 合并所有批次文件到一个文件
+    print(f"合并 {num_batches} 个批次文件到主文件...")
+    with open(filename, 'w', encoding='utf-8') as main_file:
+        for batch_idx in range(num_batches):
+            batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+            if os.path.exists(batch_filename):
+                with open(batch_filename, 'r', encoding='utf-8') as batch_file:
+                    main_file.write(batch_file.read())
+                # 删除批次文件
+                os.remove(batch_filename)
+                print(f"已合并并删除批次文件: {batch_filename}")
 
-    print(f"\n样本维度分布:")
-    for dim, count in sorted(dimension_count.items()):
+    print(f"\n总体样本维度分布:")
+    for dim, count in sorted(total_dimension_count.items()):
         print(f"{dim}维: {count} 个样本")
 
-    # 保存到文件
-    save_samples_to_txt(samples, filename)
+    print(f"所有数据已保存到: {filename}")
 
-    return samples
+    return all_samples
 
 
 
