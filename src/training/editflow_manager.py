@@ -205,12 +205,31 @@ class EditFlowManager:
         return model, condition_encoder, criterion, optimizer, tokenizer
 
   
-    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config):
+    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info=None):
         batch_size = z0_token_ids.size(0)
         t = torch.rand(batch_size, 1, device=self.device)
 
+        # 调试：检查z0和z1 token IDs的有效性（仅在提供debug_info且为第一个batch时）
+        if debug_info and debug_info.get('is_first_batch', False):
+            print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
+            print(f"[DEBUG] vocab_size={config.vocab_size}")
+
+            # 检查是否有越界的token IDs
+            z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
+            z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
+            print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
+            print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
+
         z0_probs = tokens_to_prob(z0_token_ids, config.vocab_size)
         z1_probs = tokens_to_prob(z1_token_ids, config.vocab_size)
+
+        # 调试：检查概率分布（仅在提供debug_info且为第一个batch时）
+        if debug_info and debug_info.get('is_first_batch', False):
+            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: min={z0_probs.min().item()}, max={z0_probs.max().item()}, sum={z0_probs.sum(dim=-1)[0,0].item():.4f}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: min={z1_probs.min().item()}, max={z1_probs.max().item()}, sum={z1_probs.sum(dim=-1)[0,0].item():.4f}")
+            print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
+
         z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
@@ -292,8 +311,47 @@ class EditFlowManager:
             z0_token_ids = batch['z0_token_ids'].to(self.device)
             z1_token_ids = batch['z1_token_ids'].to(self.device)
 
+            # 调试输出：解码z0和z1的token序列
+            if batch_idx == 0:  # 只在第一个batch输出调试信息
+                print(f"\n[DEBUG] 维度 {dimension} - 第一个batch的token解码信息:")
+
+                # 解码z0_token_ids
+                vocab = dataset.special_tokens_manager.tokenizer.get_vocab()
+                id_to_token = {v: k for k, v in vocab.items()}
+
+                print("[DEBUG] z0_token_ids解码结果 (前3个样本):")
+                for i in range(min(3, z0_token_ids.size(0))):
+                    z0_tokens = []
+                    for token_id in z0_token_ids[i].tolist():
+                        if token_id in id_to_token:
+                            token = id_to_token[token_id]
+                            if token not in ['<pad>', '<gap>', '<s>', '</s>']:
+                                z0_tokens.append(token)
+                    z0_expression = ','.join(z0_tokens) if z0_tokens else "<empty>"
+                    print(f"  样本{i}: {z0_expression}")
+
+                print("[DEBUG] z1_token_ids解码结果 (前3个样本):")
+                for i in range(min(3, z1_token_ids.size(0))):
+                    z1_tokens = []
+                    for token_id in z1_token_ids[i].tolist():
+                        if token_id in id_to_token:
+                            token = id_to_token[token_id]
+                            if token not in ['<pad>', '<gap>', '<s>', '</s>']:
+                                z1_tokens.append(token)
+                    z1_expression = ','.join(z1_tokens) if z1_tokens else "<empty>"
+                    print(f"  样本{i}: {z1_expression}")
+
             condition_embeddings = condition_encoder(x_values, residuals)
-            forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config)
+
+            # 准备调试信息
+            debug_info = None
+            if batch_idx == 0:
+                debug_info = {
+                    'is_first_batch': True,
+                    'context': f'维度{dimension}'
+                }
+
+            forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
             loss = self.compute_loss(forward_results, criterion, dataset) / gradient_accumulation_steps
 
             grad_norm = 0.0

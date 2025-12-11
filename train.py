@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
     # 训练参数
-    parser.add_argument("--batch_size", type=int, default=10, help="批次大小 (每个GPU)")
+    parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")

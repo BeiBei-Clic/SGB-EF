@@ -31,10 +31,34 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
     kappa_t = kappa_t.view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
 
     pt = (1 - kappa_t) * p0 + kappa_t * p1
+
+    # 检查并修复数值问题
+    if torch.isnan(pt).any() or torch.isinf(pt).any():
+        print(f"[DEBUG] 检测到pt中包含nan或inf值")
+        print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
+        print(f"[DEBUG] p0.min: {p0.min().item()}, p0.max: {p0.max().item()}")
+        print(f"[DEBUG] p1.min: {p1.min().item()}, p1.max: {p1.max().item()}")
+        print(f"[DEBUG] kappa_t.min: {kappa_t.min().item()}, kappa_t.max: {kappa_t.max().item()}")
+
+        # 如果有无效值，使用p0作为fallback
+        pt = p0.clone()
+        print("[DEBUG] 使用p0作为fallback")
+
+    # 确保所有值为非负
+    pt = torch.clamp(pt, min=0.0)
+
     pt_sum = pt.sum(dim=-1, keepdim=True)
     # 防止除零，避免产生inf或nan值
     pt_sum = torch.clamp(pt_sum, min=1e-8)
     pt = pt / pt_sum
+
+    # 最终检查概率的有效性
+    if torch.isnan(pt).any() or torch.isinf(pt).any() or (pt < 0).any():
+        print(f"[DEBUG] 概率归一化后仍有问题")
+        print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
+        print(f"[DEBUG] pt_sum.min: {pt_sum.min().item()}, pt_sum.max: {pt_sum.max().item()}")
+        # 如果仍有问题，返回p0的token ID
+        return torch.argmax(p0, dim=-1)
 
     pt_flat = pt.view(-1, pt.size(-1))
     sampled = torch.multinomial(pt_flat, 1)
