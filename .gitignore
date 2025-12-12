@@ -5,3 +5,4 @@ checkpoints/
 models
 claude-provider.sh
 data
+logs

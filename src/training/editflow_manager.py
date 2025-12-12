@@ -210,27 +210,29 @@ class EditFlowManager:
         t = torch.rand(batch_size, 1, device=self.device)
 
         # 调试：检查z0和z1 token IDs的有效性（仅在提供debug_info且为第一个batch时）
-        if debug_info and debug_info.get('is_first_batch', False):
-            print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
-            print(f"[DEBUG] vocab_size={config.vocab_size}")
+        # if debug_info and debug_info.get('is_first_batch', False):
+        #     print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
+        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
+        #     print(f"[DEBUG] vocab_size={config.vocab_size}")
 
-            # 检查是否有越界的token IDs
-            z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
-            z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
-            print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
-            print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
+        #     # 检查是否有越界的token IDs
+        #     z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
+        #     z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
+        #     print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
+        #     print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
 
         z0_probs = tokens_to_prob(z0_token_ids, config.vocab_size)
         z1_probs = tokens_to_prob(z1_token_ids, config.vocab_size)
 
         # 调试：检查概率分布（仅在提供debug_info且为第一个batch时）
-        if debug_info and debug_info.get('is_first_batch', False):
-            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: min={z0_probs.min().item()}, max={z0_probs.max().item()}, sum={z0_probs.sum(dim=-1)[0,0].item():.4f}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: min={z1_probs.min().item()}, max={z1_probs.max().item()}, sum={z1_probs.sum(dim=-1)[0,0].item():.4f}")
-            print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
+        # if debug_info and debug_info.get('is_first_batch', False):
+        #     print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: {z0_probs}")
+        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: {z1_probs}")
+        #     print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
 
         z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
+
+        # print(f"[DEBUG]  z_t: {z_t}")
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
             z_t, dataset.special_tokens_manager
