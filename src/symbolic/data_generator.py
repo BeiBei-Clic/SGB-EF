@@ -16,6 +16,11 @@ import signal
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
+# 自定义超时异常
+class TimeoutError(Exception):
+    """自定义超时异常"""
+    pass
+
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
@@ -593,120 +598,158 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
 
         while sample_count < current_batch_size:
+            sample_start_time = time.time()
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
             steps = []
 
-            dim = random.randint(1, max_dim)
-            dimension_count[dim] = dimension_count.get(dim, 0) + 1
+            # 每个样本的最大处理时间（秒）
+            SAMPLE_TIMEOUT = 5.0
 
-            log_sample_step(sample_id, f"开始生成样本", f"批次{batch_idx+1}, 维度{dim}, 样本数{sample_count}/{current_batch_size}")
-
-            # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
-            log_sample_step(sample_id, "生成数据点", f"{n_points}个点, {dim}维")
-            x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
-            x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
-            x_array = np.array(x_values)  # 用于表达式计算
-            steps.append("数据点生成完成")
-
-            # 生成目标表达式
-            log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
             try:
-                target_expr = generate_random_expr(dim, max_depth)
-                expr_str = str(target_expr)
-                steps.append(f"目标表达式: {expr_str}")
-            except Exception as expr_error:
-                log_sample_step(sample_id, "跳过生成失败的表达式", f"生成错误: {str(expr_error)}")
-                sample_count += 1
-                pbar.update(1)
-                continue
+                # 检查样本生成是否超时
+                if time.time() - sample_start_time > SAMPLE_TIMEOUT:
+                    log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
 
-            # 保留必要的防御性检查
-            if len(expr_str) > 24:
-                log_sample_step(sample_id, "跳过复杂表达式", f"长度{len(expr_str)} > 24")
-                sample_count += 1
-                pbar.update(1)
-                continue
+                dim = random.randint(1, max_dim)
+                dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
-            if target_expr.has(sp.I) or 'I' in expr_str:
-                log_sample_step(sample_id, "跳过复数表达式", f"包含复数单位I")
-                sample_count += 1
-                pbar.update(1)
-                continue
+                log_sample_step(sample_id, f"开始生成样本", f"批次{batch_idx+1}, 维度{dim}, 样本数{sample_count}/{current_batch_size}")
 
-            # 计算目标表达式值
-            log_sample_step(sample_id, "计算目标表达式值")
-            try:
-                y_target = evaluate_expr(target_expr, x_array)
-                steps.append("目标值计算完成")
-            except Exception as eval_error:
-                log_sample_step(sample_id, "跳过计算失败的表达式", f"计算错误: {str(eval_error)}")
-                sample_count += 1
-                pbar.update(1)
-                continue
+                # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
+                log_sample_step(sample_id, "生成数据点", f"{n_points}个点, {dim}维")
+                x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
+                x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
+                x_array = np.array(x_values)  # 用于表达式计算
+                steps.append("数据点生成完成")
 
-            # 生成删减序列
-            log_sample_step(sample_id, "生成删减序列")
-            try:
-                reduction_sequence = generate_reduction_sequence(target_expr)
-                steps.append(f"删减序列长度: {len(reduction_sequence)}")
-            except Exception as reduction_error:
-                log_sample_step(sample_id, "跳过生成失败的删减序列", f"生成错误: {str(reduction_error)}")
-                sample_count += 1
-                pbar.update(1)
-                continue
+                # 生成目标表达式
+                log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
+                try:
+                    target_expr = generate_random_expr(dim, max_depth)
+                    expr_str = str(target_expr)
+                    steps.append(f"目标表达式: {expr_str}")
+                except TimeoutError:
+                    log_sample_step(sample_id, "跳过生成超时的表达式", "生成超时2秒")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+                except Exception as expr_error:
+                    log_sample_step(sample_id, "跳过生成失败的表达式", f"生成错误: {str(expr_error)}")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
 
-            # 为删减序列中的每个表达式创建样本
-            for i, reduced_expr in enumerate(reduction_sequence):
+                # 保留必要的防御性检查
+                if len(expr_str) > 24:
+                    log_sample_step(sample_id, "跳过复杂表达式", f"长度{len(expr_str)} > 24")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+
+                if target_expr.has(sp.I) or 'I' in expr_str:
+                    log_sample_step(sample_id, "跳过复数表达式", f"包含复数单位I")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+
+                # 计算目标表达式值
+                log_sample_step(sample_id, "计算目标表达式值")
+                try:
+                    y_target = evaluate_expr(target_expr, x_array)
+                    steps.append("目标值计算完成")
+                except TimeoutError:
+                    log_sample_step(sample_id, "跳过计算超时的表达式", "计算超时2秒")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+                except Exception as eval_error:
+                    log_sample_step(sample_id, "跳过计算失败的表达式", f"计算错误: {str(eval_error)}")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+
+                # 生成删减序列
+                log_sample_step(sample_id, "生成删减序列")
+                try:
+                    reduction_sequence = generate_reduction_sequence(target_expr)
+                    steps.append(f"删减序列长度: {len(reduction_sequence)}")
+                except TimeoutError:
+                    log_sample_step(sample_id, "跳过生成超时的删减序列", "生成超时1秒")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+                except Exception as reduction_error:
+                    log_sample_step(sample_id, "跳过生成失败的删减序列", f"生成错误: {str(reduction_error)}")
+                    sample_count += 1
+                    pbar.update(1)
+                    continue
+
+                # 为删减序列中的每个表达式创建样本
+                for i, reduced_expr in enumerate(reduction_sequence):
+                    if sample_count >= current_batch_size:
+                        break
+
+                    log_sample_step(sample_id, f"处理删减表达式 {i+1}/{len(reduction_sequence)}", f"表达式: {str(reduced_expr)}")
+
+                    # 对删减后的表达式应用额外的随机破坏
+                    curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
+
+                    # 检查删减后的表达式是否包含复数单位
+                    if curr_expr.has(sp.I) or 'I' in str(curr_expr):
+                        log_sample_step(sample_id, f"跳过复数删减表达式 {i+1}", f"表达式包含复数单位")
+                        continue
+
+                    # 计算当前值
+                    try:
+                        y_curr = evaluate_expr(curr_expr, x_array)
+                    except TimeoutError:
+                        log_sample_step(sample_id, f"跳过计算超时的删减表达式 {i+1}", "计算超时1秒")
+                        continue
+                    except Exception as eval_error:
+                        log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {str(eval_error)}")
+                        continue
+
+                    # 转换为token序列
+                    target_tokens = expr_to_tree(target_expr).split(',')
+                    curr_tokens = expr_to_tree(curr_expr).split(',')
+
+                    # 对齐到Z空间，包含gap token
+                    z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+
+                    batch_samples.append({
+                        "input_dimension": dim,
+                        "x_values": x_values,  # 保持与原代码一致的字段名
+                        "y_target": y_target.tolist(),
+                        "y_curr": y_curr.tolist(),
+                        "residuals": (y_target - y_curr).tolist(),
+                        "tree_gt": expr_to_tree(target_expr),
+                        "exp_gt": str(target_expr),
+                        "tree_cur1": expr_to_tree(curr_expr),
+                        "exp_cur1": str(curr_expr),
+                        "curr_tokens": curr_tokens,
+                        "target_tokens": target_tokens,
+                        "z0_tokens": z0_tokens,
+                        "z1_tokens": z1_tokens
+                    })
+
+                    sample_count += 1
+                    pbar.update(1)
+
+                log_sample_success(sample_id)
+
                 if sample_count >= current_batch_size:
                     break
 
-                log_sample_step(sample_id, f"处理删减表达式 {i+1}/{len(reduction_sequence)}", f"表达式: {str(reduced_expr)}")
-
-                # 对删减后的表达式应用额外的随机破坏
-                curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
-
-                # 检查删减后的表达式是否包含复数单位
-                if curr_expr.has(sp.I) or 'I' in str(curr_expr):
-                    log_sample_step(sample_id, f"跳过复数删减表达式 {i+1}", f"表达式包含复数单位")
-                    continue
-
-                # 计算当前值
-                try:
-                    y_curr = evaluate_expr(curr_expr, x_array)
-                except Exception as eval_error:
-                    log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {str(eval_error)}")
-                    continue
-
-                # 转换为token序列
-                target_tokens = expr_to_tree(target_expr).split(',')
-                curr_tokens = expr_to_tree(curr_expr).split(',')
-
-                # 对齐到Z空间，包含gap token
-                z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
-
-                batch_samples.append({
-                    "input_dimension": dim,
-                    "x_values": x_values,  # 保持与原代码一致的字段名
-                    "y_target": y_target.tolist(),
-                    "y_curr": y_curr.tolist(),
-                    "residuals": (y_target - y_curr).tolist(),
-                    "tree_gt": expr_to_tree(target_expr),
-                    "exp_gt": str(target_expr),
-                    "tree_cur1": expr_to_tree(curr_expr),
-                    "exp_cur1": str(curr_expr),
-                    "curr_tokens": curr_tokens,
-                    "target_tokens": target_tokens,
-                    "z0_tokens": z0_tokens,
-                    "z1_tokens": z1_tokens
-                })
-
-                sample_count += 1
-                pbar.update(1)
-
-            log_sample_success(sample_id)
-
-            if sample_count >= current_batch_size:
-                break
+            except Exception as e:
+                # 记录卡住的样本
+                duration = time.time() - sample_start_time
+                steps.append(f"错误: {str(e)}")
+                log_sample_stuck(sample_id, duration, steps)
+                print(f"警告: 生成样本时出错，跳过该样本: {e}")
+                continue
 
         pbar.close()
 
