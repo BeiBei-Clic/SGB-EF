@@ -16,11 +16,6 @@ import signal
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
-# 自定义超时异常
-class TimeoutError(Exception):
-    """自定义超时异常"""
-    pass
-
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
@@ -518,6 +513,10 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
     # 反转序列，因为我们是反向构建的
     return list(reversed(z1)), list(reversed(z2))
 
+def get_data_filename(num_samples: int, max_dim: int, n_points: int, max_depth: int) -> str:
+    """生成数据文件名"""
+    return f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
+
 def save_samples_to_txt(samples: List[Dict], filename: str):
     """将样本保存到txt文件，每行一个样本"""
     print(f"保存数据到 {filename}...")
@@ -557,20 +556,25 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     np.random.seed(current_time)
 
     # 检查是否存在缓存文件
-    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
+    filename = get_data_filename(num_samples, max_dim, n_points, max_depth)
 
     if use_cache and os.path.exists(filename):
         print(f"发现缓存文件 {filename}，直接加载数据...")
         return load_samples_from_txt(filename)
 
-    # 分批生成数据样本，支持断点续传
+    # 统一使用分批生成逻辑，小数据量时相当于直接生成
+    BATCH_SIZE = 50000  # 每批生成5万个样本
+    return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, BATCH_SIZE)
+
+
+def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, max_depth: int, filename: str, batch_size: int) -> List[Dict]:
+    """分批生成数据样本，支持断点续传"""
     all_samples = []
     total_dimension_count = {}
-    BATCH_SIZE = 50000  # 每批生成5万个样本
 
-    print(f"分批生成 {num_samples} 个连续流训练样本，每批 {BATCH_SIZE} 个...")
+    print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
 
-    num_batches = (num_samples + BATCH_SIZE - 1) // BATCH_SIZE
+    num_batches = (num_samples + batch_size - 1) // batch_size
 
     # 检查已完成的批次
     completed_batches = []
@@ -586,8 +590,8 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         start_batch = 0
 
     for batch_idx in range(start_batch, num_batches):
-        start_idx = batch_idx * BATCH_SIZE
-        end_idx = min(start_idx + BATCH_SIZE, num_samples)
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, num_samples)
         current_batch_size = end_idx - start_idx
 
         print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
@@ -625,10 +629,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 x_array = np.array(x_values)  # 用于表达式计算
                 steps.append("数据点生成完成")
 
-                # 生成目标表达式
+                # 生成目标表达式，添加超时保护
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
                 try:
-                    target_expr = generate_random_expr(dim, max_depth)
+                    target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
                     expr_str = str(target_expr)
                     steps.append(f"目标表达式: {expr_str}")
                 except TimeoutError:
@@ -642,23 +646,24 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                     pbar.update(1)
                     continue
 
-                # 保留必要的防御性检查
-                if len(expr_str) > 24:
-                    log_sample_step(sample_id, "跳过复杂表达式", f"长度{len(expr_str)} > 24")
+                # 如果表达式太复杂，跳过
+                if len(expr_str) > 100:
+                    log_sample_step(sample_id, "跳过复杂表达式", f"长度{len(expr_str)} > 100")
                     sample_count += 1
                     pbar.update(1)
                     continue
 
+                # 预先检查表达式是否可能导致复数问题
                 if target_expr.has(sp.I) or 'I' in expr_str:
                     log_sample_step(sample_id, "跳过复数表达式", f"包含复数单位I")
                     sample_count += 1
                     pbar.update(1)
                     continue
 
-                # 计算目标表达式值
-                log_sample_step(sample_id, "计算目标表达式值")
+                # 尝试计算目标值，添加超时保护
                 try:
-                    y_target = evaluate_expr(target_expr, x_array)
+                    log_sample_step(sample_id, "计算目标表达式值")
+                    y_target = with_timeout(evaluate_expr, 2.0, target_expr, x_array)
                     steps.append("目标值计算完成")
                 except TimeoutError:
                     log_sample_step(sample_id, "跳过计算超时的表达式", "计算超时2秒")
@@ -673,19 +678,8 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
                 # 生成删减序列
                 log_sample_step(sample_id, "生成删减序列")
-                try:
-                    reduction_sequence = generate_reduction_sequence(target_expr)
-                    steps.append(f"删减序列长度: {len(reduction_sequence)}")
-                except TimeoutError:
-                    log_sample_step(sample_id, "跳过生成超时的删减序列", "生成超时1秒")
-                    sample_count += 1
-                    pbar.update(1)
-                    continue
-                except Exception as reduction_error:
-                    log_sample_step(sample_id, "跳过生成失败的删减序列", f"生成错误: {str(reduction_error)}")
-                    sample_count += 1
-                    pbar.update(1)
-                    continue
+                reduction_sequence = generate_reduction_sequence(target_expr)
+                steps.append(f"删减序列长度: {len(reduction_sequence)}")
 
                 # 为删减序列中的每个表达式创建样本
                 for i, reduced_expr in enumerate(reduction_sequence):
@@ -702,9 +696,9 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         log_sample_step(sample_id, f"跳过复数删减表达式 {i+1}", f"表达式包含复数单位")
                         continue
 
-                    # 计算当前值
+                    # 尝试计算当前值，添加超时保护
                     try:
-                        y_curr = evaluate_expr(curr_expr, x_array)
+                        y_curr = with_timeout(evaluate_expr, 1.0, curr_expr, x_array)
                     except TimeoutError:
                         log_sample_step(sample_id, f"跳过计算超时的删减表达式 {i+1}", "计算超时1秒")
                         continue
@@ -740,9 +734,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
                 log_sample_success(sample_id)
 
-                if sample_count >= current_batch_size:
-                    break
-
             except Exception as e:
                 # 记录卡住的样本
                 duration = time.time() - sample_start_time
@@ -750,6 +741,9 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 log_sample_stuck(sample_id, duration, steps)
                 print(f"警告: 生成样本时出错，跳过该样本: {e}")
                 continue
+
+            if sample_count >= current_batch_size:
+                break
 
         pbar.close()
 
@@ -805,3 +799,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     print(f"所有数据已保存到: {filename}")
 
     return all_samples
+
+
+
