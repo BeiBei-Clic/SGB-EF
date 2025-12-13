@@ -513,10 +513,6 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
     # 反转序列，因为我们是反向构建的
     return list(reversed(z1)), list(reversed(z2))
 
-def get_data_filename(num_samples: int, max_dim: int, n_points: int, max_depth: int) -> str:
-    """生成数据文件名"""
-    return f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
-
 def save_samples_to_txt(samples: List[Dict], filename: str):
     """将样本保存到txt文件，每行一个样本"""
     print(f"保存数据到 {filename}...")
@@ -589,7 +585,7 @@ def load_samples_from_txt(filename: str) -> List[Dict]:
     print(f"已加载 {len(samples)} 个样本")
     return samples
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000, use_cache: bool = True) -> List[Dict]:
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000) -> List[Dict]:
     """生成用于EditFlow连续流训练的样本"""
 
     # 设置真正的随机种子，确保每次运行生成不同的数据
@@ -598,10 +594,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     np.random.seed(current_time)
 
     # 检查是否存在缓存文件
-    filename = get_data_filename(num_samples, max_dim, n_points, max_depth)
+    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
 
     # 1. 检查是否存在数据文件且没有批次文件，证明数据完整，可以开始训练
-    if use_cache and os.path.exists(filename):
+    if os.path.exists(filename):
         # 检查是否有残留的批次文件
         num_batches = (num_samples + batch_size - 1) // batch_size
         has_batches = False

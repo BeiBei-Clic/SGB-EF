@@ -13,7 +13,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from ..utils.special_tokens import SpecialTokensManager
-from ..symbolic.data_generator import generate_flow_samples, get_data_filename, load_dimension_index
+from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
 from .flow import (
     KappaScheduler, sample_conditional_path, tokens_to_prob,
     remove_gap_tokens, fill_gap_tokens_with_repeats,
@@ -59,12 +59,7 @@ class EditFlowManager:
         print("准备连续流训练数据...")
 
         # 检查是否存在缓存文件
-        cache_filename = get_data_filename(
-            num_samples=self.args.num_samples,
-            max_dim=self.args.max_dim,
-            n_points=self.args.n_points,
-            max_depth=self.args.max_depth
-        )
+        cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
 
         if not os.path.exists(cache_filename):
             print(f"未发现缓存文件 {cache_filename}，将先生成数据...")
@@ -72,8 +67,7 @@ class EditFlowManager:
                 num_samples=self.args.num_samples,
                 max_dim=self.args.max_dim,
                 n_points=self.args.n_points,
-                max_depth=self.args.max_depth,
-                use_cache=True  # 启用缓存功能
+                max_depth=self.args.max_depth
             )
         else:
             print(f"发现缓存文件 {cache_filename}，将基于文件创建数据集...")
