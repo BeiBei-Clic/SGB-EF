@@ -558,33 +558,57 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     # 检查是否存在缓存文件
     filename = get_data_filename(num_samples, max_dim, n_points, max_depth)
 
+    # 1. 检查是否存在数据文件且没有批次文件，证明数据完整，可以开始训练
     if use_cache and os.path.exists(filename):
-        print(f"发现缓存文件 {filename}，直接加载数据...")
-        return load_samples_from_txt(filename)
-
-    # 如果主文件不存在但有批次文件，先合并批次文件
-    if use_cache and not os.path.exists(filename):
+        # 检查是否有残留的批次文件
         num_batches = (num_samples + batch_size - 1) // batch_size
-        existing_batches = []
+        has_batches = False
         for batch_idx in range(num_batches):
             batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
             if os.path.exists(batch_filename):
-                existing_batches.append(batch_filename)
+                has_batches = True
+                break
 
-        if existing_batches:
-            print(f"发现 {len(existing_batches)} 个批次文件，但主文件不存在，开始合并...")
-            # 合并批次文件到主文件
-            with open(filename, 'w', encoding='utf-8') as main_file:
-                for batch_filename in sorted(existing_batches):
-                    with open(batch_filename, 'r', encoding='utf-8') as batch_file:
-                        main_file.write(batch_file.read())
-                    os.remove(batch_filename)  # 删除批次文件
-                    print(f"已合并并删除: {os.path.basename(batch_filename)}")
-            print(f"所有批次已合并到: {filename}")
-            # 现在加载合并后的主文件
+        if not has_batches:
+            print(f"发现完整数据文件 {filename}，无批次文件，直接加载数据...")
             return load_samples_from_txt(filename)
+        else:
+            print(f"发现异常状态：数据文件和批次文件都存在")
+            print(f"这可能是之前合并中断导致的，将先删除旧数据文件...")
+            # 删掉旧的主文件，让它进入"批次未完成"的流程
+            os.remove(filename)
 
-    # 统一使用分批生成逻辑，小数据量时相当于直接生成
+    # 2. 检查批次文件状态
+    num_batches = (num_samples + batch_size - 1) // batch_size
+    existing_batches = []
+    for batch_idx in range(num_batches):
+        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+        if os.path.exists(batch_filename):
+            existing_batches.append(batch_filename)
+
+    # 3. 根据批次文件存在情况决定后续操作
+    if existing_batches:
+        # 检查是否所有批次都已完成
+        if len(existing_batches) == num_batches:
+            print(f"发现 {len(existing_batches)}/{num_batches} 个批次文件，批次已完成，开始合并...")
+            # 合并批次文件到主文件（从小批次到大批次合并）
+            with open(filename, 'w', encoding='utf-8') as main_file:
+                for batch_idx in range(num_batches):
+                    batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+                    if os.path.exists(batch_filename):
+                        with open(batch_filename, 'r', encoding='utf-8') as batch_file:
+                            main_file.write(batch_file.read())
+                        os.remove(batch_filename)  # 删除批次文件
+                        print(f"已合并并删除: batch_{batch_idx + 1}")
+            print(f"所有批次已合并到: {filename}")
+
+            # 合并完成后直接加载并返回
+            return load_samples_from_txt(filename)
+        else:
+            print(f"发现 {len(existing_batches)}/{num_batches} 个批次文件，批次未完成")
+            print(f"将从第 {len(existing_batches) + 1} 批开始继续生成...")
+
+    # 4. 若都不存在，则从头开始生成批次文件
     return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, batch_size)
 
 
