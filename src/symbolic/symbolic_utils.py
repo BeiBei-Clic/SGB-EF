@@ -228,70 +228,6 @@ def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:
 
     return reduction_sequence
 
-
-def preprocess_expression(expr: sp.Expr) -> sp.Expr:
-    """预处理表达式，替换有问题的值"""
-    # 替换复数单位I为1，避免复数计算问题
-    expr = expr.replace(sp.I, sp.Integer(1))
-
-    # 替换 zoo (复无穷大，SymPy中ComplexInfinity的实际名称)
-    expr = expr.replace(sp.zoo, sp.Integer(1))
-
-    # 替换其他无穷大形式
-    expr = expr.replace(sp.oo, sp.Integer(1000000))
-    expr = expr.replace(-sp.oo, sp.Integer(-1000000))
-
-    # 处理可能的 NaN 值
-    expr = expr.replace(sp.nan, sp.Integer(0))
-
-    # 如果表达式仍包含复数运算符，尝试替换
-    if expr.has(sp.I):
-        expr = sp.re(expr)  # 提取实数部分
-
-    return expr
-
-
-def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
-    """在给定x值上计算表达式
-
-    如果表达式包含有问题的值，将抛出异常而不是修复
-    """
-    # 检查表达式是否包含有问题的值
-    if expr.has(sp.I):
-        raise ValueError(f"表达式包含复数单位I: {expr}")
-    if expr.has(sp.zoo):
-        raise ValueError(f"表达式包含复无穷大(zoo): {expr}")
-    if expr.has(sp.oo) or expr.has(-sp.oo):
-        raise ValueError(f"表达式包含无穷大: {expr}")
-    if expr.has(sp.nan):
-        raise ValueError(f"表达式包含NaN: {expr}")
-
-    # 获取表达式中的变量
-    n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
-    symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
-    expr_vars = [s for s in symbols if s in expr.free_symbols]
-
-    # 常数表达式直接计算
-    if not expr_vars:
-        value = float(sp.re(expr)) if expr.is_complex else float(expr)
-        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
-
-    # 转换为可计算函数
-    f = sp.lambdify(expr_vars, expr, 'numpy')
-
-    # 计算结果
-    if x_values.ndim > 1:
-        result = f(*[x_values[:, i] for i in range(len(expr_vars))])
-    else:
-        result = f(x_values)
-
-    # 处理复数和异常值
-    if np.iscomplexobj(result):
-        result = np.real(result)
-
-    return np.clip(np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6), -1e6, 1e6)
-
-
 def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
     """使用Levenshtein距离计算两个token序列的对齐，返回包含gap token的等长序列"""
     m, n = len(tokens1), len(tokens2)
@@ -341,3 +277,74 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
 
     # 反转序列，因为我们是反向构建的
     return list(reversed(z1)), list(reversed(z2))
+
+
+def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
+    """在给定x值上计算表达式
+
+    如果表达式包含有问题的值，将抛出异常而不是修复
+    """
+    # 检查表达式是否包含有问题的值
+    if expr.has(sp.I):
+        raise ValueError(f"表达式包含复数单位I: {expr}")
+    if expr.has(sp.zoo):
+        raise ValueError(f"表达式包含复无穷大(zoo): {expr}")
+    if expr.has(sp.oo) or expr.has(-sp.oo):
+        raise ValueError(f"表达式包含无穷大: {expr}")
+    if expr.has(sp.nan):
+        raise ValueError(f"表达式包含NaN: {expr}")
+
+    # 获取表达式中的变量
+    n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
+    symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
+    expr_vars = [s for s in symbols if s in expr.free_symbols]
+
+    # 常数表达式直接计算
+    if not expr_vars:
+        value = float(sp.re(expr)) if expr.is_complex else float(expr)
+        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
+
+    # 转换为可计算函数
+    f = sp.lambdify(expr_vars, expr, 'numpy')
+
+    # 计算结果
+    if x_values.ndim > 1:
+        result = f(*[x_values[:, i] for i in range(len(expr_vars))])
+    else:
+        result = f(x_values)
+
+    # 检查结果是否为复数
+    if np.iscomplexobj(result):
+        raise ValueError(f"计算结果包含复数: {expr}")
+
+    # 检查结果中是否包含NaN或无穷大
+    if np.any(np.isnan(result)):
+        raise ValueError(f"计算结果包含NaN，表达式: {expr}")
+    if np.any(np.isinf(result)):
+        raise ValueError(f"计算结果包含无穷大，表达式: {expr}")
+
+    return result
+
+
+def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
+                             error_callback=None) -> Tuple[bool, np.ndarray]:
+    """
+    安全地计算表达式值，带异常处理
+
+    Args:
+        expr: 要计算的表达式
+        x_values: x值数组
+        error_callback: 可选的回调函数，用于记录错误信息
+
+    Returns:
+        (是否成功, 计算结果)
+        - 成功: (True, 结果数组)
+        - 失败: (False, None)
+    """
+    try:
+        result = evaluate_expr(expr, x_values)
+        return True, result
+    except Exception as e:
+        if error_callback:
+            error_callback(str(e))
+        return False, None

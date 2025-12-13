@@ -16,11 +16,11 @@ from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import log_sample_step, log_sample_success, log_sample_stuck, cleanup_successful_logs
 from src.symbolic.symbolic_utils import (
-    timed_simplify, expr_to_tree, generate_random_expr,
-    apply_unary_op, apply_binary_op, corrupt_expression,
-    reduce_expression, generate_reduction_sequence,
-    preprocess_expression, evaluate_expr, levenshtein_alignment_with_gap,
-    UNARY_OPS, BINARY_OPS
+    expr_to_tree, generate_random_expr,
+    corrupt_expression,
+    generate_reduction_sequence,
+    evaluate_expression_safe,
+    levenshtein_alignment_with_gap,
 )
 from tqdm import tqdm
 
@@ -53,7 +53,10 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
 
     # 计算目标值
     log_sample_step(sample_id, "计算目标表达式值")
-    y_values = evaluate_expr(target_expr, x_array)
+    success, y_values = evaluate_expression_safe(target_expr, x_array)
+    if not success:
+        # 如果计算失败，抛出异常让调用者处理
+        raise ValueError(f"表达式计算失败: {target_expr}")
     steps.append("目标值计算完成")
 
     # 生成当前表达式
@@ -257,17 +260,13 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                     # 不增加sample_count，直接重新生成
                     continue
 
-                # 尝试计算目标值，添加超时保护
+                # 尝试计算目标值
                 log_sample_step(sample_id, "计算目标表达式值")
-                try:
-                    y_target = with_timeout(evaluate_expr, 2.0, target_expr, x_array)
-                    steps.append("目标值计算完成")
-                except TimeoutError:
-                    log_sample_step(sample_id, "重新生成表达式", "计算超时2秒")
-                    # 不增加sample_count，直接重新生成
-                    continue
-                except Exception as eval_error:
-                    log_sample_step(sample_id, "重新生成表达式", f"计算错误: {str(eval_error)}")
+                success, y_target = evaluate_expression_safe(
+                    target_expr, x_array,
+                    error_callback=lambda err: log_sample_step(sample_id, "重新生成表达式", f"计算错误: {err}")
+                )
+                if not success:
                     # 不增加sample_count，直接重新生成
                     continue
 
@@ -291,14 +290,12 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         log_sample_step(sample_id, f"跳过复数删减表达式 {i+1}", f"表达式包含复数单位")
                         continue
 
-                    # 尝试计算当前值，添加超时保护
-                    try:
-                        y_curr = with_timeout(evaluate_expr, 1.0, curr_expr, x_array)
-                    except TimeoutError:
-                        log_sample_step(sample_id, f"跳过计算超时的删减表达式 {i+1}", "计算超时1秒")
-                        continue
-                    except Exception as eval_error:
-                        log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {str(eval_error)}")
+                    # 尝试计算当前值
+                    success, y_curr = evaluate_expression_safe(
+                        curr_expr, x_array,
+                        error_callback=lambda err: log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {err}")
+                    )
+                    if not success:
                         continue
 
                     # 转换为token序列
