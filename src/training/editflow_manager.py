@@ -577,12 +577,33 @@ class EditFlowManager:
         # 准备输入数据
         x_values = torch.FloatTensor(x_data).unsqueeze(0).to(device)
         y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)
-        residuals = y_values
-        condition = condition_encoder(x_values, residuals)
 
         # 推断输入维度并生成初始表达式
         if input_dim is None:
             input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
+
+        # 修正：计算初始残差 (真实值 - 初始表达式的预测值)
+        # 构建初始表达式
+        import sympy as sp
+        from ..symbolic.symbolic_utils import evaluate_expression_safe
+
+        if input_dim == 1:
+            # 一维情况：初始表达式为 x0
+            initial_expr = sp.Symbol('x0')
+        else:
+            # 多维情况：初始表达式为 x0+x1+x2+...
+            initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
+
+        # 计算初始表达式在x_data上的预测值
+        success, y_pred = evaluate_expression_safe(initial_expr, x_data)
+        if not success:
+            print(f"警告：无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差")
+            residuals = y_values
+        else:
+            # 计算残差：真实值 - 预测值
+            residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
+
+        condition = condition_encoder(x_values, residuals)
 
         if input_dim == 1:
             current_tokens = ['x0']
