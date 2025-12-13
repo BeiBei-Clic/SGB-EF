@@ -1,110 +1,108 @@
 import os
-import time
 import datetime
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 LOG_FILE = "logs/sample_generation.log"
 STUCK_LOG_FILE = "logs/sample_stuck.log"
+PERF_LOG_FILE = "logs/performance.log"
+
+
+def _get_timestamp():
+    """获取格式化的时间戳"""
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def _write_log(msg, filename=LOG_FILE):
+    """统一的日志写入函数"""
+    os.makedirs("logs", exist_ok=True)
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
 
 
 def log_sample_step(sample_id, step, info=""):
     """记录样本生成步骤"""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    log_msg = f"{timestamp} [{sample_id}] {step}"
+    msg = f"{_get_timestamp()} [{sample_id}] {step}"
     if info:
-        log_msg += f" - {info}"
-
-    # 确保logs目录存在
-    os.makedirs("logs", exist_ok=True)
-
-    # 写入详细日志
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(log_msg + "\n")
+        msg += f" - {info}"
+    _write_log(msg)
 
 
 def log_sample_success(sample_id):
-    """记录样本成功完成，并清理详细日志"""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    success_msg = f"{timestamp} [{sample_id}] SUCCESS"
-
-    # 写入成功标记
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(success_msg + "\n")
+    """记录样本成功完成"""
+    _write_log(f"{_get_timestamp()} [{sample_id}] SUCCESS")
 
 
 def log_sample_stuck(sample_id, duration, steps):
-    """记录卡住的样本到专门的stuck日志"""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-    stuck_info = {
-        "timestamp": timestamp,
-        "sample_id": sample_id,
-        "duration_seconds": round(duration, 2),
-        "steps": steps
-    }
-
-    # 写入卡住日志
-    with open(STUCK_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"卡住样本记录:\n")
-        f.write(f"  时间: {timestamp}\n")
-        f.write(f"  样本ID: {sample_id}\n")
-        f.write(f"  持续时间: {duration:.2f}秒\n")
-        f.write(f"  步骤: {steps}\n")
-        f.write("=" * 50 + "\n")
+    """记录卡住的样本"""
+    _write_log(
+        f"卡住样本记录:\n  时间: {_get_timestamp()}\n  样本ID: {sample_id}\n"
+        f"  持续时间: {duration:.2f}秒\n  步骤: {steps}\n" + "=" * 50,
+        STUCK_LOG_FILE
+    )
 
 
 def cleanup_successful_logs():
-    """清理已完成样本的详细日志，保留卡住的"""
-    if not os.path.exists(LOG_FILE):
+    """清理已完成样本的详细日志"""
+    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) < 50 * 1024 * 1024:
         return
 
-    start_time = time.time()
-    max_cleanup_time = 30  # 最多30秒清理时间
+    print("日志文件过大，直接清空")
+    _write_log(f"# 日志已清理 - {datetime.datetime.now()}")
 
-    try:
-        stuck_samples = set()
-        if os.path.exists(STUCK_LOG_FILE):
-            # 从卡住日志中提取卡住的样本ID，限制读取时间
-            with open(STUCK_LOG_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    if time.time() - start_time > max_cleanup_time:
-                        print("日志清理超时，跳过此次清理")
-                        return
-                    if "样本ID:" in line:
-                        sample_id = line.split("样本ID: ")[1].strip()
-                        stuck_samples.add(sample_id)
 
-        # 检查日志文件大小，如果太大则直接清空
-        if os.path.getsize(LOG_FILE) > 50 * 1024 * 1024:  # 50MB
-            print("日志文件过大，直接清空成功样本日志")
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.write(f"# 日志已清理 - {datetime.datetime.now()}\n")
-            return
+def log_expression_generation(sample_id, expr_str, max_depth, complexity_score=0):
+    """记录表达式生成"""
+    ops_count = expr_str.count('(') + expr_str.count('sin') + expr_str.count('cos') + \
+                expr_str.count('exp') + expr_str.count('log') + expr_str.count('sqrt')
+    msg = f"{_get_timestamp()} [{sample_id}] EXPR_GEN - '{expr_str}' | len={len(expr_str)} | ops={ops_count} | depth≤{max_depth}"
+    if complexity_score:
+        msg += f" | score={complexity_score}"
+    _write_log(msg)
 
-        # 更高效的过滤：直接写新文件而不是重读
-        temp_file = LOG_FILE + ".tmp"
-        with open(LOG_FILE, "r", encoding="utf-8") as infile, \
-             open(temp_file, "w", encoding="utf-8") as outfile:
 
-            outfile.write(f"# 清理后的日志 - {datetime.datetime.now()}\n")
+def log_expression_eval(sample_id, expr_str, eval_time_ms, success=True, error_msg=""):
+    """记录表达式计算"""
+    if success:
+        msg = f"{_get_timestamp()} [{sample_id}] EXPR_EVAL_OK - {expr_str} | {eval_time_ms:.1f}ms"
+    else:
+        msg = f"{_get_timestamp()} [{sample_id}] EXPR_EVAL_FAIL - {expr_str} | {eval_time_ms:.1f}ms | {error_msg}"
+    _write_log(msg)
 
-            for line in infile:
-                if time.time() - start_time > max_cleanup_time:
-                    print("日志清理超时，终止清理")
-                    break
 
-                # 简化过滤逻辑：只过滤包含SUCCESS的行
-                if "SUCCESS" not in line:
-                    outfile.write(line)
+def log_retry_attempt(sample_id, retry_num, max_retries, reason):
+    """记录重试"""
+    _write_log(f"{_get_timestamp()} [{sample_id}] RETRY {retry_num}/{max_retries} - {reason}")
 
-        # 替换原文件
-        os.replace(temp_file, LOG_FILE)
 
-    except Exception as e:
-        print(f"清理日志时出错: {e}")
-        # 如果清理失败，直接清空日志文件避免卡住
-        try:
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.write(f"# 日志清理失败后重置 - {datetime.datetime.now()}\n")
-        except:
-            pass
+def log_batch_progress(batch_idx, total_batches, samples_completed, total_samples,
+                      avg_time_per_sample=0, success_rate=0):
+    """记录批次进度"""
+    progress_pct = (samples_completed / total_samples) * 100 if total_samples > 0 else 0
+    mem_info = f"mem={psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024:.0f}MB" if psutil else "mem=N/A"
+
+    msg = f"{_get_timestamp()} BATCH_PROGRESS [{batch_idx+1}/{total_batches}] " \
+          f"samples={samples_completed}/{total_samples} ({progress_pct:.1f}%) " \
+          f"avg_time={avg_time_per_sample:.2f}s succ_rate={success_rate:.1%} {mem_info}"
+
+    _write_log(msg, PERF_LOG_FILE)
+    _write_log(msg, LOG_FILE)
+
+
+def log_reduction_sequence(sample_id, original_expr, reduction_seq, final_expr):
+    """记录删减序列"""
+    _write_log(f"{_get_timestamp()} [{sample_id}] REDUCTION_SEQ - {len(reduction_seq)} steps: "
+               f"'{original_expr}' → ... → '{final_expr}'")
+
+
+def log_data_generation_stats(sample_id, n_points, input_dim, data_range=(-5.0, 5.0)):
+    """记录数据生成统计"""
+    _write_log(f"{_get_timestamp()} [{sample_id}] DATA_GEN - {n_points} points, {input_dim}dim, range={data_range}")
+
+
+def log_timeout_occurred(sample_id, operation, timeout_seconds):
+    """记录超时"""
+    _write_log(f"{_get_timestamp()} [{sample_id}] TIMEOUT - {operation} exceeded {timeout_seconds}s")

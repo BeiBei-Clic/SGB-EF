@@ -14,7 +14,12 @@ import logging
 import threading
 from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
-from src.utils.log_utils import log_sample_step, log_sample_success, log_sample_stuck, cleanup_successful_logs
+from src.utils.log_utils import (
+    log_sample_step, log_sample_success, log_sample_stuck, cleanup_successful_logs,
+    log_expression_generation, log_expression_eval, log_retry_attempt,
+    log_batch_progress, log_reduction_sequence, log_data_generation_stats,
+    log_timeout_occurred
+)
 from src.symbolic.symbolic_utils import (
     expr_to_tree, generate_random_expr,
     corrupt_expression,
@@ -104,6 +109,9 @@ def save_dimension_index(filename: str, dimension_samples: Dict[int, List[int]])
     """
     index_filename = get_dimension_index_filename(filename)
 
+    # 确保目录存在
+    os.makedirs(os.path.dirname(index_filename), exist_ok=True)
+
     # 将位置索引转换为普通列表（可能包含numpy int）
     index_data = {}
     for dim, positions in dimension_samples.items():
@@ -170,7 +178,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     # 检查批次文件状态
     num_batches = (num_samples + batch_size - 1) // batch_size
-    batch_filenames = [filename.replace('.txt', f'_batch_{i + 1}.txt') for i in range(num_batches)]
+    # 批次文件保存在 data/temp 目录中
+    temp_dir = "data/temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    batch_filenames = [f"{temp_dir}/{os.path.basename(filename).replace('.txt', f'_batch_{i + 1}.txt')}" for i in range(num_batches)]
 
     # 1. 主文件存在且无批次文件 → 数据完整
     if os.path.exists(filename) and not any(os.path.exists(f) for f in batch_filenames):
@@ -192,12 +203,16 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     # 按批次顺序生成
     for batch_idx in range(len(completed_batches), num_batches):
         current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
+        batch_start_time = time.time()
 
         print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
 
         batch_samples, dimension_count, sample_count = [], {}, 0
         pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
         SAMPLE_TIMEOUT = 5.0  # 样本最大处理时间
+
+        # 记录批次开始
+        log_batch_progress(batch_idx, num_batches, batch_idx * batch_size, num_samples)
 
         while sample_count < current_batch_size:
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
@@ -221,6 +236,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
                 x_values = [list(point) for point in x_values_raw]
                 x_array = np.array(x_values)
+                log_data_generation_stats(sample_id, n_points, dim, (-5.0, 5.0))
 
                 # 生成目标表达式，添加超时保护和重试机制
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
@@ -231,13 +247,15 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
                         expr_str = str(target_expr)
                         steps.append(f"目标表达式: {expr_str}")
+                        log_expression_generation(sample_id, expr_str, max_depth)
                         break
                     except TimeoutError:
-                        log_sample_step(sample_id, f"重试生成目标表达式(第{retry_count+1}次)", "生成超时2秒")
+                        log_timeout_occurred(sample_id, "generate_random_expr", 2.0)
+                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, "timeout")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
                     except Exception as expr_error:
-                        log_sample_step(sample_id, f"重试生成目标表达式(第{retry_count+1}次)", f"生成错误: {str(expr_error)}")
+                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, f"error: {str(expr_error)}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
 
@@ -262,10 +280,14 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
                 # 尝试计算目标值
                 log_sample_step(sample_id, "计算目标表达式值")
+                eval_start = time.time()
                 success, y_target = evaluate_expression_safe(
                     target_expr, x_array,
-                    error_callback=lambda err: log_sample_step(sample_id, "重新生成表达式", f"计算错误: {err}")
+                    error_callback=lambda err: log_expression_eval(sample_id, expr_str, (time.time() - eval_start) * 1000, False, err)
                 )
+                eval_time = (time.time() - eval_start) * 1000
+                if success:
+                    log_expression_eval(sample_id, expr_str, eval_time, True)
                 if not success:
                     # 不增加sample_count，直接重新生成
                     continue
@@ -274,6 +296,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 log_sample_step(sample_id, "生成删减序列")
                 reduction_sequence = generate_reduction_sequence(target_expr)
                 steps.append(f"删减序列长度: {len(reduction_sequence)}")
+                log_reduction_sequence(sample_id, expr_str, reduction_sequence, str(reduction_sequence[-1]) if reduction_sequence else "")
 
                 # 为删减序列中的每个表达式创建样本
                 for i, reduced_expr in enumerate(reduction_sequence):
@@ -334,6 +357,15 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 continue
 
         pbar.close()
+
+        # 计算批次统计
+        batch_duration = time.time() - batch_start_time
+        avg_time = batch_duration / current_batch_size if current_batch_size > 0 else 0
+        success_rate = len(batch_samples) / current_batch_size if current_batch_size > 0 else 0
+
+        # 记录批次完成统计
+        log_batch_progress(batch_idx, num_batches, (batch_idx + 1) * batch_size, num_samples,
+                          avg_time, success_rate)
 
         # 累积维度统计
         for dim, count in dimension_count.items():

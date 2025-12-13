@@ -341,9 +341,16 @@ def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
         - 成功: (True, 结果数组)
         - 失败: (False, None)
     """
+    from src.utils.timeout_utils import TimeoutError, with_timeout
+
     try:
-        result = evaluate_expr(expr, x_values)
+        # 为evaluate_expr添加3秒超时保护，防止复杂表达式卡死
+        result = with_timeout(evaluate_expr, 3.0, expr, x_values)
         return True, result
+    except TimeoutError as e:
+        if error_callback:
+            error_callback(f"计算超时: {str(e)}")
+        return False, None
     except Exception as e:
         if error_callback:
             error_callback(str(e))
