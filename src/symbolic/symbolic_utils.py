@@ -252,43 +252,44 @@ def preprocess_expression(expr: sp.Expr) -> sp.Expr:
 
 
 def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
-    """在给定x值上计算表达式"""
-    try:
-        # 预处理表达式，替换 ComplexInfinity 和其他有问题的值
-        expr = preprocess_expression(expr)
+    """在给定x值上计算表达式
 
-        n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
-        variables = [sp.Symbol(f'x{i}') for i in range(n_dims)]
-        expr_vars = [var for var in variables if var in expr.free_symbols]
+    如果表达式包含有问题的值，将抛出异常而不是修复
+    """
+    # 检查表达式是否包含有问题的值
+    if expr.has(sp.I):
+        raise ValueError(f"表达式包含复数单位I: {expr}")
+    if expr.has(sp.zoo):
+        raise ValueError(f"表达式包含复无穷大(zoo): {expr}")
+    if expr.has(sp.oo) or expr.has(-sp.oo):
+        raise ValueError(f"表达式包含无穷大: {expr}")
+    if expr.has(sp.nan):
+        raise ValueError(f"表达式包含NaN: {expr}")
 
-        if not expr_vars:
-            # 对于常数表达式，提取实数部分
-            value = float(sp.re(expr)) if expr.is_complex else float(expr)
-            return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
+    # 获取表达式中的变量
+    n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
+    symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
+    expr_vars = [s for s in symbols if s in expr.free_symbols]
 
-        f = sp.lambdify(expr_vars, expr, 'numpy')
+    # 常数表达式直接计算
+    if not expr_vars:
+        value = float(sp.re(expr)) if expr.is_complex else float(expr)
+        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
 
-        if x_values.ndim > 1:
-            result = f(*[x_values[:, i] for i in range(len(expr_vars))])
-        else:
-            result = f(x_values)
+    # 转换为可计算函数
+    f = sp.lambdify(expr_vars, expr, 'numpy')
 
-        # 处理复数结果：提取实数部分
-        if np.iscomplexobj(result):
-            result = np.real(result)
+    # 计算结果
+    if x_values.ndim > 1:
+        result = f(*[x_values[:, i] for i in range(len(expr_vars))])
+    else:
+        result = f(x_values)
 
-        result = np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6)
-        return np.clip(result, -1e6, 1e6)
+    # 处理复数和异常值
+    if np.iscomplexobj(result):
+        result = np.real(result)
 
-    except (ValueError, TypeError, OverflowError) as e:
-        # 处理复数转换错误和其他数值计算错误
-        if "Cannot convert complex to float" in str(e) or "complex" in str(e).lower():
-            # 如果是复数相关错误，返回全零数组
-            shape = x_values.shape[0] if x_values.ndim > 1 else len(x_values)
-            return np.zeros(shape)
-        else:
-            # 其他数值错误，重新抛出
-            raise e
+    return np.clip(np.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6), -1e6, 1e6)
 
 
 def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:

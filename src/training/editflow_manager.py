@@ -66,7 +66,8 @@ class EditFlowManager:
             num_samples=self.args.num_samples,
             max_dim=self.args.max_dim,
             n_points=self.args.n_points,
-            max_depth=self.args.max_depth
+            max_depth=self.args.max_depth,
+            max_expr_length=self.args.max_expr_length
         )
 
         # 尝试加载维度索引，如果不存在则扫描文件

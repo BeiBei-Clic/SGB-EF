@@ -26,6 +26,9 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
+# 常量定义
+MAX_RETRIES = 3  # 表达式生成和计算的最大重试次数
+
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
     sample_id = f"sample_{input_dimension}dim_{int(time.time() * 1000) % 1000000}"
@@ -142,8 +145,17 @@ def load_samples_from_txt(filename: str) -> List[Dict]:
     print(f"已加载 {len(samples)} 个样本")
     return samples
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000):
-    """生成用于EditFlow连续流训练的数据文件，支持断点续传"""
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, max_expr_length: int = 24, batch_size: int = 50000):
+    """生成用于EditFlow连续流训练的数据文件，支持断点续传
+
+    Args:
+        num_samples: 总样本数
+        max_dim: 最大维度
+        n_points: 每个样本的数据点数
+        max_depth: 表达式最大深度
+        max_expr_length: 表达式最大字符长度（默认24）
+        batch_size: 批次大小
+    """
 
     # 设置真正的随机种子，确保每次运行生成不同的数据
     current_time = int(time.time()) % (2**32 - 1)  # 确保种子在有效范围内
@@ -207,51 +219,56 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 x_values = [list(point) for point in x_values_raw]
                 x_array = np.array(x_values)
 
-                # 生成目标表达式，添加超时保护
+                # 生成目标表达式，添加超时保护和重试机制
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
-                try:
-                    target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
-                    expr_str = str(target_expr)
-                    steps.append(f"目标表达式: {expr_str}")
-                except TimeoutError:
-                    log_sample_step(sample_id, "跳过生成超时的表达式", "生成超时2秒")
-                    sample_count += 1
-                    pbar.update(1)
-                    continue
-                except Exception as expr_error:
-                    log_sample_step(sample_id, "跳过生成失败的表达式", f"生成错误: {str(expr_error)}")
+                target_expr = None
+
+                for retry_count in range(MAX_RETRIES):
+                    try:
+                        target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
+                        expr_str = str(target_expr)
+                        steps.append(f"目标表达式: {expr_str}")
+                        break
+                    except TimeoutError:
+                        log_sample_step(sample_id, f"重试生成目标表达式(第{retry_count+1}次)", "生成超时2秒")
+                        if retry_count == MAX_RETRIES - 1:
+                            log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
+                    except Exception as expr_error:
+                        log_sample_step(sample_id, f"重试生成目标表达式(第{retry_count+1}次)", f"生成错误: {str(expr_error)}")
+                        if retry_count == MAX_RETRIES - 1:
+                            log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
+
+                if target_expr is None:
                     sample_count += 1
                     pbar.update(1)
                     continue
 
-                # 如果表达式太复杂，跳过
-                if len(expr_str) > 100:
-                    log_sample_step(sample_id, "跳过复杂表达式", f"长度{len(expr_str)} > 100")
-                    sample_count += 1
-                    pbar.update(1)
+                expr_str = str(target_expr)
+
+                # 如果表达式太复杂，重新生成
+                if len(expr_str) > max_expr_length:
+                    log_sample_step(sample_id, "重新生成表达式", f"表达式过长: {len(expr_str)} > {max_expr_length}")
+                    # 不增加sample_count，直接重新生成
                     continue
 
                 # 预先检查表达式是否可能导致复数问题
                 if target_expr.has(sp.I) or 'I' in expr_str:
-                    log_sample_step(sample_id, "跳过复数表达式", f"包含复数单位I")
-                    sample_count += 1
-                    pbar.update(1)
+                    log_sample_step(sample_id, "重新生成表达式", f"表达式包含复数单位I")
+                    # 不增加sample_count，直接重新生成
                     continue
 
                 # 尝试计算目标值，添加超时保护
+                log_sample_step(sample_id, "计算目标表达式值")
                 try:
-                    log_sample_step(sample_id, "计算目标表达式值")
                     y_target = with_timeout(evaluate_expr, 2.0, target_expr, x_array)
                     steps.append("目标值计算完成")
                 except TimeoutError:
-                    log_sample_step(sample_id, "跳过计算超时的表达式", "计算超时2秒")
-                    sample_count += 1
-                    pbar.update(1)
+                    log_sample_step(sample_id, "重新生成表达式", "计算超时2秒")
+                    # 不增加sample_count，直接重新生成
                     continue
                 except Exception as eval_error:
-                    log_sample_step(sample_id, "跳过计算失败的表达式", f"计算错误: {str(eval_error)}")
-                    sample_count += 1
-                    pbar.update(1)
+                    log_sample_step(sample_id, "重新生成表达式", f"计算错误: {str(eval_error)}")
+                    # 不增加sample_count，直接重新生成
                     continue
 
                 # 生成删减序列
