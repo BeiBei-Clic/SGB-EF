@@ -58,19 +58,16 @@ class EditFlowManager:
         """准备训练数据，优先从本地缓存文件加载，并划分训练集和测试集"""
         print("准备连续流训练数据...")
 
-        # 检查是否存在缓存文件
+        # 数据文件路径
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
 
-        if not os.path.exists(cache_filename):
-            print(f"未发现缓存文件 {cache_filename}，将先生成数据...")
-            generate_flow_samples(
-                num_samples=self.args.num_samples,
-                max_dim=self.args.max_dim,
-                n_points=self.args.n_points,
-                max_depth=self.args.max_depth
-            )
-        else:
-            print(f"发现缓存文件 {cache_filename}，将基于文件创建数据集...")
+        # 生成数据（如果需要），内部会检查文件是否存在并决定是否需要生成
+        generate_flow_samples(
+            num_samples=self.args.num_samples,
+            max_dim=self.args.max_dim,
+            n_points=self.args.n_points,
+            max_depth=self.args.max_depth
+        )
 
         # 尝试加载维度索引，如果不存在则扫描文件
         dimension_samples = load_dimension_index(cache_filename)

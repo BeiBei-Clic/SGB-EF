@@ -142,8 +142,8 @@ def load_samples_from_txt(filename: str) -> List[Dict]:
     print(f"已加载 {len(samples)} 个样本")
     return samples
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000) -> List[Dict]:
-    """生成用于EditFlow连续流训练的样本"""
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000):
+    """生成用于EditFlow连续流训练的数据文件，支持断点续传"""
 
     # 设置真正的随机种子，确保每次运行生成不同的数据
     current_time = int(time.time()) % (2**32 - 1)  # 确保种子在有效范围内
@@ -153,7 +153,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     # 检查是否存在缓存文件
     filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
 
-    # 1. 检查批次文件状态
+    # 检查批次文件状态
     num_batches = (num_samples + batch_size - 1) // batch_size
     existing_batches = [
         filename.replace('.txt', f'_batch_{i + 1}.txt')
@@ -161,54 +161,16 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         if os.path.exists(filename.replace('.txt', f'_batch_{i + 1}.txt'))
     ]
 
-    # 2. 主文件存在且无批次文件 → 数据完整
+    # 1. 主文件存在且无批次文件 → 数据完整
     if os.path.exists(filename) and not existing_batches:
-        print(f"发现完整数据文件 {filename}，直接加载...")
+        print(f"发现完整数据文件 {filename}")
         return
 
-    # 3. 主文件存在且有批次文件 → 合并中断，追加剩余批次
-    if os.path.exists(filename) and existing_batches:
-        print(f"发现合并中断，继续追加剩余批次...")
-        with open(filename, 'a', encoding='utf-8') as main_file:
-            for i in range(num_batches):
-                batch_filename = filename.replace('.txt', f'_batch_{i + 1}.txt')
-                if os.path.exists(batch_filename):
-                    with open(batch_filename, 'r', encoding='utf-8') as batch_file:
-                        main_file.write(batch_file.read())
-                    os.remove(batch_filename)
-                    print(f"已追加并删除: batch_{i + 1}")
-        print(f"合并完成: {filename}")
-        return
-
-    # 4. 主文件不存在但全部批次完成 → 合并
-    if len(existing_batches) == num_batches:
-        print(f"所有 {num_batches} 个批次已完成，开始合并...")
-        with open(filename, 'w', encoding='utf-8') as main_file:
-            for i in range(num_batches):
-                batch_filename = filename.replace('.txt', f'_batch_{i + 1}.txt')
-                with open(batch_filename, 'r', encoding='utf-8') as batch_file:
-                    main_file.write(batch_file.read())
-                os.remove(batch_filename)
-                print(f"已合并并删除: batch_{i + 1}")
-        print(f"合并完成: {filename}")
-        return
-
-    # 5. 部分批次存在或无批次 → 继续/开始生成
-    if existing_batches:
-        print(f"发现 {len(existing_batches)}/{num_batches} 个批次文件，继续生成剩余批次...")
-
-    # 4. 若都不存在，则从头开始生成批次文件
-    return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, batch_size)
-
-
-def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, max_depth: int, filename: str, batch_size: int) -> List[Dict]:
-    """分批生成数据样本，支持断点续传"""
+    # 2. 分批生成数据样本，支持断点续传
     all_samples = []
     total_dimension_count = {}
 
     print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
-
-    num_batches = (num_samples + batch_size - 1) // batch_size
 
     # 检查已完成的批次
     completed_batches = []
@@ -219,11 +181,9 @@ def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, 
 
     if completed_batches:
         print(f"发现已完成 {len(completed_batches)} 个批次，将从第 {len(completed_batches) + 1} 批开始继续生成...")
-        start_batch = len(completed_batches)
-    else:
-        start_batch = 0
 
-    for batch_idx in range(start_batch, num_batches):
+    # 按批次顺序生成
+    for batch_idx in range(len(completed_batches), num_batches):
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, num_samples)
         current_batch_size = end_idx - start_idx
@@ -402,23 +362,11 @@ def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, 
             print("清理成功样本的详细日志...")
             cleanup_successful_logs()
 
-    # 加载已完成批次的样本
-    print(f"\n加载已完成批次的样本...")
-    for batch_idx in range(num_batches):
-        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
-        if os.path.exists(batch_filename):
-            batch_samples = load_samples_from_txt(batch_filename)
-            all_samples.extend(batch_samples)
-            # 统计维度分布
-            for sample in batch_samples:
-                dim = sample['input_dimension']
-                total_dimension_count[dim] = total_dimension_count.get(dim, 0) + 1
-
-    # 合并所有批次文件到一个文件，并记录维度索引
-    print(f"合并 {num_batches} 个批次文件到主文件...")
+    # 3. 按批次顺序合并所有剩余批次文件到主文件，并记录维度索引
+    print(f"\n按批次顺序合并所有剩余批次文件到主文件...")
     dimension_samples = {}  # 存储每个维度的样本位置索引
 
-    with open(filename, 'w', encoding='utf-8') as main_file:
+    with open(filename, 'a', encoding='utf-8') as main_file:
         for batch_idx in range(num_batches):
             batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
             if os.path.exists(batch_filename):
@@ -448,5 +396,3 @@ def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, 
         print(f"{dim}维: {count} 个样本")
 
     print(f"所有数据已保存到: {filename}")
-
-    return all_samples
