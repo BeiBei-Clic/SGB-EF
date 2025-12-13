@@ -155,14 +155,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     # 检查批次文件状态
     num_batches = (num_samples + batch_size - 1) // batch_size
-    existing_batches = [
-        filename.replace('.txt', f'_batch_{i + 1}.txt')
-        for i in range(num_batches)
-        if os.path.exists(filename.replace('.txt', f'_batch_{i + 1}.txt'))
-    ]
+    batch_filenames = [filename.replace('.txt', f'_batch_{i + 1}.txt') for i in range(num_batches)]
 
     # 1. 主文件存在且无批次文件 → 数据完整
-    if os.path.exists(filename) and not existing_batches:
+    if os.path.exists(filename) and not any(os.path.exists(f) for f in batch_filenames):
         print(f"发现完整数据文件 {filename}")
         return
 
@@ -173,39 +169,28 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
     print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
 
     # 检查已完成的批次
-    completed_batches = []
-    for batch_idx in range(num_batches):
-        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
-        if os.path.exists(batch_filename):
-            completed_batches.append(batch_idx)
+    completed_batches = [i for i, bf in enumerate(batch_filenames) if os.path.exists(bf)]
 
     if completed_batches:
         print(f"发现已完成 {len(completed_batches)} 个批次，将从第 {len(completed_batches) + 1} 批开始继续生成...")
 
     # 按批次顺序生成
     for batch_idx in range(len(completed_batches), num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, num_samples)
-        current_batch_size = end_idx - start_idx
+        current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
 
         print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
 
-        batch_samples = []
-        dimension_count = {}
-        sample_count = 0
+        batch_samples, dimension_count, sample_count = [], {}, 0
         pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
+        SAMPLE_TIMEOUT = 5.0  # 样本最大处理时间
 
         while sample_count < current_batch_size:
-            sample_start_time = time.time()
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
+            sample_start_time = time.time()
             steps = []
 
-            # 每个样本的最大处理时间（秒）
-            SAMPLE_TIMEOUT = 5.0
-
             try:
-                # 检查样本生成是否超时
-                if time.time() - sample_start_time > SAMPLE_TIMEOUT:
+                if time.time() - sample_start_time > SAMPLE_TIMEOUT:  # 样本生成超时检查
                     log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
                     sample_count += 1
                     pbar.update(1)
@@ -214,14 +199,13 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 dim = random.randint(1, max_dim)
                 dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
-                log_sample_step(sample_id, f"开始生成样本", f"批次{batch_idx+1}, 维度{dim}, 样本数{sample_count}/{current_batch_size}")
+                log_sample_step(sample_id, "开始生成样本", f"批次{batch_idx+1}, 维度{dim}, 样本数{sample_count}/{current_batch_size}")
 
-                # 生成数据点，统一处理确保每个数据点是[x0, x1, x2, ...]的形式
+                # 生成数据点
                 log_sample_step(sample_id, "生成数据点", f"{n_points}个点, {dim}维")
                 x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
-                x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
-                x_array = np.array(x_values)  # 用于表达式计算
-                steps.append("数据点生成完成")
+                x_values = [list(point) for point in x_values_raw]
+                x_array = np.array(x_values)
 
                 # 生成目标表达式，添加超时保护
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
@@ -329,15 +313,11 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 log_sample_success(sample_id)
 
             except Exception as e:
-                # 记录卡住的样本
                 duration = time.time() - sample_start_time
                 steps.append(f"错误: {str(e)}")
                 log_sample_stuck(sample_id, duration, steps)
                 print(f"警告: 生成样本时出错，跳过该样本: {e}")
                 continue
-
-            if sample_count >= current_batch_size:
-                break
 
         pbar.close()
 
@@ -346,7 +326,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
             total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
 
         # 立即保存当前批次
-        batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+        batch_filename = batch_filenames[batch_idx]
         save_samples_to_txt(batch_samples, batch_filename)
 
         # 将批次样本添加到总样本中
@@ -368,7 +348,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     with open(filename, 'a', encoding='utf-8') as main_file:
         for batch_idx in range(num_batches):
-            batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+            batch_filename = batch_filenames[batch_idx]
             if os.path.exists(batch_filename):
                 # 读取批次样本并记录位置
                 batch_samples = load_samples_from_txt(batch_filename)
