@@ -547,7 +547,7 @@ def load_samples_from_txt(filename: str) -> List[Dict]:
     print(f"已加载 {len(samples)} 个样本")
     return samples
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, use_cache: bool = True) -> List[Dict]:
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, batch_size: int = 50000, use_cache: bool = True) -> List[Dict]:
     """生成用于EditFlow连续流训练的样本"""
 
     # 设置真正的随机种子，确保每次运行生成不同的数据
@@ -562,9 +562,30 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         print(f"发现缓存文件 {filename}，直接加载数据...")
         return load_samples_from_txt(filename)
 
+    # 如果主文件不存在但有批次文件，先合并批次文件
+    if use_cache and not os.path.exists(filename):
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        existing_batches = []
+        for batch_idx in range(num_batches):
+            batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
+            if os.path.exists(batch_filename):
+                existing_batches.append(batch_filename)
+
+        if existing_batches:
+            print(f"发现 {len(existing_batches)} 个批次文件，但主文件不存在，开始合并...")
+            # 合并批次文件到主文件
+            with open(filename, 'w', encoding='utf-8') as main_file:
+                for batch_filename in sorted(existing_batches):
+                    with open(batch_filename, 'r', encoding='utf-8') as batch_file:
+                        main_file.write(batch_file.read())
+                    os.remove(batch_filename)  # 删除批次文件
+                    print(f"已合并并删除: {os.path.basename(batch_filename)}")
+            print(f"所有批次已合并到: {filename}")
+            # 现在加载合并后的主文件
+            return load_samples_from_txt(filename)
+
     # 统一使用分批生成逻辑，小数据量时相当于直接生成
-    BATCH_SIZE = 50000  # 每批生成5万个样本
-    return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, BATCH_SIZE)
+    return _generate_samples_in_batches(num_samples, max_dim, n_points, max_depth, filename, batch_size)
 
 
 def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, max_depth: int, filename: str, batch_size: int) -> List[Dict]:
