@@ -532,6 +532,48 @@ def save_samples_to_txt(samples: List[Dict], filename: str):
 
     print(f"已保存 {len(samples)} 个样本到 {filename}")
 
+def get_dimension_index_filename(data_filename: str) -> str:
+    """生成维度索引文件名"""
+    return data_filename.replace('.txt', '_dimension_index.json')
+
+def save_dimension_index(filename: str, dimension_samples: Dict[int, List[int]]):
+    """保存维度索引文件
+
+    Args:
+        filename: 数据文件名
+        dimension_samples: 维度到位置索引的映射
+    """
+    index_filename = get_dimension_index_filename(filename)
+
+    # 将位置索引转换为普通列表（可能包含numpy int）
+    index_data = {}
+    for dim, positions in dimension_samples.items():
+        index_data[str(dim)] = [int(pos) for pos in positions]
+
+    with open(index_filename, 'w', encoding='utf-8') as f:
+        json.dump(index_data, f, indent=2)
+
+    print(f"维度索引已保存到 {index_filename}")
+
+def load_dimension_index(filename: str) -> Dict[int, List[int]]:
+    """加载维度索引文件"""
+    index_filename = get_dimension_index_filename(filename)
+
+    if not os.path.exists(index_filename):
+        return None
+
+    print(f"发现维度索引文件 {index_filename}，正在加载...")
+    with open(index_filename, 'r', encoding='utf-8') as f:
+        index_data = json.load(f)
+
+    # 转换回原来的格式
+    dimension_samples = {}
+    for dim_str, positions in index_data.items():
+        dimension_samples[int(dim_str)] = positions
+
+    print(f"维度索引加载完成")
+    return dimension_samples
+
 def load_samples_from_txt(filename: str) -> List[Dict]:
     """从txt文件加载样本"""
     print(f"从 {filename} 加载数据...")
@@ -825,17 +867,34 @@ def _generate_samples_in_batches(num_samples: int, max_dim: int, n_points: int, 
                 dim = sample['input_dimension']
                 total_dimension_count[dim] = total_dimension_count.get(dim, 0) + 1
 
-    # 合并所有批次文件到一个文件
+    # 合并所有批次文件到一个文件，并记录维度索引
     print(f"合并 {num_batches} 个批次文件到主文件...")
+    dimension_samples = {}  # 存储每个维度的样本位置索引
+
     with open(filename, 'w', encoding='utf-8') as main_file:
         for batch_idx in range(num_batches):
             batch_filename = filename.replace('.txt', f'_batch_{batch_idx + 1}.txt')
             if os.path.exists(batch_filename):
-                with open(batch_filename, 'r', encoding='utf-8') as batch_file:
-                    main_file.write(batch_file.read())
+                # 读取批次样本并记录位置
+                batch_samples = load_samples_from_txt(batch_filename)
+                for sample in batch_samples:
+                    # 记录当前位置
+                    pos = main_file.tell()
+                    dim = sample['input_dimension']
+                    if dim not in dimension_samples:
+                        dimension_samples[dim] = []
+                    dimension_samples[dim].append(pos)
+
+                    # 写入主文件
+                    sample_line = json.dumps(sample, ensure_ascii=False)
+                    main_file.write(sample_line + '\n')
+
                 # 删除批次文件
                 os.remove(batch_filename)
                 print(f"已合并并删除批次文件: {batch_filename}")
+
+    # 保存维度索引文件
+    save_dimension_index(filename, dimension_samples)
 
     print(f"\n总体样本维度分布:")
     for dim, count in sorted(total_dimension_count.items()):
