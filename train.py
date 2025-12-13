@@ -31,13 +31,15 @@ def main():
     parser = argparse.ArgumentParser(description="训练EditFlow符号回归模型")
 
     # 数据参数
-    parser.add_argument("--num_samples", type=int, default=10000000, help="训练样本数")
+    parser.add_argument("--num_samples", type=int, default=100000, help="训练样本数")
     parser.add_argument("--max_dim", type=int, default=10, help="最大输入维度")
     parser.add_argument("--n_points", type=int, default=100, help="数据点数量")
     parser.add_argument("--max_depth", type=int, default=4, help="表达式最大深度")
     parser.add_argument("--max_expr_length", type=int, default=24, help="表达式最大token长度")
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
+    parser.add_argument("--read_batch_size", type=int, default=50000, help="数据读取批次大小，避免一次性加载所有数据到内存")
+    parser.add_argument("--debug", action="store_true", default=False, help="是否输出调试信息")
 
     # 模型参数
     parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
@@ -63,6 +65,8 @@ def main():
     print(f"样本数: {args.num_samples}")
     print(f"最大维度: {args.max_dim}")
     print(f"表达式最大长度: {args.max_expr_length}")
+    print(f"数据读取批次大小: {args.read_batch_size}")
+    print(f"调试模式: {'开启' if args.debug else '关闭'}")
     print(f"批次大小: {args.batch_size}")
     print(f"训练轮数: {args.num_epochs}")
     print(f"学习率: {args.learning_rate}")

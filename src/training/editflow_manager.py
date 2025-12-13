@@ -7,12 +7,13 @@ import numpy as np
 import time
 import argparse
 import os
+import json
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from ..utils.special_tokens import SpecialTokensManager
-from ..symbolic.data_generator import generate_flow_samples, get_data_filename
+from ..symbolic.data_generator import generate_flow_samples, get_data_filename, load_dimension_index
 from .flow import (
     KappaScheduler, sample_conditional_path, tokens_to_prob,
     remove_gap_tokens, fill_gap_tokens_with_repeats,
@@ -65,22 +66,44 @@ class EditFlowManager:
             max_depth=self.args.max_depth
         )
 
-        if os.path.exists(cache_filename):
-            print(f"发现缓存文件 {cache_filename}，将直接加载数据...")
+        if not os.path.exists(cache_filename):
+            print(f"未发现缓存文件 {cache_filename}，将先生成数据...")
+            generate_flow_samples(
+                num_samples=self.args.num_samples,
+                max_dim=self.args.max_dim,
+                n_points=self.args.n_points,
+                max_depth=self.args.max_depth,
+                use_cache=True  # 启用缓存功能
+            )
+        else:
+            print(f"发现缓存文件 {cache_filename}，将基于文件创建数据集...")
 
-        samples = generate_flow_samples(
-            num_samples=self.args.num_samples,
-            max_dim=self.args.max_dim,
-            n_points=self.args.n_points,
-            max_depth=self.args.max_depth,
-            use_cache=True  # 启用缓存功能
-        )
+        # 尝试加载维度索引，如果不存在则扫描文件
+        dimension_samples = load_dimension_index(cache_filename)
 
-        # 按维度分组
-        dimension_groups = {}
-        for sample in samples:
-            dim = sample['input_dimension']
-            dimension_groups.setdefault(dim, []).append(sample)
+        if dimension_samples is None:
+            # 维度索引不存在，需要扫描文件
+            print(f"维度索引不存在，正在扫描文件进行维度统计...")
+            dimension_samples = {}  # 存储每个维度的样本位置索引
+
+            with open(cache_filename, 'r', encoding='utf-8') as f:
+                while True:
+                    pos = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if line:
+                        sample = json.loads(line)
+                        dim = sample['input_dimension']
+                        if dim not in dimension_samples:
+                            dimension_samples[dim] = []
+                        dimension_samples[dim].append(pos)
+
+            print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
+        else:
+            # 使用缓存的维度索引
+            print(f"使用缓存的维度索引，共发现 {len(dimension_samples)} 个维度")
 
         # 划分训练集和测试集
         test_split = getattr(self.args, 'test_split', 0.2)
@@ -88,49 +111,52 @@ class EditFlowManager:
         test_dataloaders = {}
         train_datasets = {}
         test_datasets = {}
-        train_dimension_groups = {}
-        test_dimension_groups = {}
 
-        for dim, dim_samples in dimension_groups.items():
-            # 打乱数据
-            np.random.shuffle(dim_samples)
+        for dim, all_positions in dimension_samples.items():
+            # 打乱样本位置索引
+            np.random.shuffle(all_positions)
 
             # 计算划分点
-            split_idx = int(len(dim_samples) * (1 - test_split))
-            train_samples = dim_samples[:split_idx]
-            test_samples = dim_samples[split_idx:]
+            split_idx = int(len(all_positions) * (1 - test_split))
+            train_positions = all_positions[:split_idx]
+            test_positions = all_positions[split_idx:]
 
-            print(f"维度 {dim}: 训练样本 {len(train_samples)}, 测试样本 {len(test_samples)}")
+            # 创建基于位置的文件数据集
+            train_dataset = FlowDataset(
+                train_positions, cache_filename, tokenizer,
+                max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
+            )
+            test_dataset = FlowDataset(
+                test_positions, cache_filename, tokenizer,
+                max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
+            )
 
-            # 创建训练集
-            train_dataset = FlowDataset(train_samples, tokenizer, max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length)
+            # 创建DataLoader
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset, batch_size=self.args.batch_size, shuffle=True,
                 num_workers=0, collate_fn=custom_collate_fn
             )
-            train_dataloaders[dim] = train_dataloader
-            train_datasets[dim] = train_dataset
-            train_dimension_groups[dim] = train_samples
-
-            # 创建测试集
-            test_dataset = FlowDataset(test_samples, tokenizer, max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length)
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset, batch_size=self.args.batch_size, shuffle=False,
                 num_workers=0, collate_fn=custom_collate_fn
             )
-            test_dataloaders[dim] = test_dataloader
-            test_datasets[dim] = test_dataset
-            test_dimension_groups[dim] = test_samples
 
-        total_train_samples = sum(len(samples) for samples in train_dimension_groups.values())
-        total_test_samples = sum(len(samples) for samples in test_dimension_groups.values())
+            train_dataloaders[dim] = train_dataloader
+            test_dataloaders[dim] = test_dataloader
+            train_datasets[dim] = train_dataset
+            test_datasets[dim] = test_dataset
+
+            print(f"维度 {dim}: 训练样本 {len(train_positions)}, 测试样本 {len(test_positions)}")
+
+        total_train_samples = sum(len(dataset) for dataset in train_datasets.values())
+        total_test_samples = sum(len(dataset) for dataset in test_datasets.values())
 
         print(f"数据划分完成:")
         print(f"  训练集: {total_train_samples} 个样本")
         print(f"  测试集: {total_test_samples} 个样本")
-        print(f"  分布在 {len(train_dimension_groups)} 个维度组中")
+        print(f"  分布在 {len(train_datasets)} 个维度组中")
 
-        return train_dataloaders, train_datasets, train_dimension_groups, test_dataloaders, test_datasets, test_dimension_groups
+        return train_dataloaders, train_datasets, test_dataloaders, test_datasets
 
     def setup_models(self, checkpoint_path=None):
         """
@@ -209,8 +235,11 @@ class EditFlowManager:
         batch_size = z0_token_ids.size(0)
         t = torch.rand(batch_size, 1, device=self.device)
 
-        # 调试：检查z0和z1 token IDs的有效性（仅在提供debug_info且为第一个batch时）
-        # if debug_info and debug_info.get('is_first_batch', False):
+        # 获取debug参数
+        debug_mode = getattr(self.args, 'debug', False)
+
+        # 调试：检查z0和z1 token IDs的有效性（仅在debug模式且为第一个batch时）
+        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
         #     print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
         #     print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
         #     print(f"[DEBUG] vocab_size={config.vocab_size}")
@@ -224,13 +253,13 @@ class EditFlowManager:
         z0_probs = tokens_to_prob(z0_token_ids, config.vocab_size)
         z1_probs = tokens_to_prob(z1_token_ids, config.vocab_size)
 
-        # 调试：检查概率分布（仅在提供debug_info且为第一个batch时）
-        # if debug_info and debug_info.get('is_first_batch', False):
+        # 调试：检查概率分布（仅在debug模式且为第一个batch时）
+        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
         #     print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: {z0_probs}")
         #     print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: {z1_probs}")
         #     print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
 
-        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
+        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler, debug=debug_mode)
 
         # print(f"[DEBUG]  z_t: {z_t}")
 
@@ -313,8 +342,9 @@ class EditFlowManager:
             z0_token_ids = batch['z0_token_ids'].to(self.device)
             z1_token_ids = batch['z1_token_ids'].to(self.device)
 
-            # 调试输出：解码z0和z1的token序列
-            if batch_idx == 0:  # 只在第一个batch输出调试信息
+            # 调试输出：解码z0和z1的token序列（仅在debug模式且第一个batch时）
+            debug_mode = getattr(self.args, 'debug', False)
+            if batch_idx == 0 and debug_mode:  # 只在debug模式且第一个batch输出调试信息
                 print(f"\n[DEBUG] 维度 {dimension} - 第一个batch的token解码信息:")
 
                 # 解码z0_token_ids
@@ -454,7 +484,7 @@ class EditFlowManager:
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 使用tokenizer准备数据
-        train_dataloaders, train_datasets, train_dimension_groups, test_dataloaders, test_datasets, test_dimension_groups = self.prepare_data(tokenizer)
+        train_dataloaders, train_datasets, test_dataloaders, test_datasets = self.prepare_data(tokenizer)
 
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")

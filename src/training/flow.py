@@ -3,6 +3,8 @@ EditFlow连续流匹配的核心组件
 """
 
 import torch
+import json
+import os
 from typing import List, Dict, Tuple, Optional
 from ..symbolic.data_generator import generate_flow_samples
 from ..utils.special_tokens import SpecialTokensManager
@@ -23,7 +25,7 @@ class KappaScheduler:
         return 6 * t - 6 * t**2 if self.scheduler_type == 'cubic' else torch.ones_like(t)
 
 
-def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor, scheduler: KappaScheduler) -> torch.Tensor:
+def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor, scheduler: KappaScheduler, debug: bool = False) -> torch.Tensor:
     """在给定时间t采样条件路径"""
     batch_size, seq_len, vocab_size = p0.shape
     t = t.view(-1, 1, 1) if t.dim() == 1 else t
@@ -34,15 +36,17 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
 
     # 检查并修复数值问题
     if torch.isnan(pt).any() or torch.isinf(pt).any():
-        print(f"[DEBUG] 检测到pt中包含nan或inf值")
-        print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
-        print(f"[DEBUG] p0.min: {p0.min().item()}, p0.max: {p0.max().item()}")
-        print(f"[DEBUG] p1.min: {p1.min().item()}, p1.max: {p1.max().item()}")
-        print(f"[DEBUG] kappa_t.min: {kappa_t.min().item()}, kappa_t.max: {kappa_t.max().item()}")
+        if debug:
+            print(f"[DEBUG] 检测到pt中包含nan或inf值")
+            print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
+            print(f"[DEBUG] p0.min: {p0.min().item()}, p0.max: {p0.max().item()}")
+            print(f"[DEBUG] p1.min: {p1.min().item()}, p1.max: {p1.max().item()}")
+            print(f"[DEBUG] kappa_t.min: {kappa_t.min().item()}, kappa_t.max: {kappa_t.max().item()}")
 
         # 如果有无效值，使用p0作为fallback
         pt = p0.clone()
-        print("[DEBUG] 使用p0作为fallback")
+        if debug:
+            print("[DEBUG] 使用p0作为fallback")
 
     # 确保所有值为非负
     pt = torch.clamp(pt, min=0.0)
@@ -54,9 +58,10 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
 
     # 最终检查概率的有效性
     if torch.isnan(pt).any() or torch.isinf(pt).any() or (pt < 0).any():
-        print(f"[DEBUG] 概率归一化后仍有问题")
-        print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
-        print(f"[DEBUG] pt_sum.min: {pt_sum.min().item()}, pt_sum.max: {pt_sum.max().item()}")
+        if debug:
+            print(f"[DEBUG] 概率归一化后仍有问题")
+            print(f"[DEBUG] pt.min: {pt.min().item()}, pt.max: {pt.max().item()}")
+            print(f"[DEBUG] pt_sum.min: {pt_sum.min().item()}, pt_sum.max: {pt_sum.max().item()}")
         # 如果仍有问题，返回p0的token ID
         return torch.argmax(p0, dim=-1)
 
@@ -161,12 +166,24 @@ class ContinuousFlowLoss:
 
 
 class FlowDataset(torch.utils.data.Dataset):
-    """连续流数据集 (z0, z1, x_values, residuals)"""
+    """连续流数据集 (z0, z1, x_values, residuals) - 基于文件按需读取，避免内存溢出"""
 
-    def __init__(self, samples: List[Dict], tokenizer, max_dim=10, max_expr_length=128):
-        self.samples = samples
+    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128):
+        """
+        基于文件位置索引的数据集
+
+        Args:
+            positions: 文件中样本的位置索引列表
+            filename: 数据文件路径
+            tokenizer: 分词器
+            max_dim: 最大维度
+            max_expr_length: 表达式最大长度
+        """
+        self.positions = positions
+        self.filename = filename
         self.tokenizer = tokenizer
         self.max_expr_length = max_expr_length
+        self.max_dim = max_dim
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
 
         # 设置分词器的特殊token属性
@@ -174,11 +191,11 @@ class FlowDataset(torch.utils.data.Dataset):
 
         self.vocab_size = self.special_tokens_manager.get_current_vocab_size()
         self.pad_token = self.special_tokens_manager.get_token_id('pad')
-        self.bos_token = self.special_tokens_manager.get_token_id('bos')  # 使用统一的bos token
+        self.bos_token = self.special_tokens_manager.get_token_id('bos')
         self.gap_token = self.special_tokens_manager.get_token_id('gap')
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.positions)
 
     def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
         """将token列表转换为token ID列表"""
@@ -189,10 +206,14 @@ class FlowDataset(torch.utils.data.Dataset):
         return token_ids
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        # 从文件指定位置读取样本
+        with open(self.filename, 'r', encoding='utf-8') as f:
+            f.seek(self.positions[idx])
+            line = f.readline().strip()
+            sample = json.loads(line)
+
         x_values = torch.FloatTensor(sample['x_values'])
         residuals = torch.FloatTensor(sample['residuals'])
-        # residuals应该保持为1D张量，在collate_fn中会被正确地堆叠为2D
 
         z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
         z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
