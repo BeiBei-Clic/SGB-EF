@@ -696,35 +696,11 @@ class EditFlowManager:
                         if debug_mode:
                             print(f"[DEBUG] 选择插入的token ID: {best_token}")
 
-                        token_map = special_tokens_manager.get_function_token_map()
-
-                        for i in range(special_tokens_manager.max_dim):
-                            var_name = f'x{i}'
-                            tokens = special_tokens_manager.tokenizer.encode(var_name, add_special_tokens=False)
-                            if tokens:
-                                token_map[var_name] = tokens[0]
-
-                        for op_name in special_tokens_manager.OPERATORS:
-                            tokens = special_tokens_manager.tokenizer.encode(op_name, add_special_tokens=False)
-                            if tokens:
-                                token_map[op_name] = tokens[0]
-
+                        # 直接使用tokenizer转换token ID为token名称
+                        best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
+                        current_tokens.insert(pos, best_token_name)
                         if debug_mode:
-                            print(f"[DEBUG] Token映射表大小: {len(token_map)}")
-
-                        found = False
-                        for expr_elem, token_id in token_map.items():
-                            if token_id == best_token:
-                                current_tokens.insert(pos, expr_elem)
-                                if debug_mode:
-                                    print(f"[DEBUG] 成功插入token: '{expr_elem}'")
-                                found = True
-                                break
-
-                        if not found:
-                            current_tokens.insert(pos, 'x0')
-                            if debug_mode:
-                                print(f"[DEBUG] 未找到对应token，插入默认'x0'")
+                            print(f"[DEBUG] 成功插入token: '{best_token_name}'")
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
@@ -732,20 +708,11 @@ class EditFlowManager:
                             print(f"[DEBUG] 选择替换的token ID: {best_token}")
                             print(f"[DEBUG] 替换前: '{current_tokens[pos]}'")
 
-                        token_map = special_tokens_manager.get_function_token_map()
-
-                        for i in range(special_tokens_manager.max_dim):
-                            var_name = f'x{i}'
-                            tokens = special_tokens_manager.tokenizer.encode(var_name, add_special_tokens=False)
-                            if tokens:
-                                token_map[var_name] = tokens[0]
-
-                        for expr_elem, token_id in token_map.items():
-                            if token_id == best_token:
-                                current_tokens[pos] = expr_elem
-                                if debug_mode:
-                                    print(f"[DEBUG] 成功替换为: '{expr_elem}'")
-                                break
+                        # 直接使用tokenizer转换token ID为token名称
+                        best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
+                        current_tokens[pos] = best_token_name
+                        if debug_mode:
+                            print(f"[DEBUG] 成功替换为: '{best_token_name}'")
 
                     elif action_type == 'delete' and pos < len(current_tokens):
                         deleted_token = current_tokens[pos]

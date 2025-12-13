@@ -304,6 +304,27 @@ class SpecialTokensManager:
         all_tokens = list(self.special_tokens.keys())
         return self.check_and_add_tokens(all_tokens)
 
+    def get_function_token_map(self) -> Dict[str, int]:
+        """
+        获取函数token到ID的映射字典
+
+        Returns:
+            包含函数名到token ID映射的字典
+        """
+        # 确保特殊token已经被处理
+        if not self._tokens_processed:
+            self.ensure_special_tokens()
+
+        vocab = self._get_cached_vocab()
+        token_map = {}
+
+        # 添加函数到映射
+        for func_name in self.FUNCTIONS:
+            if func_name in vocab:
+                token_map[func_name] = vocab[func_name]
+
+        return token_map
+
     def get_current_vocab_size(self) -> int:
         """获取当前词表大小"""
         return len(self.tokenizer.get_vocab())

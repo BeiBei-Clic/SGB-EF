@@ -16,12 +16,13 @@ def main():
     args = type('Args', (), {
         'seed': 42,
         'base_model_name': "google-bert/bert-base-uncased",
-        'condition_model_name': "Qwen/Qwen3-Embedding-0.6B",  # 条件嵌入模型名称
+        'condition_model_name': "nomic-ai/nomic-embed-text-v1.5",  # 条件嵌入模型名称
         'cache_dir': "models/huggingface_cache",  # 模型缓存目录
         'use_data_parallel': False,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
-        'max_dim': 10  # 添加最大维度参数，确保覆盖变量范围
+        'max_dim': 10,  # 添加最大维度参数，确保覆盖变量范围
+        'max_expr_length': 24  # 最大表达式长度
     })()
 
     manager = EditFlowManager(args)
