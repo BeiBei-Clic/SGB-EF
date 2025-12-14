@@ -18,7 +18,7 @@ from src.utils.log_utils import (
     log_sample_step, log_sample_success, log_sample_stuck, cleanup_successful_logs,
     log_expression_generation, log_expression_eval, log_retry_attempt,
     log_batch_progress, log_reduction_sequence, log_data_generation_stats,
-    log_timeout_occurred
+    log_timeout_occurred, log_detailed_error
 )
 from src.symbolic.symbolic_utils import (
     expr_to_tree, generate_random_expr,
@@ -189,7 +189,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         return
 
     # 2. 分批生成数据样本，支持断点续传
-    all_samples = []
     total_dimension_count = {}
 
     print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
@@ -243,21 +242,28 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 target_expr = None
 
                 for retry_count in range(MAX_RETRIES):
+                    retry_start = time.time()
                     try:
+                        log_sample_step(sample_id, f"表达式生成尝试 {retry_count+1}/{MAX_RETRIES}", f"维度={dim}")
                         target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
                         expr_str = str(target_expr)
+                        retry_time = (time.time() - retry_start) * 1000
+
                         steps.append(f"目标表达式: {expr_str}")
-                        log_expression_generation(sample_id, expr_str, max_depth)
+                        log_expression_generation(sample_id, expr_str, max_depth, extra_info=f"retry={retry_count+1} | time={retry_time:.1f}ms")
                         break
-                    except TimeoutError:
-                        log_timeout_occurred(sample_id, "generate_random_expr", 2.0)
-                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, "timeout")
+                    except TimeoutError as te:
+                        retry_time = time.time() - retry_start
+                        log_timeout_occurred(sample_id, "generate_random_expr", 2.0, extra_info=f"dim={dim}, attempt={retry_count+1}, duration={retry_time:.1f}s")
+                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, "timeout", extra_info=f"dim={dim}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
+                            log_detailed_error(sample_id, "generate_random_expr_timeout", te, f"all {MAX_RETRIES} attempts timed out")
                     except Exception as expr_error:
-                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, f"error: {str(expr_error)}")
+                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, f"error: {str(expr_error)[:30]}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
+                            log_detailed_error(sample_id, "generate_random_expr_failed", expr_error, f"all {MAX_RETRIES} attempts failed")
 
                 if target_expr is None:
                     sample_count += 1
@@ -352,6 +358,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
             except Exception as e:
                 duration = time.time() - sample_start_time
                 steps.append(f"错误: {str(e)}")
+                log_detailed_error(sample_id, "sample_generation", e, f"duration={duration:.2f}s, steps={len(steps)}")
                 log_sample_stuck(sample_id, duration, steps)
                 print(f"警告: 生成样本时出错，跳过该样本: {e}")
                 continue
@@ -374,9 +381,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         # 立即保存当前批次
         batch_filename = batch_filenames[batch_idx]
         save_samples_to_txt(batch_samples, batch_filename)
-
-        # 将批次样本添加到总样本中
-        all_samples.extend(batch_samples)
 
         print(f"第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
         print(f"当前批次维度分布:")

@@ -7,6 +7,7 @@ import time
 import numpy as np
 import sympy as sp
 from typing import List, Tuple
+from src.utils.timeout_utils import TimeoutError
 
 
 # 运算符定义
@@ -70,10 +71,15 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
-    """生成随机表达式"""
+    """生成随机表达式 - 增加超时保护和详细日志"""
+    start_time = time.time()
     symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
 
     def generate_expr(depth: int) -> sp.Expr:
+        # 超时检查
+        if time.time() - start_time > 1.5:
+            raise TimeoutError("表达式生成超时")
+
         if depth >= max_depth:
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
@@ -87,13 +93,18 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
         else:
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
-    # 使用带时间限制的化简，然后检查是否包含复数
+    # 生成表达式
     expr = generate_expr(0)
-    expr = timed_simplify(expr, max_time=1)
+
+    # 简化表达式（带超时保护）
+    try:
+        simplified = timed_simplify(expr, max_time=0.5)
+        expr = simplified
+    except Exception as e:
+        pass  # 简化失败就使用原始表达式
 
     # 检查并移除复数单位I
     if expr.has(sp.I):
-        # 如果包含复数单位，替换为1
         expr = expr.replace(sp.I, sp.Integer(1))
         expr = timed_simplify(expr, max_time=0.5)
 
