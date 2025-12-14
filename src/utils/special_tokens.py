@@ -48,7 +48,6 @@ class SpecialTokensManager:
 
         # 构建所有特殊token的映射
         self.special_tokens = {}
-        self.token_to_id = {}  # 添加token到ID的映射
 
         for op in self.OPERATORS:
             self.special_tokens[op] = op
@@ -172,63 +171,6 @@ class SpecialTokensManager:
         """检查token是否为特殊token"""
         return token in self.special_tokens
 
-    def check_and_add_tokens(self, tokens_to_check: List[str]) -> Dict[str, int]:
-        """
-        检查token是否在分词器中存在，如果不存在则添加
-
-        Args:
-            tokens_to_check: 需要检查的token列表
-
-        Returns:
-            token到ID的映射字典
-        """
-        token_to_id = {}
-        added_tokens_info = []
-        existing_tokens_info = []
-
-        # 获取当前词表
-        vocab = self.tokenizer.get_vocab()
-        current_vocab_size = len(vocab)
-
-        for token in tokens_to_check:
-            # 检查token是否在词表中直接存在
-            if token in vocab:
-                # 直接找到对应的token ID
-                token_id = vocab[token]
-                token_to_id[token] = token_id
-                existing_tokens_info.append(f"{token} -> {token_id}")
-            else:
-                # token不存在，需要添加
-                self.tokenizer.add_tokens([token])
-                self.added_tokens.add(token)
-                # 重新获取词表
-                vocab = self.tokenizer.get_vocab()
-                new_id = vocab[token]
-                token_to_id[token] = new_id
-                added_tokens_info.append(f"{token} -> {new_id}")
-
-        # 标记特殊token已被处理，并更新缓存
-        self._tokens_processed = True
-        self._cached_vocab = vocab
-
-        # 显示所有特殊词汇的token映射信息（只在第一次有实际添加时才显示详细信息）
-        if added_tokens_info:
-            print("=== 特殊词汇Token映射信息 ===")
-            if existing_tokens_info:
-                print("已存在的token映射:")
-                for info in existing_tokens_info:
-                    print(f"  {info}")
-
-            print("新增的token映射:")
-            for info in added_tokens_info:
-                print(f"  {info}")
-
-            final_vocab_size = len(vocab)
-            print(f"词表大小从 {current_vocab_size} 更新为 {final_vocab_size}")
-            print("=" * 30)
-
-        return token_to_id
-
     def setup_tokenizer_special_tokens(self):
         """
         设置分词器的特殊token属性，确保分词器使用我们的特殊token
@@ -294,15 +236,31 @@ class SpecialTokensManager:
                 self.tokenizer.sep_token = self.EOS_TOKEN
                 self.tokenizer.sep_token_id = vocab[self.EOS_TOKEN]
 
-    def ensure_special_tokens(self) -> Dict[str, int]:
+    def ensure_special_tokens(self):
         """
         确保所有特殊符号和变量都在分词器中存在
-
-        Returns:
-            完整的token到ID映射字典
         """
         all_tokens = list(self.special_tokens.keys())
-        return self.check_and_add_tokens(all_tokens)
+        added_count = 0
+
+        # 获取当前词表
+        vocab = self.tokenizer.get_vocab()
+
+        for token in all_tokens:
+            if token not in vocab:
+                # token不存在，需要添加
+                self.tokenizer.add_tokens([token])
+                self.added_tokens.add(token)
+                vocab = self.tokenizer.get_vocab()
+                added_count += 1
+
+        # 标记特殊token已被处理，并更新缓存
+        self._tokens_processed = True
+        self._cached_vocab = vocab
+
+        # 只在有新token添加时显示信息
+        if added_count > 0:
+            print(f"已添加 {added_count} 个新token到词表")
 
     def get_function_token_map(self) -> Dict[str, int]:
         """
