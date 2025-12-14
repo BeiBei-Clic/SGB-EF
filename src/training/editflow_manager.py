@@ -322,8 +322,7 @@ class EditFlowManager:
                     for token_id in z0_token_ids[i].tolist():
                         if token_id in id_to_token:
                             token = id_to_token[token_id]
-                            if token not in ['<pad>', '<gap>', '<s>', '</s>']:
-                                z0_tokens.append(token)
+                            z0_tokens.append(token)
                     z0_expression = ','.join(z0_tokens) if z0_tokens else "<empty>"
                     print(f"  样本{i}: {z0_expression}")
 
@@ -333,8 +332,7 @@ class EditFlowManager:
                     for token_id in z1_token_ids[i].tolist():
                         if token_id in id_to_token:
                             token = id_to_token[token_id]
-                            if token not in ['<pad>', '<gap>', '<s>', '</s>']:
-                                z1_tokens.append(token)
+                            z1_tokens.append(token)
                     z1_expression = ','.join(z1_tokens) if z1_tokens else "<empty>"
                     print(f"  样本{i}: {z1_expression}")
 

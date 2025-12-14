@@ -74,10 +74,6 @@ class SpecialTokensManager:
         self.special_tokens[self.UNK_TOKEN] = self.UNK_TOKEN
         self.special_tokens[self.MASK_TOKEN] = self.MASK_TOKEN
 
-    def get_special_tokens(self) -> Dict[str, str]:
-        """获取所有特殊token映射"""
-        return self.special_tokens.copy()
-
     def _get_cached_vocab(self) -> Dict[str, int]:
         """获取缓存的词表，如果词表被修改了则重新获取"""
         if not self._tokens_processed or self._cached_vocab is None:
@@ -116,18 +112,6 @@ class SpecialTokensManager:
 
         token = token_map[token_name]
         return vocab[token]
-
-    def get_operators(self) -> List[str]:
-        """获取运算符列表"""
-        return self.OPERATORS.copy()
-
-    def get_functions(self) -> List[str]:
-        """获取函数列表"""
-        return self.FUNCTIONS.copy()
-
-    def get_variables(self) -> List[str]:
-        """获取变量列表"""
-        return [f'x{i}' for i in range(self.max_dim)]
 
     def tokenize_expression(self, expression: str) -> List[int]:
         """
