@@ -51,8 +51,8 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
 
 def remove_gap_tokens(z_t: torch.Tensor, special_tokens_manager: SpecialTokensManager) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """移除gap token并返回处理后的序列"""
-    pad_token_id = special_tokens_manager.get_token_id('pad')
-    gap_token_id = special_tokens_manager.get_token_id('gap')
+    pad_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
+    gap_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
     batch_size, z_seq_len = z_t.shape
     device = z_t.device
 
@@ -106,7 +106,7 @@ class ContinuousFlowLoss:
         batch_size, z_seq_len = z_t.shape
         n_ops = 2 * vocab_size + 1
 
-        pad_token = special_tokens_manager.get_token_id('pad')
+        pad_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
 
         z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
         z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq
@@ -158,9 +158,9 @@ class FlowDataset(torch.utils.data.Dataset):
         self.special_tokens_manager.setup_tokenizer_special_tokens()
 
         self.vocab_size = self.special_tokens_manager.get_current_vocab_size()
-        self.pad_token = self.special_tokens_manager.get_token_id('pad')
-        self.bos_token = self.special_tokens_manager.get_token_id('bos')
-        self.gap_token = self.special_tokens_manager.get_token_id('gap')
+        self.pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
+        self.bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
+        self.gap_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
 
     def __len__(self):
         return len(self.positions)

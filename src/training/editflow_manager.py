@@ -199,16 +199,16 @@ class EditFlowManager:
         debug_mode = getattr(self.args, 'debug', False)
 
         # 调试：检查z0和z1 token IDs的有效性（仅在debug模式且为第一个batch时）
-        if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
-            print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
-            print(f"[DEBUG] vocab_size={config.vocab_size}")
+        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
+        #     print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
+        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
+        #     print(f"[DEBUG] vocab_size={config.vocab_size}")
 
-            # 检查是否有越界的token IDs
-            z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
-            z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
-            print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
-            print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
+        #     # 检查是否有越界的token IDs
+        #     z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
+        #     z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
+        #     print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
+        #     print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
 
         # z0 token序列转换为概率分布
         batch_size, seq_len = z0_token_ids.shape
@@ -262,7 +262,7 @@ class EditFlowManager:
         z_pad_mask = forward_results['z_pad_mask']
         t = forward_results['t']
         effective_vocab_size = forward_results['vocab_size']
-        gap_token = dataset.special_tokens_manager.get_token_id('gap')
+        gap_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
 
         lambda_ins = pred_rates[:, :, 0:1]
         lambda_sub = pred_rates[:, :, 1:2]
@@ -617,8 +617,8 @@ class EditFlowManager:
                     print(f"[DEBUG] 表达式过长，截断至 {max_len-1} 个token")
 
             # 使用统一的特殊token管理
-            bos_token = special_tokens_manager.get_token_id('bos')
-            pad_token = special_tokens_manager.get_token_id('pad')
+            bos_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
+            pad_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
 
             tokenized_expr = [bos_token] + tokenized_expr
             tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))

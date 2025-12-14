@@ -80,39 +80,6 @@ class SpecialTokensManager:
             self._cached_vocab = self.tokenizer.get_vocab()
         return self._cached_vocab
 
-    def get_token_id(self, token_name: str) -> int:
-        """
-        获取任意特殊token的ID
-
-        Args:
-            token_name: token名称，支持 'gap', 'pad', 'bos', 'eos', 'unk', 'mask'
-
-        Returns:
-            token的ID
-        """
-        # 确保特殊token已经被处理
-        if not self._tokens_processed:
-            self.ensure_special_tokens()
-
-        vocab = self._get_cached_vocab()
-
-        # token名称映射
-        token_map = {
-            'gap': self.GAP_TOKEN,
-            'constant': self.CONSTANT_TOKEN,
-            'pad': self.PAD_TOKEN,
-            'bos': self.BOS_TOKEN,
-            'eos': self.EOS_TOKEN,
-            'unk': self.UNK_TOKEN,
-            'mask': self.MASK_TOKEN
-        }
-
-        if token_name not in token_map:
-            raise ValueError(f"未知的特殊token名称: {token_name}")
-
-        token = token_map[token_name]
-        return vocab[token]
-
     def tokenize_expression(self, expression: str) -> List[int]:
         """
         将表达式字符串转换为token序列
