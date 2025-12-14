@@ -154,6 +154,13 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         print(f"发现完整数据文件 {filename}")
         return
 
+    # 1.5. 主文件存在且有批次文件 → 直接进入合并阶段（跳过生成）
+    if os.path.exists(filename) and any(os.path.exists(f) for f in batch_filenames):
+        print(f"发现主文件和批次文件，直接进入合并阶段...")
+        print(f"将追加剩余批次文件到主文件...")
+        merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count=None)
+        return
+
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
@@ -360,6 +367,25 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     # 3. 按批次顺序合并所有剩余批次文件到主文件，并记录维度索引
     print(f"\n按批次顺序合并所有剩余批次文件到主文件...")
+    merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count)
+
+    print(f"所有数据已保存到: {filename}")
+
+
+def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_batches: int, total_dimension_count: Dict = None):
+    """合并批次文件到主文件（用于中断恢复）
+
+    Args:
+        filename: 主文件名
+        batch_filenames: 批次文件列表
+        num_batches: 总批次数
+        total_dimension_count: 维度计数（生成模式传入，合并模式为None）
+    """
+    if total_dimension_count is not None:
+        print(f"\n=== 生成模式合并阶段 ===")
+    else:
+        print(f"\n=== 批次文件合并模式 ===")
+
     dimension_samples = {}  # 存储每个维度的样本位置索引
 
     with open(filename, 'a', encoding='utf-8') as main_file:
@@ -402,8 +428,15 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         json.dump(index_data, f, indent=2)
     print(f"维度索引已保存到 {index_filename}")
 
-    print(f"\n总体样本维度分布:")
-    for dim, count in sorted(total_dimension_count.items()):
-        print(f"{dim}维: {count} 个样本")
+    # 根据模式打印维度分布
+    if total_dimension_count is not None:
+        print(f"\n总体样本维度分布:")
+        for dim, count in sorted(total_dimension_count.items()):
+            print(f"{dim}维: {count} 个样本")
+    else:
+        print(f"\n合并的样本维度分布:")
+        for dim, count in sorted(dimension_samples.items()):
+            print(f"{dim}维: {count} 个样本")
 
-    print(f"所有数据已保存到: {filename}")
+    print(f"所有批次文件已合并到主文件: {filename}")
+    print(f"批次文件已清理完成")

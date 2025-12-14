@@ -262,7 +262,7 @@ class EditFlowManager:
             'vocab_size': config.vocab_size,
                     }
 
-    def compute_loss(self, forward_results, criterion, dataset):
+    def compute_loss(self, forward_results, criterion, dataset, debug=False):
         pred_rates = forward_results['pred_rates']
         pred_ins_probs = forward_results['pred_ins_probs']
         pred_sub_probs = forward_results['pred_sub_probs']
@@ -291,15 +291,16 @@ class EditFlowManager:
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
 
         # 调试：打印u矩阵
-        print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
-        print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
-        print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
-        print(f"[DEBUG COMPUTE_LOSS] u_cat stats: min={u_cat.min().item():.6f}, max={u_cat.max().item():.6f}, mean={u_cat.mean().item():.6f}")
-        print(f"[DEBUG COMPUTE_LOSS] u_z shape: {u_z.shape}")
-        print(f"[DEBUG COMPUTE_LOSS] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
-        print(f"[DEBUG COMPUTE_LOSS] u_mask shape: {u_mask.shape}")
-        print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
-        print(f"[DEBUG COMPUTE_LOSS] t: {t.squeeze(-1)}")
+        if debug:
+            print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
+            print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
+            print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
+            print(f"[DEBUG COMPUTE_LOSS] u_cat stats: min={u_cat.min().item():.6f}, max={u_cat.max().item():.6f}, mean={u_cat.mean().item():.6f}")
+            print(f"[DEBUG COMPUTE_LOSS] u_z shape: {u_z.shape}")
+            print(f"[DEBUG COMPUTE_LOSS] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
+            print(f"[DEBUG COMPUTE_LOSS] u_mask shape: {u_mask.shape}")
+            print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
+            print(f"[DEBUG COMPUTE_LOSS] t: {t.squeeze(-1)}")
 
         loss = criterion(u_z, u_mask, t, effective_vocab_size)
         return loss
@@ -368,7 +369,7 @@ class EditFlowManager:
                 }
 
             forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
-            loss = self.compute_loss(forward_results, criterion, dataset) / gradient_accumulation_steps
+            loss = self.compute_loss(forward_results, criterion, dataset, debug=debug_mode) / gradient_accumulation_steps
 
             grad_norm = 0.0
             if not torch.isnan(loss):
@@ -415,7 +416,7 @@ class EditFlowManager:
 
                     condition_embeddings = condition_encoder(x_values, residuals)
                     forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config)
-                    loss = self.compute_loss(forward_results, criterion, dataset)
+                    loss = self.compute_loss(forward_results, criterion, dataset, debug=False)
 
                     if not torch.isnan(loss):
                         total_loss += loss.item()
