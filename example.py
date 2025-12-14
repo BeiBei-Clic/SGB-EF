@@ -22,7 +22,7 @@ def main():
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 10,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 24  # 最大表达式长度
+        'max_expr_length': 12  # 最大表达式长度
     })()
 
     manager = EditFlowManager(args)
@@ -46,7 +46,7 @@ def main():
         model_path=model_path,
         x_data=x_data,
         y_data=y_data,
-        debug_mode=True,  # 开启调试模式
+        debug_mode=False,  # 开启调试模式
         n_steps=30  # 减少步数以便观察
     )
 

@@ -155,7 +155,8 @@ class EditFlowTransformer(nn.Module):
             nn.Linear(config.hidden_dim, config.vocab_size)
         )
 
-        self.final_layer_norm = nn.LayerNorm(config.hidden_dim)
+        self.time_layer_norm = nn.LayerNorm(config.hidden_dim)
+        self.condition_layer_norm = nn.LayerNorm(config.hidden_dim)
 
     def forward(self, input_ids, attention_mask=None, time_steps=None, condition=None):
         batch_size, seq_len = input_ids.shape
@@ -179,18 +180,17 @@ class EditFlowTransformer(nn.Module):
         )
         hidden_states = base_outputs.last_hidden_state
 
-        # 添加时间和位置嵌入
-        # 扩展时间嵌入以匹配序列长度维度
+        # 添加时间嵌入
         time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
         hidden_states = hidden_states + time_emb
+        hidden_states = self.time_layer_norm(hidden_states)
 
         # 条件注入
         condition_proj = self.condition_projection(condition)
         if self.config.use_condition_injection:
-            hidden_states = hidden_states + self.condition_injection(hidden_states, condition_proj)
-
-        # 最终处理
-        hidden_states = self.final_layer_norm(hidden_states)
+            condition_injected = self.condition_injection(hidden_states, condition_proj)
+            hidden_states = hidden_states + condition_injected
+            hidden_states = self.condition_layer_norm(hidden_states)
 
         # 输出头
         rates = F.softplus(self.rates_head(hidden_states))

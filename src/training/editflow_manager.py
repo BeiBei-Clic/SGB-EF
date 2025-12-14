@@ -222,8 +222,19 @@ class EditFlowManager:
 
         # 调试：检查概率分布（仅在debug模式且为第一个batch时）
         if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
-            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: {z0_probs}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: {z1_probs}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs 形状: {z0_probs.shape}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs 形状: {z1_probs.shape}")
+            print(f"[DEBUG] {debug_info.get('context', '')} vocab_size: {config.vocab_size}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z0_token_ids 统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids 统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}")
+
+            # 检查每个位置的token ID和对应的概率
+            for i in range(min(3, z0_token_ids.size(0))):
+                print(f"[DEBUG] 样本 {i} z0_token_ids: {z0_token_ids[i].tolist()}")
+                print(f"[DEBUG] 样本 {i} z1_token_ids: {z1_token_ids[i].tolist()}")
+                # 检查第一个位置的one-hot概率
+                token_id_0 = z0_token_ids[i, 0].item()
+                print(f"[DEBUG] 样本 {i} 位置0 token_id={token_id_0}, 对应概率: {z0_probs[i, 0, token_id_0].item()}")
             print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
 
 
@@ -278,6 +289,17 @@ class EditFlowManager:
         u_cat = torch.cat([lambda_ins * extended_ins_probs, lambda_sub * extended_sub_probs, lambda_del], dim=-1)
         u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
+
+        # 调试：打印u矩阵
+        print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
+        print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
+        print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
+        print(f"[DEBUG COMPUTE_LOSS] u_cat stats: min={u_cat.min().item():.6f}, max={u_cat.max().item():.6f}, mean={u_cat.mean().item():.6f}")
+        print(f"[DEBUG COMPUTE_LOSS] u_z shape: {u_z.shape}")
+        print(f"[DEBUG COMPUTE_LOSS] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
+        print(f"[DEBUG COMPUTE_LOSS] u_mask shape: {u_mask.shape}")
+        print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
+        print(f"[DEBUG COMPUTE_LOSS] t: {t.squeeze(-1)}")
 
         loss = criterion(u_z, u_mask, t, effective_vocab_size)
         return loss
