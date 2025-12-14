@@ -70,32 +70,8 @@ class EditFlowManager:
             max_expr_length=self.args.max_expr_length
         )
 
-        # 尝试加载维度索引，如果不存在则扫描文件
+        # 加载维度索引，如果不存在则扫描文件并保存索引
         dimension_samples = load_dimension_index(cache_filename)
-
-        if dimension_samples is None:
-            # 维度索引不存在，需要扫描文件
-            print(f"维度索引不存在，正在扫描文件进行维度统计...")
-            dimension_samples = {}  # 存储每个维度的样本位置索引
-
-            with open(cache_filename, 'r', encoding='utf-8') as f:
-                while True:
-                    pos = f.tell()
-                    line = f.readline()
-                    if not line:
-                        break
-                    line = line.strip()
-                    if line:
-                        sample = json.loads(line)
-                        dim = sample['input_dimension']
-                        if dim not in dimension_samples:
-                            dimension_samples[dim] = []
-                        dimension_samples[dim].append(pos)
-
-            print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
-        else:
-            # 使用缓存的维度索引
-            print(f"使用缓存的维度索引，共发现 {len(dimension_samples)} 个维度")
 
         # 划分训练集和测试集
         test_split = getattr(self.args, 'test_split', 0.2)
@@ -140,12 +116,9 @@ class EditFlowManager:
 
             print(f"维度 {dim}: 训练样本 {len(train_positions)}, 测试样本 {len(test_positions)}")
 
-        total_train_samples = sum(len(dataset) for dataset in train_datasets.values())
-        total_test_samples = sum(len(dataset) for dataset in test_datasets.values())
-
         print(f"数据划分完成:")
-        print(f"  训练集: {total_train_samples} 个样本")
-        print(f"  测试集: {total_test_samples} 个样本")
+        print(f"  训练集: {sum(len(dataset) for dataset in train_datasets.values())} 个样本")
+        print(f"  测试集: {sum(len(dataset) for dataset in test_datasets.values())} 个样本")
         print(f"  分布在 {len(train_datasets)} 个维度组中")
 
         return train_dataloaders, train_datasets, test_dataloaders, test_datasets

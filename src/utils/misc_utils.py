@@ -10,26 +10,15 @@ def find_latest_checkpoint(args):
     save_dir = getattr(args, 'save_dir', 'checkpoints')
 
     # 查找所有epoch检查点
-    pattern = os.path.join(save_dir, "editflow_epoch_*.pth")
-    checkpoint_files = glob.glob(pattern)
+    checkpoint_files = glob.glob(os.path.join(save_dir, "editflow_epoch_*.pth"))
 
     if checkpoint_files:
-        # 提取epoch数字并排序
-        def get_epoch_number(filepath):
-            filename = os.path.basename(filepath)
-            epoch_str = filename.replace('editflow_epoch_', '').replace('.pth', '')
-            return int(epoch_str)
+        # 提取epoch数字并返回最新的
+        return max(checkpoint_files, key=lambda f: int(os.path.basename(f).split('_')[2].split('.')[0]))
 
-        # 返回最新epoch的检查点
-        latest_checkpoint = max(checkpoint_files, key=get_epoch_number)
-        return latest_checkpoint
-
-    # 如果没有epoch检查点，尝试final模型
+    # 查找final模型
     final_model = os.path.join(save_dir, "continuous_flow_final.pth")
-    if os.path.exists(final_model):
-        return final_model
-
-    return None
+    return final_model if os.path.exists(final_model) else None
 
 
 def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer=None):

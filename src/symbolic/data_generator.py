@@ -76,22 +76,50 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     }
 
 def load_dimension_index(filename: str) -> Dict[int, List[int]]:
-    """加载维度索引文件"""
+    """加载维度索引文件，如果不存在则扫描数据文件并保存索引"""
     index_filename = filename.replace('.txt', '_dimension_index.json')
 
-    if not os.path.exists(index_filename):
-        return None
+    if os.path.exists(index_filename):
+        print(f"发现维度索引文件 {index_filename}，正在加载...")
+        with open(index_filename, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
 
-    print(f"发现维度索引文件 {index_filename}，正在加载...")
-    with open(index_filename, 'r', encoding='utf-8') as f:
-        index_data = json.load(f)
+        # 转换回原来的格式
+        dimension_samples = {}
+        for dim_str, positions in index_data.items():
+            dimension_samples[int(dim_str)] = positions
 
-    # 转换回原来的格式
-    dimension_samples = {}
-    for dim_str, positions in index_data.items():
-        dimension_samples[int(dim_str)] = positions
+        print(f"维度索引加载完成，共发现 {len(dimension_samples)} 个维度")
+        return dimension_samples
 
-    print(f"维度索引加载完成")
+    # 维度索引不存在，需要扫描文件
+    print(f"维度索引不存在，正在扫描文件进行维度统计...")
+    dimension_samples = {}  # 存储每个维度的样本位置索引
+
+    with open(filename, 'r', encoding='utf-8') as f:
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            line = line.strip()
+            if line:
+                sample = json.loads(line)
+                dim = sample['input_dimension']
+                if dim not in dimension_samples:
+                    dimension_samples[dim] = []
+                dimension_samples[dim].append(pos)
+
+    print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
+
+    # 保存维度索引到缓存文件
+    os.makedirs(os.path.dirname(index_filename), exist_ok=True)
+    index_data = {}
+    for dim, positions in dimension_samples.items():
+        index_data[str(dim)] = [int(pos) for pos in positions]
+    with open(index_filename, 'w', encoding='utf-8') as f:
+        json.dump(index_data, f, indent=2)
+
     return dimension_samples
 
 def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, max_expr_length: int = 24, batch_size: int = 50000):
