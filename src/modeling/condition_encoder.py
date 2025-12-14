@@ -49,10 +49,10 @@ class ConditionEncoder(nn.Module):
                 x_vals = [x_values[b, i, d].item() for d in range(input_dim)]
                 x_str = ','.join(f"{x_val:.6f}" for x_val in x_vals)
                 r_val = residuals[b, i].item()
-                point_texts.append(f"Data point: [{x_str}], r={r_val:.6f}")
+                point_texts.append(f"x: [{x_str}], r={r_val:.6f}")
 
             texts.append(f"Instruct: {task}\nQuery: {' '.join(point_texts)}")
-
+        # print(texts)
         # 编码文本
         inputs = self.tokenizer(
             texts,

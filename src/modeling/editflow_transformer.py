@@ -112,6 +112,12 @@ class EditFlowTransformer(nn.Module):
             config.hidden_dim = getattr(self.model_config, 'hidden_size')
             config.num_heads = getattr(self.model_config, 'num_attention_heads')
             config.num_layers = getattr(self.model_config, 'num_hidden_layers')
+
+            # 如果vocab_size大于原始词表大小，调整embedding层
+            original_vocab_size = getattr(self.model_config, 'vocab_size', self.base_model.config.vocab_size)
+            if hasattr(config, 'vocab_size') and config.vocab_size and config.vocab_size > original_vocab_size:
+                print(f"调整模型embedding层大小: {original_vocab_size} -> {config.vocab_size}")
+                self.base_model.resize_token_embeddings(config.vocab_size)
         else:
             raise ValueError("必须指定base_model_name")
 

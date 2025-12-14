@@ -164,11 +164,6 @@ class EditFlowManager:
         )
         model = EditFlowTransformer(config).to(self.device)
 
-        # 调整模型embedding层大小以匹配新的词表
-        if actual_vocab_size > model.base_model.get_input_embeddings().num_embeddings:
-            print(f"调整模型embedding层大小: {model.base_model.get_input_embeddings().num_embeddings} -> {actual_vocab_size}")
-            model.base_model.resize_token_embeddings(actual_vocab_size)
-
         # 创建优化器
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
         optimizer = torch.optim.AdamW(
