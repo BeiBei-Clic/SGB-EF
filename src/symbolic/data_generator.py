@@ -15,7 +15,7 @@ import threading
 from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
-    log_sample_step, log_sample_success, log_sample_stuck, cleanup_successful_logs,
+    log_sample_step, log_sample_success, log_sample_stuck,
     log_expression_generation, log_expression_eval, log_retry_attempt,
     log_batch_progress, log_reduction_sequence, log_data_generation_stats,
     log_timeout_occurred, log_detailed_error
@@ -37,8 +37,6 @@ MAX_RETRIES = 3  # 表达式生成和计算的最大重试次数
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
     sample_id = f"sample_{input_dimension}dim_{int(time.time() * 1000) % 1000000}"
-    start_time = time.time()
-    steps = []
 
     log_sample_step(sample_id, f"开始生成 {input_dimension}维样本")
 
@@ -46,7 +44,6 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     log_sample_step(sample_id, "生成数据点")
     x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
     x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
-    steps.append("数据点生成完成")
 
     # 转换为numpy数组用于表达式计算
     x_array = np.array(x_values)
@@ -54,7 +51,6 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     # 生成目标表达式
     log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
     target_expr = generate_random_expr(input_dimension, max_depth)
-    steps.append(f"目标表达式: {str(target_expr)}")
 
     # 计算目标值
     log_sample_step(sample_id, "计算目标表达式值")
@@ -62,12 +58,10 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     if not success:
         # 如果计算失败，抛出异常让调用者处理
         raise ValueError(f"表达式计算失败: {target_expr}")
-    steps.append("目标值计算完成")
 
     # 生成当前表达式
     log_sample_step(sample_id, "生成当前表达式(破坏)")
     curr_expr = corrupt_expression(target_expr, 0.5)
-    steps.append(f"当前表达式: {str(curr_expr)}")
 
     log_sample_success(sample_id)
 
@@ -81,50 +75,9 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
         "exp_cur1": str(curr_expr)
     }
 
-def save_samples_to_txt(samples: List[Dict], filename: str):
-    """将样本保存到txt文件，每行一个样本"""
-    print(f"保存数据到 {filename}...")
-
-    # 确保目录存在
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-    with open(filename, 'w', encoding='utf-8') as f:
-        for sample in samples:
-            # 将样本转换为JSON格式并写入一行
-            sample_line = json.dumps(sample, ensure_ascii=False)
-            f.write(sample_line + '\n')
-
-    print(f"已保存 {len(samples)} 个样本到 {filename}")
-
-def get_dimension_index_filename(data_filename: str) -> str:
-    """生成维度索引文件名"""
-    return data_filename.replace('.txt', '_dimension_index.json')
-
-def save_dimension_index(filename: str, dimension_samples: Dict[int, List[int]]):
-    """保存维度索引文件
-
-    Args:
-        filename: 数据文件名
-        dimension_samples: 维度到位置索引的映射
-    """
-    index_filename = get_dimension_index_filename(filename)
-
-    # 确保目录存在
-    os.makedirs(os.path.dirname(index_filename), exist_ok=True)
-
-    # 将位置索引转换为普通列表（可能包含numpy int）
-    index_data = {}
-    for dim, positions in dimension_samples.items():
-        index_data[str(dim)] = [int(pos) for pos in positions]
-
-    with open(index_filename, 'w', encoding='utf-8') as f:
-        json.dump(index_data, f, indent=2)
-
-    print(f"维度索引已保存到 {index_filename}")
-
 def load_dimension_index(filename: str) -> Dict[int, List[int]]:
     """加载维度索引文件"""
-    index_filename = get_dimension_index_filename(filename)
+    index_filename = filename.replace('.txt', '_dimension_index.json')
 
     if not os.path.exists(index_filename):
         return None
@@ -140,21 +93,6 @@ def load_dimension_index(filename: str) -> Dict[int, List[int]]:
 
     print(f"维度索引加载完成")
     return dimension_samples
-
-def load_samples_from_txt(filename: str) -> List[Dict]:
-    """从txt文件加载样本"""
-    print(f"从 {filename} 加载数据...")
-
-    samples = []
-    with open(filename, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                sample = json.loads(line)
-                samples.append(sample)
-
-    print(f"已加载 {len(samples)} 个样本")
-    return samples
 
 def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, max_expr_length: int = 24, batch_size: int = 50000):
     """生成用于EditFlow连续流训练的数据文件，支持断点续传
@@ -380,17 +318,17 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
         # 立即保存当前批次
         batch_filename = batch_filenames[batch_idx]
-        save_samples_to_txt(batch_samples, batch_filename)
-
+        print(f"保存数据到 {batch_filename}...")
+        os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
+        with open(batch_filename, 'w', encoding='utf-8') as f:
+            for sample in batch_samples:
+                sample_line = json.dumps(sample, ensure_ascii=False)
+                f.write(sample_line + '\n')
+        print(f"已保存 {len(batch_samples)} 个样本到 {batch_filename}")
         print(f"第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
         print(f"当前批次维度分布:")
         for dim, count in sorted(dimension_count.items()):
             print(f"  {dim}维: {count} 个样本")
-
-        # 每20个批次清理一次日志，保留卡住的记录（最后一批不清理）
-        if (batch_idx + 1) % 20 == 0 and batch_idx + 1 < num_batches:
-            print("清理成功样本的详细日志...")
-            cleanup_successful_logs()
 
     # 3. 按批次顺序合并所有剩余批次文件到主文件，并记录维度索引
     print(f"\n按批次顺序合并所有剩余批次文件到主文件...")
@@ -401,7 +339,15 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
             batch_filename = batch_filenames[batch_idx]
             if os.path.exists(batch_filename):
                 # 读取批次样本并记录位置
-                batch_samples = load_samples_from_txt(batch_filename)
+                print(f"从 {batch_filename} 加载数据...")
+                batch_samples = []
+                with open(batch_filename, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            sample = json.loads(line)
+                            batch_samples.append(sample)
+                print(f"已加载 {len(batch_samples)} 个样本")
                 for sample in batch_samples:
                     # 记录当前位置
                     pos = main_file.tell()
@@ -419,7 +365,14 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 print(f"已合并并删除批次文件: {batch_filename}")
 
     # 保存维度索引文件
-    save_dimension_index(filename, dimension_samples)
+    index_filename = filename.replace('.txt', '_dimension_index.json')
+    os.makedirs(os.path.dirname(index_filename), exist_ok=True)
+    index_data = {}
+    for dim, positions in dimension_samples.items():
+        index_data[str(dim)] = [int(pos) for pos in positions]
+    with open(index_filename, 'w', encoding='utf-8') as f:
+        json.dump(index_data, f, indent=2)
+    print(f"维度索引已保存到 {index_filename}")
 
     print(f"\n总体样本维度分布:")
     for dim, count in sorted(total_dimension_count.items()):
