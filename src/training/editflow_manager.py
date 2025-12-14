@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 from ..utils.special_tokens import SpecialTokensManager
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
 from .flow import (
-    KappaScheduler, sample_conditional_path, tokens_to_prob,
+    KappaScheduler, sample_conditional_path,
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
 )
@@ -199,29 +199,35 @@ class EditFlowManager:
         debug_mode = getattr(self.args, 'debug', False)
 
         # 调试：检查z0和z1 token IDs的有效性（仅在debug模式且为第一个batch时）
-        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
-        #     print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
-        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
-        #     print(f"[DEBUG] vocab_size={config.vocab_size}")
+        if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
+            print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
+            print(f"[DEBUG] vocab_size={config.vocab_size}")
 
-        #     # 检查是否有越界的token IDs
-        #     z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
-        #     z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
-        #     print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
-        #     print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
+            # 检查是否有越界的token IDs
+            z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
+            z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
+            print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
+            print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
 
-        z0_probs = tokens_to_prob(z0_token_ids, config.vocab_size)
-        z1_probs = tokens_to_prob(z1_token_ids, config.vocab_size)
+        # z0 token序列转换为概率分布
+        batch_size, seq_len = z0_token_ids.shape
+        z0_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z0_token_ids.device)
+        z0_probs.scatter_(2, z0_token_ids.unsqueeze(-1), 1.0)
+
+        # z1 token序列转换为概率分布
+        batch_size, seq_len = z1_token_ids.shape
+        z1_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z1_token_ids.device)
+        z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
         # 调试：检查概率分布（仅在debug模式且为第一个batch时）
-        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
-        #     print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: {z0_probs}")
-        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: {z1_probs}")
-        #     print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
+        if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
+            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs: {z0_probs}")
+            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs: {z1_probs}")
+            print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
+
 
         z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler, debug=debug_mode)
-
-        # print(f"[DEBUG]  z_t: {z_t}")
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
             z_t, dataset.special_tokens_manager
