@@ -271,11 +271,9 @@ class EditFlowManager:
         ins_probs = lambda_ins * pred_ins_probs
         sub_probs = lambda_sub * pred_sub_probs
 
-        extended_ins_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
-        extended_ins_probs[:, :, :pred_ins_probs.size(-1)] = ins_probs
-
-        extended_sub_probs = torch.zeros(x_t.size(0), x_t.size(1), effective_vocab_size, device=x_t.device)
-        extended_sub_probs[:, :, :pred_sub_probs.size(-1)] = sub_probs
+        # 简化：如果词汇表已经完整，直接使用
+        extended_ins_probs = ins_probs
+        extended_sub_probs = sub_probs
 
         u_cat = torch.cat([lambda_ins * extended_ins_probs, lambda_sub * extended_sub_probs, lambda_del], dim=-1)
         u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
