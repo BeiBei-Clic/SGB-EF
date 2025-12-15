@@ -39,7 +39,6 @@ def main():
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
     parser.add_argument("--read_batch_size", type=int, default=50000, help="数据读取批次大小，避免一次性加载所有数据到内存")
-    parser.add_argument("--max_training_data", type=int, default=10000000, help="最大训练数据量，超过此值时分批加载训练数据")
     parser.add_argument("--debug", action="store_true", default=False, help="是否输出调试信息")
 
     # 模型参数
@@ -67,7 +66,6 @@ def main():
     print(f"最大维度: {args.max_dim}")
     print(f"表达式最大长度: {args.max_expr_length}")
     print(f"数据读取批次大小: {args.read_batch_size}")
-    print(f"最大训练数据量: {args.max_training_data}")
     print(f"调试模式: {'开启' if args.debug else '关闭'}")
     print(f"批次大小: {args.batch_size}")
     print(f"训练轮数: {args.num_epochs}")

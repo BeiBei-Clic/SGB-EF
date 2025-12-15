@@ -135,10 +135,8 @@ class EditFlowManager:
         """
         print("初始化tokenizer和模型...")
 
-        # 首先初始化tokenizer，获取预训练模型的词汇表
+        # 初始化tokenizer
         model_name = getattr(self.args, 'base_model_name', "google-bert/bert-base-uncased")
-
-        # 设置模型缓存目录
         cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -155,16 +153,15 @@ class EditFlowManager:
         condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name).to(self.device)
 
         print("初始化EditFlow模型...")
-        actual_vocab_size = len(tokenizer.get_vocab())  # 获取实际词表大小
         config = EditFlowConfig(
             max_seq_len=self.args.max_expr_length,
             condition_dim=condition_encoder.output_dim,
             base_model_name=model_name,
-            vocab_size=actual_vocab_size,  # 使用更新后的词表大小
+            vocab_size=len(tokenizer.get_vocab()),
         )
         model = EditFlowTransformer(config).to(self.device)
 
-        # 创建优化器
+        # 创建优化器和损失函数
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
@@ -173,14 +170,14 @@ class EditFlowManager:
         )
 
         # 如果提供了检查点路径，加载预训练模型
-        checkpoint = load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer)
+        load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer)
 
         # 使用DataParallel包装模型以支持多GPU
         if self.use_data_parallel and self.gpu_count > 1:
             print(f"使用DataParallel包装模型...")
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
             condition_encoder = torch.nn.DataParallel(condition_encoder, device_ids=self.device_ids)
-            
+
             # 多GPU设置优化
             effective_batch_size = self.args.batch_size * self.gpu_count
             print(f"有效批次大小: {effective_batch_size} (每个GPU: {self.args.batch_size})")
