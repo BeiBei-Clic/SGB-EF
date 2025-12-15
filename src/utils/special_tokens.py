@@ -139,7 +139,7 @@ class SpecialTokensManager:
         missing_tokens = [token for token in self.special_tokens.keys() if token not in vocab]
 
         if missing_tokens:
-            self.tokenizer.add_tokens(missing_tokens)
+            self.tokenizer.add_tokens(missing_tokens, mean_resizing=False)
             self.added_tokens.update(missing_tokens)
             print(f"已添加 {len(missing_tokens)} 个新token到词表")
 
