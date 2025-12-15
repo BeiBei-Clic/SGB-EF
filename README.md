@@ -4,33 +4,36 @@
 
 为了加速模型下载，建议使用国内镜像源。
 
-### 临时设置
+### 设置方法
+
 ```bash
+# 临时设置
 export HF_ENDPOINT=https://hf-mirror.com
-```
 
-### 永久设置
-将上述命令添加到 `~/.bashrc` 或 `~/.zshrc`：
-
-```bash
+# 永久设置（添加到 ~/.bashrc 或 ~/.zshrc）
 echo 'export HF_ENDPOINT=https://hf-mirror.com' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ### 验证设置
+
 ```bash
 echo $HF_ENDPOINT
 # 输出: https://hf-mirror.com
 ```
 
-### 其他镜像源
-- 主镜像: `https://hf-mirror.com`
-- 备用镜像: `https://hf.1zhe.icu`
+### 可用镜像源
 
-## 模型缓存位置
+- **主镜像**: `https://hf-mirror.com`
+- **备用镜像**: `https://hf.1zhe.icu`
+
+## 模型缓存
+
+### 缓存位置
+
 项目模型缓存默认存储在：`models/huggingface_cache/`
 
-### 支持的嵌入模型对比
+### 嵌入模型对比
 
 | 模型名称 | 参数量 | 嵌入维度 | 特点 | 适用场景 |
 |---------|--------|----------|------|----------|
@@ -39,30 +42,28 @@ echo $HF_ENDPOINT
 
 ## 数据生成日志监控
 
-项目为数据生成过程提供了详细的日志记录系统，帮助监控和调试数据生成过程。
+### 日志文件
 
-### 日志文件位置
-
-- **详细日志**: `logs/sample_generation.log` - 记录所有样本的生成步骤
+- **详细日志**: `logs/sample_generation.log` - 记录所有样本生成步骤
 - **卡住样本日志**: `logs/sample_stuck.log` - 只记录出错的样本信息
 
-### 实时监控命令
+### 实时监控
 
 ```bash
-# 查看当前正在生成的样本（实时）
+# 查看正在生成的样本
 tail -f logs/sample_generation.log
 
-# 查看卡住的样本（实时）
+# 查看卡住的样本
 tail -f logs/sample_stuck.log
 
-# 查看最新的数据生成文件
+# 查看最新数据文件
 ls -la data/ | tail -5
 
 # 查看数据生成进度
 ls -la data/*batch*.txt | wc -l
 ```
 
-### 日志分析命令
+### 日志分析
 
 ```bash
 # 统计卡住样本数量
@@ -71,29 +72,25 @@ grep -c "卡住样本记录" logs/sample_stuck.log
 # 查看最常见的错误类型
 grep "错误:" logs/sample_stuck.log | sort | uniq -c | sort -nr
 
-# 查看数据生成的时间分布
+# 查看数据生成时间分布
 grep "开始生成" logs/sample_generation.log | awk '{print $1}' | sort | uniq -c
 
 # 查看当前批次进度
 grep "第.*批" logs/sample_generation.log | tail -1
 
-# 查看复杂的表达式样本
+# 统计复杂表达式样本
 grep "跳过复杂表达式" logs/sample_generation.log | wc -l
 ```
 
-### 日志内容说明
+## 分布式训练
 
-- `[sample_id]` - 每个样本的唯一标识符
-- 时间戳 - 精确到毫秒的生成时间
-- 步骤记录 - 数据点生成、表达式生成、值计算等每个步骤
-- 成功/失败标记 - 样本是否成功完成
-- 持续时间 - 每个样本的生成耗时
-
-### 日志清理机制
-
-系统每5个批次自动清理成功样本的详细日志，只保留：
-- 卡住的样本详细信息
-- 当前正在生成的样本记录
-- 系统级别的错误信息
-
-这样可以有效控制日志文件大小，同时保留重要的调试信息。
+```bash
+  accelerate launch \
+      --num_processes=3 \
+      --num_machines=1 \
+      --mixed_precision=fp16 \
+      --dynamo_backend=no \
+      --multi_gpu \
+      train.py \
+      --num_samples 10000000
+```
