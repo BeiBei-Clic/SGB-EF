@@ -38,12 +38,10 @@ class SinusoidalTimeEmbedding(nn.Module):
             t = t.unsqueeze(-1)
 
         half_dim = self.hidden_dim // 2
-        emb = math.log(10000.0) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=t.device, dtype=t.dtype) * -emb)
-        emb = t * emb.unsqueeze(0)
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        exponent = torch.arange(half_dim, device=t.device, dtype=t.dtype) * -(math.log(10000.0) / (half_dim - 1))
+        emb = torch.cat([torch.sin(t * exponent), torch.cos(t * exponent)], dim=-1)
 
-        if self.hidden_dim % 2 == 1:
+        if self.hidden_dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
 
         return emb
