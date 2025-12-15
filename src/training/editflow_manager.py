@@ -422,62 +422,57 @@ class EditFlowManager:
         return total_loss / num_batches if num_batches > 0 else float('inf')
 
     
-    def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config):
-        checkpoint_path = os.path.join(self.args.save_dir, f"editflow_epoch_{epoch+1}.pth")
+    def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config, is_final=False):
         os.makedirs(self.args.save_dir, exist_ok=True)
+        checkpoint_path = os.path.join(
+            self.args.save_dir,
+            "continuous_flow_final.pth" if is_final else f"editflow_epoch_{epoch+1}.pth"
+        )
 
-        # 检查模型是否被DataParallel包装
-        model_is_dataparallel = hasattr(model, 'module')
-        encoder_is_dataparallel = hasattr(condition_encoder, 'module')
-
-        # 保存原始状态字典（保持DataParallel的module.前缀）
-        model_state = model.state_dict()
-        condition_encoder_state = condition_encoder.state_dict()
-
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch + 1,
-            'model_state_dict': model_state,
-            'condition_encoder_state_dict': condition_encoder_state,
+            'model_state_dict': model.state_dict(),
+            'condition_encoder_state_dict': condition_encoder.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': loss,
             'config': config,
             'args': self.args,
             'use_data_parallel': self.use_data_parallel,
             'gpu_count': self.gpu_count,
-            # 添加保存时的状态信息
-            'model_was_dataparallel': model_is_dataparallel,
-            'encoder_was_dataparallel': encoder_is_dataparallel,
+            'model_was_dataparallel': hasattr(model, 'module'),
+            'encoder_was_dataparallel': hasattr(condition_encoder, 'module'),
             'saved_with_dataparallel_setting': self.use_data_parallel and self.gpu_count > 1
-        }, checkpoint_path)
+        }
 
+        if is_final:
+            checkpoint_data['scheduler_type'] = 'cubic'
+
+        torch.save(checkpoint_data, checkpoint_path)
         return checkpoint_path
 
     def train(self):
         print(f"使用设备: {self.device}")
 
-        # 检查是否有可用的检查点文件
+        # 检查检查点并加载模型
         checkpoint_path = find_latest_checkpoint(self.args)
-        if checkpoint_path:
-            print(f"找到检查点: {checkpoint_path}")
-        else:
-            print("未找到检查点，将从基础模型开始训练")
+        print(f"{'找到检查点' if checkpoint_path else '未找到检查点，将从基础模型开始训练'}: {checkpoint_path or ''}")
 
-        # 使用setup_models加载模型（优先检查点，然后本地缓存，最后下载）
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
-
-        # 使用tokenizer准备数据
         train_dataloaders, train_datasets, test_dataloaders, test_datasets = self.prepare_data(tokenizer)
 
-        print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
-        print(f"条件编码器参数数量: {sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad):,}")
+        model_params = sum(p.numel() for p in model.parameters())
+        encoder_params = sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad)
+        print(f"模型参数数量: {model_params:,}, 条件编码器参数数量: {encoder_params:,}")
         print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
 
-        for epoch in range(self.args.num_epochs):
-            total_loss = 0.0
-            total_batches = 0
+        config = model.module.config if hasattr(model, 'module') else model.config
+        eval_every = getattr(self.args, 'eval_every', 5)
 
+        for epoch in range(self.args.num_epochs):
+            total_loss, total_batches = 0.0, 0
+
+            # 训练所有维度
             for dim, dataloader in train_dataloaders.items():
-                print(f"\n训练维度 {dim} 的数据...")
                 dataset = train_datasets[dim]
                 dim_loss, dim_batches = self.train_epoch(
                     model, condition_encoder, criterion, optimizer,
@@ -491,48 +486,22 @@ class EditFlowManager:
             print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
 
             # 测试集评估
-            eval_every = getattr(self.args, 'eval_every', 5)
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:
-                print("开始测试集评估...")
                 test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloaders, test_datasets)
                 print(f"测试集损失: {test_loss:.4f}")
 
+            # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
-                config = model.module.config if hasattr(model, 'module') else model.config
                 checkpoint_path = self.save_checkpoint(
                     model, condition_encoder, optimizer, avg_loss, epoch, config
                 )
                 print(f"检查点已保存到: {checkpoint_path}")
 
-        final_model_path = os.path.join(self.args.save_dir, "continuous_flow_final.pth")
-        os.makedirs(self.args.save_dir, exist_ok=True)
-
-        # 检查模型是否被DataParallel包装
-        model_is_dataparallel = hasattr(model, 'module')
-        encoder_is_dataparallel = hasattr(condition_encoder, 'module')
-
-        # 保存原始状态字典（保持DataParallel的module.前缀）
-        model_state = model.state_dict()
-        condition_encoder_state = condition_encoder.state_dict()
-
-        config = model.module.config if hasattr(model, 'module') else model.config
-        torch.save({
-            'epoch': self.args.num_epochs,
-            'model_state_dict': model_state,
-            'condition_encoder_state_dict': condition_encoder_state,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'config': config,
-            'args': self.args,
-            'use_data_parallel': self.use_data_parallel,
-            'gpu_count': self.gpu_count,
-            'scheduler_type': 'cubic',
-            # 添加保存时的状态信息
-            'model_was_dataparallel': model_is_dataparallel,
-            'encoder_was_dataparallel': encoder_is_dataparallel,
-            'saved_with_dataparallel_setting': self.use_data_parallel and self.gpu_count > 1
-        }, final_model_path)
-
-        print(f"最终模型已保存到: {final_model_path}")
+        # 保存最终模型
+        final_path = self.save_checkpoint(
+            model, condition_encoder, optimizer, avg_loss, self.args.num_epochs - 1, config, is_final=True
+        )
+        print(f"最终模型已保存到: {final_path}")
         return model, condition_encoder
 
     def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None, max_expr_length=None):

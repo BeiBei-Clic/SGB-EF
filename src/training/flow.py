@@ -29,40 +29,15 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
     """在给定时间t采样条件路径"""
     batch_size, seq_len, vocab_size = p0.shape
     t = t.view(-1, 1, 1) if t.dim() == 1 else t
-    kappa_t = scheduler(t)
-    kappa_t = kappa_t.view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
+    kappa_t = scheduler(t).view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
 
-    # 调试：检查输入概率分布
-    if debug:
-        print(f"[DEBUG sample_conditional_path] p0 shape: {p0.shape}, p1 shape: {p1.shape}")
-        print(f"[DEBUG sample_conditional_path] p0 统计: min={p0.min().item():.4f}, max={p0.max().item():.4f}, sum={p0.sum().item():.4f}")
-        print(f"[DEBUG sample_conditional_path] p1 统计: min={p1.min().item():.4f}, max={p1.max().item():.4f}, sum={p1.sum().item():.4f}")
-
-        # 检查每个位置的 one-hot 编码是否正确
-        for i in range(min(2, batch_size)):
-            for j in range(min(3, seq_len)):
-                p0_row = p0[i, j]
-                p1_row = p1[i, j]
-                p0_sum = p0_row.sum().item()
-                p1_sum = p1_row.sum().item()
-                p0_max = p0_row.max().item()
-                p1_max = p1_row.max().item()
-                print(f"[DEBUG sample_conditional_path] Sample {i} Pos {j}: p0_sum={p0_sum:.4f}, p0_max={p0_max:.4f}, p1_sum={p1_sum:.4f}, p1_max={p1_max:.4f}")
-
-    # 线性插值
     pt = (1 - kappa_t) * p0 + kappa_t * p1
-
-    # 确保概率为非负并归一化
     pt = torch.clamp(pt, min=0.0)
-    pt_sum = pt.sum(dim=-1, keepdim=True)
-    # 防止除零
-    pt_sum = torch.clamp(pt_sum, min=1e-8)
+    pt_sum = torch.clamp(pt.sum(dim=-1, keepdim=True), min=1e-8)
     pt = pt / pt_sum
 
-    # 采样
     pt_flat = pt.view(-1, pt.size(-1))
-    sampled = torch.multinomial(pt_flat, 1)
-    return sampled.view(batch_size, seq_len)
+    return torch.multinomial(pt_flat, 1).view(batch_size, seq_len)
 
 
 
@@ -140,37 +115,13 @@ class ContinuousFlowLoss:
     def __call__(self, u_cat: torch.Tensor, u_mask: torch.Tensor,
                  t: torch.Tensor, vocab_size: int) -> torch.Tensor:
         u_total = u_cat.sum(dim=(1, 2))
-
-        # 调试：检查 u_total
-        if torch.isnan(u_total).any() or torch.isinf(u_total).any():
-            print(f"[DEBUG LOSS] u_total has NaN/Inf: {u_total}")
-            print(f"[DEBUG LOSS] u_cat stats: min={u_cat.min().item():.6f}, max={u_cat.max().item():.6f}, mean={u_cat.mean().item():.6f}")
-
         sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
         sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)
-
-        # 调试：检查 sched_coeff
-        if torch.isnan(sched_coeff).any() or torch.isinf(sched_coeff).any():
-            print(f"[DEBUG LOSS] sched_coeff has NaN/Inf: {sched_coeff}")
 
         log_u_cat = torch.log(torch.clamp(u_cat, min=1e-12, max=1e12))
         cross_entropy = (log_u_cat * u_mask.float()).sum(dim=(1, 2))
 
-        # 调试：检查 cross_entropy
-        if torch.isnan(cross_entropy).any() or torch.isinf(cross_entropy).any():
-            print(f"[DEBUG LOSS] cross_entropy has NaN/Inf: {cross_entropy}")
-            print(f"[DEBUG LOSS] log_u_cat stats: min={log_u_cat.min().item():.6f}, max={log_u_cat.max().item():.6f}")
-            print(f"[DEBUG LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
-
-        loss = u_total - cross_entropy * sched_coeff
-
-        # 调试：检查最终损失
-        if torch.isnan(loss).any() or torch.isinf(loss).any():
-            print(f"[DEBUG LOSS] Final loss has NaN/Inf: {loss}")
-            print(f"[DEBUG LOSS] u_total: {u_total}")
-            print(f"[DEBUG LOSS] cross_entropy * sched_coeff: {cross_entropy * sched_coeff}")
-
-        return loss.mean()
+        return (u_total - cross_entropy * sched_coeff).mean()
 
 
 class FlowDataset(torch.utils.data.Dataset):
