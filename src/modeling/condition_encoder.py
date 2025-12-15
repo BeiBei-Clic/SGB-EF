@@ -3,9 +3,14 @@
 """
 
 import os
+import warnings
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
+
+# 在模块级别过滤transformers的词汇扩展警告
+warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
 
 
 

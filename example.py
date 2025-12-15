@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
 带调试信息的符号回归实例 - 直接调用EditFlowManager中的symbolic_regression方法
-可以直接运行，无需accelerate launch命令
 """
 
-import os
 import numpy as np
-from datetime import datetime
 
 from src.symbolic.data_generator import generate_sample
 from src.training.editflow_manager import EditFlowManager
 
 
 def main():
-    print("=== 带调试信息的符号回归实例 (直接运行模式) ===")
-    print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # 设置分布式训练环境变量（避免警告）
-    os.environ["ACCELERATE_MIXED_PRECISION"] = "no"  # 推理时不需要混合精度
+    print("=== 带调试信息的符号回归实例 ===")
 
     # 设置参数
     args = type('Args', (), {
@@ -30,8 +23,7 @@ def main():
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 10,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 12,  # 最大表达式长度
-        'mixed_precision': 'no'  # 明确设置混合精度为关闭
+        'max_expr_length': 12  # 最大表达式长度
     })()
 
     manager = EditFlowManager(args)
