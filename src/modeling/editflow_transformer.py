@@ -2,12 +2,27 @@
 EditFlow Transformer - 基于Transformer的符号回归编辑流模型
 """
 import os
+import sys
+import io
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
 import math
+import logging
 from pathlib import Path
+
+# 强制过滤transformers的词汇扩展警告，避免重复输出
+warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*mean_resizing=False.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*vocab expansion.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*embedding.*", category=UserWarning)
+
+# 设置transformers日志级别为ERROR，减少不必要的输出
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 
 class EditFlowConfig:
@@ -82,7 +97,7 @@ class CrossAttentionConditionInjection(nn.Module):
 class EditFlowTransformer(nn.Module):
     """EditFlow Transformer - 基于Transformer的符号回归编辑流模型"""
 
-    def __init__(self, config):
+    def __init__(self, config, verbose=False):
         super().__init__()
         self.config = config
 
@@ -91,7 +106,8 @@ class EditFlowTransformer(nn.Module):
             cache_dir = Path("models/huggingface_cache").resolve()
             os.makedirs(cache_dir, exist_ok=True)
 
-            print(f"正在加载基础模型: {config.base_model_name} (缓存: {cache_dir})")
+            if verbose:
+                print(f"正在加载基础模型: {config.base_model_name} (缓存: {cache_dir})")
 
             self.base_model = AutoModel.from_pretrained(config.base_model_name, cache_dir=cache_dir, trust_remote_code=True)
             self.model_config = self.base_model.config
@@ -102,8 +118,18 @@ class EditFlowTransformer(nn.Module):
 
             original_vocab_size = getattr(self.model_config, 'vocab_size', self.base_model.config.vocab_size)
             if hasattr(config, 'vocab_size') and config.vocab_size and config.vocab_size > original_vocab_size:
-                print(f"调整模型embedding层: {original_vocab_size} -> {config.vocab_size}")
-                self.base_model.resize_token_embeddings(config.vocab_size)
+                if verbose:
+                    print(f"调整模型embedding层: {original_vocab_size} -> {config.vocab_size}")
+
+                # 临时禁用标准输出来避免transformers的警告信息
+                old_stdout = sys.stdout
+                sys.stdout = buffer = io.StringIO()
+                try:
+                    self.base_model.resize_token_embeddings(config.vocab_size)
+                finally:
+                    sys.stdout = old_stdout
+                    # 清除缓冲区内容
+                    buffer.close()
             # 禁用不需要的 pooler 层梯度（避免分布式训练错误）
             if hasattr(self.base_model, 'pooler'):
                 for param in self.base_model.pooler.parameters():

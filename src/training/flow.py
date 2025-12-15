@@ -127,7 +127,7 @@ class ContinuousFlowLoss:
 class FlowDataset(torch.utils.data.Dataset):
     """连续流数据集 (z0, z1, x_values, residuals) - 基于文件按需读取，避免内存溢出"""
 
-    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128):
+    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False):
         """
         基于文件位置索引的数据集
 
@@ -137,6 +137,7 @@ class FlowDataset(torch.utils.data.Dataset):
             tokenizer: 分词器
             max_dim: 最大维度
             max_expr_length: 表达式最大长度
+            verbose: 是否输出详细日志
         """
         self.positions = positions
         self.filename = filename
@@ -146,7 +147,7 @@ class FlowDataset(torch.utils.data.Dataset):
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
 
         # 设置分词器的特殊token属性
-        self.special_tokens_manager.setup_tokenizer_special_tokens()
+        self.special_tokens_manager.setup_tokenizer_special_tokens(verbose)
 
         self.vocab_size = len(self.special_tokens_manager.tokenizer.get_vocab())
         self.pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')

@@ -36,6 +36,10 @@ class SpecialTokensManager:
         self._cached_vocab = None
         self._tokens_processed = False
 
+        # 静态变量来跟踪全局状态，避免重复处理
+        if not hasattr(SpecialTokensManager, '_processed_tokenizers'):
+            SpecialTokensManager._processed_tokenizers = set()
+
         # 构建所有特殊token的映射（简化版本）
         self.special_tokens = {
             **{op: op for op in self.OPERATORS},
@@ -94,12 +98,12 @@ class SpecialTokensManager:
 
         return token_ids
 
-    def setup_tokenizer_special_tokens(self):
+    def setup_tokenizer_special_tokens(self, verbose: bool = False):
         """
         设置分词器的特殊token属性
         优先使用分词器原有的特殊token，如果没有才使用我们添加的
         """
-        self.ensure_special_tokens()
+        self.ensure_special_tokens(verbose)
         vocab = self._get_cached_vocab()
 
         # 使用循环批量设置特殊token（简化重复代码）
@@ -133,16 +137,26 @@ class SpecialTokensManager:
                 self.tokenizer.sep_token = self.EOS_TOKEN
                 self.tokenizer.sep_token_id = vocab[self.EOS_TOKEN]
 
-    def ensure_special_tokens(self):
+    def ensure_special_tokens(self, verbose: bool = False):
         """确保所有特殊符号和变量都在分词器中存在"""
+        # 检查这个tokenizer是否已经被处理过
+        tokenizer_id = id(self.tokenizer)
+        if tokenizer_id in SpecialTokensManager._processed_tokenizers:
+            self._tokens_processed = True
+            self._cached_vocab = self.tokenizer.get_vocab()
+            return
+
         vocab = self.tokenizer.get_vocab()
         missing_tokens = [token for token in self.special_tokens.keys() if token not in vocab]
 
         if missing_tokens:
             self.tokenizer.add_tokens(missing_tokens)
             self.added_tokens.update(missing_tokens)
-            print(f"已添加 {len(missing_tokens)} 个新token到词表")
+            if verbose:
+                print(f"已添加 {len(missing_tokens)} 个新token到词表")
 
+        # 标记这个tokenizer为已处理
+        SpecialTokensManager._processed_tokenizers.add(tokenizer_id)
         self._tokens_processed = True
         self._cached_vocab = self.tokenizer.get_vocab()
 

@@ -9,11 +9,17 @@ import time
 import argparse
 import os
 import json
+import warnings
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+
+# 过滤transformers的词汇扩展警告，避免重复输出
+warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*mean_resizing=False.*", category=UserWarning)
 
 from ..utils.special_tokens import SpecialTokensManager
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
@@ -183,11 +189,11 @@ class EditFlowManager:
 
         # 初始化特殊符号管理器并添加缺失的符号
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.args.max_dim)
-        special_tokens_manager.ensure_special_tokens()
+        special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
 
         if self.accelerator.is_local_main_process:
             print("初始化条件编码器...")
-        condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name).to(self.device)
+        condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name, verbose=self.accelerator.is_local_main_process).to(self.device)
 
         if self.accelerator.is_local_main_process:
             print("初始化EditFlow模型...")
@@ -197,7 +203,7 @@ class EditFlowManager:
             base_model_name=model_name,
             vocab_size=len(tokenizer.get_vocab()),
         )
-        model = EditFlowTransformer(config).to(self.device)
+        model = EditFlowTransformer(config, verbose=self.accelerator.is_local_main_process).to(self.device)
 
         # 创建优化器和损失函数
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
@@ -350,8 +356,9 @@ class EditFlowManager:
         num_batches = 0
         gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
 
-        # 显示进度条
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
+        # 显示进度条 - 只在主进程显示
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}",
+                          disable=not self.accelerator.is_local_main_process)
 
         # 处理模型配置
         config = model.module.config if hasattr(model, 'module') else model.config
@@ -359,7 +366,9 @@ class EditFlowManager:
         # 在epoch开始时清零梯度
         optimizer.zero_grad()
 
-        progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
+        # 只在主进程设置初始进度条显示
+        if self.accelerator.is_local_main_process:
+            progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
 
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
@@ -424,13 +433,14 @@ class EditFlowManager:
             total_loss += loss.item() * gradient_accumulation_steps
             num_batches += 1
 
-            postfix_dict = {
-                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
-                'gpu_load': get_gpu_memory_usage_string(max_gpus=3)
-            }
-
-            progress_bar.set_postfix(postfix_dict)
+            # 只在主进程更新进度条显示
+            if self.accelerator.is_local_main_process:
+                postfix_dict = {
+                    'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
+                    'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
+                    'gpu_load': get_gpu_memory_usage_string(max_gpus=3)
+                }
+                progress_bar.set_postfix(postfix_dict)
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()
@@ -662,7 +672,7 @@ class EditFlowManager:
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=actual_max_dim)
 
         # 确保所有需要的符号都在tokenizer中
-        special_tokens_manager.ensure_special_tokens()
+        special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
 
         if debug_mode and self.accelerator.is_local_main_process:
             print(f"调试模式: {'开启' if debug_mode else '关闭'}")

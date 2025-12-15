@@ -11,13 +11,14 @@ from transformers import AutoModel, AutoTokenizer
 # 在模块级别过滤transformers的词汇扩展警告
 warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*mean_resizing=False.*", category=UserWarning)
 
 
 
 class ConditionEncoder(nn.Module):
     """使用Hugging Face模型编码残差点集为条件向量"""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", verbose: bool = False):
         super().__init__()
 
         # 设置本地缓存目录
@@ -25,7 +26,8 @@ class ConditionEncoder(nn.Module):
         cache_dir = os.path.join(project_root, "models", "huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        print(f"加载模型: {model_name}")
+        if verbose:
+            print(f"加载模型: {model_name}")
 
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left', trust_remote_code=True)
