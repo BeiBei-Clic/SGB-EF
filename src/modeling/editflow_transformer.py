@@ -88,39 +88,28 @@ class EditFlowTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # 加载预训练的transformer模型
+        # 加载预训练模型
         if hasattr(config, 'base_model_name') and config.base_model_name:
-            # 设置缓存目录
             cache_dir = Path("models/huggingface_cache").resolve()
             os.makedirs(cache_dir, exist_ok=True)
 
-            print(f"正在加载基础模型: {config.base_model_name}")
-            print(f"模型缓存目录: {cache_dir}")
+            print(f"正在加载基础模型: {config.base_model_name} (缓存: {cache_dir})")
 
-            # 加载预训练模型，自动适应架构
-            self.base_model = AutoModel.from_pretrained(
-                config.base_model_name,
-                cache_dir=cache_dir,
-                trust_remote_code=True
-            )
-            print(f"✓ 基础模型加载完成: {type(self.base_model)}")
-            print(f"Base model class: {self.base_model.__class__}")
-
-            # 自动获取模型配置
+            self.base_model = AutoModel.from_pretrained(config.base_model_name, cache_dir=cache_dir, trust_remote_code=True)
             self.model_config = self.base_model.config
 
             config.hidden_dim = getattr(self.model_config, 'hidden_size')
             config.num_heads = getattr(self.model_config, 'num_attention_heads')
             config.num_layers = getattr(self.model_config, 'num_hidden_layers')
 
-            # 如果vocab_size大于原始词表大小，调整embedding层
             original_vocab_size = getattr(self.model_config, 'vocab_size', self.base_model.config.vocab_size)
             if hasattr(config, 'vocab_size') and config.vocab_size and config.vocab_size > original_vocab_size:
-                print(f"调整模型embedding层大小: {original_vocab_size} -> {config.vocab_size}")
+                print(f"调整模型embedding层: {original_vocab_size} -> {config.vocab_size}")
                 self.base_model.resize_token_embeddings(config.vocab_size)
         else:
             raise ValueError("必须指定base_model_name")
 
+        # 时间嵌入层
         self.time_embedding = nn.Sequential(
             SinusoidalTimeEmbedding(config.hidden_dim),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -128,85 +117,61 @@ class EditFlowTransformer(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim)
         )
 
-        # 条件处理
+        # 条件处理层
         self.condition_projection = nn.Linear(config.condition_dim, config.hidden_dim)
         if config.use_condition_injection:
             self.condition_injection = CrossAttentionConditionInjection(config.hidden_dim, config.num_heads)
 
-        # 输出头
-        self.rates_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, 3)
-        )
+        # 输出头 - 复用head创建逻辑
+        def create_output_head(output_dim):
+            return nn.Sequential(
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_dim, output_dim)
+            )
 
-        self.insert_logits_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.vocab_size)
-        )
+        self.rates_head = create_output_head(3)
+        self.insert_logits_head = create_output_head(config.vocab_size)
+        self.substitute_logits_head = create_output_head(config.vocab_size)
 
-        self.substitute_logits_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.vocab_size)
-        )
-
+        # 层归一化
         self.time_layer_norm = nn.LayerNorm(config.hidden_dim)
         self.condition_layer_norm = nn.LayerNorm(config.hidden_dim)
 
     def forward(self, input_ids, attention_mask=None, time_steps=None, condition=None):
         batch_size, seq_len = input_ids.shape
 
-        # 自动生成时间嵌入（如果没有提供）
+        # 默认时间步和条件
         if time_steps is None:
-            # 默认使用随机时间步或固定时间步
             time_steps = torch.rand(batch_size, 1, device=input_ids.device)
-
-        time_emb = self.time_embedding(time_steps)
-
-        # 自动生成条件嵌入（如果没有提供）
         if condition is None:
-            # 默认使用零条件
             condition = torch.zeros(batch_size, self.config.condition_dim, device=input_ids.device)
 
-        # 获取基础模型的输出
-        base_outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        hidden_states = base_outputs.last_hidden_state
+        # 基础模型前向传播
+        hidden_states = self.base_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
         # 添加时间嵌入
-        time_emb = time_emb.unsqueeze(1).expand(-1, seq_len, -1)
-        hidden_states = hidden_states + time_emb
-        hidden_states = self.time_layer_norm(hidden_states)
+        time_emb = self.time_embedding(time_steps).unsqueeze(1).expand(-1, seq_len, -1)
+        hidden_states = self.time_layer_norm(hidden_states + time_emb)
 
         # 条件注入
         condition_proj = self.condition_projection(condition)
         if self.config.use_condition_injection:
-            condition_injected = self.condition_injection(hidden_states, condition_proj)
-            hidden_states = hidden_states + condition_injected
-            hidden_states = self.condition_layer_norm(hidden_states)
+            hidden_states = self.condition_layer_norm(
+                hidden_states + self.condition_injection(hidden_states, condition_proj)
+            )
 
-        # 输出头
+        # 生成输出
         rates = F.softplus(self.rates_head(hidden_states))
         insert_logits = self.insert_logits_head(hidden_states)
         substitute_logits = self.substitute_logits_head(hidden_states)
 
         # 应用掩码
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1)
-            rates = rates * mask
-            # 使用一个很大的负数替代-inf，提高softmax的数值稳定性
             invalid_mask = ~attention_mask.bool().unsqueeze(-1)
             insert_logits = insert_logits.masked_fill(invalid_mask, -1e9)
             substitute_logits = substitute_logits.masked_fill(invalid_mask, -1e9)
+            rates = rates * attention_mask.unsqueeze(-1)
 
-        insert_probs = F.softmax(insert_logits, dim=-1)
-        substitute_probs = F.softmax(substitute_logits, dim=-1)
-
-        return rates, insert_probs, substitute_probs
+        return rates, F.softmax(insert_logits, dim=-1), F.softmax(substitute_logits, dim=-1)
