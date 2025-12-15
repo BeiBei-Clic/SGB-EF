@@ -21,12 +21,13 @@ def find_latest_checkpoint(args):
     return final_model if os.path.exists(final_model) else None
 
 
-def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer=None):
+def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer=None, verbose=True):
     """加载模型检查点"""
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         return None
 
-    print(f"Loading checkpoint: {checkpoint_path}")
+    if verbose:
+        print(f"Loading checkpoint: {checkpoint_path}")
 
     torch.serialization.add_safe_globals([EditFlowConfig, argparse.Namespace])
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -46,7 +47,8 @@ def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer
             model
         )
         model.load_state_dict(model_state)
-        print("✓ Model loaded")
+        if verbose:
+            print("✓ Model loaded")
 
     if 'condition_encoder_state_dict' in checkpoint:
         encoder_state = adjust_state_dict(
@@ -55,10 +57,12 @@ def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer
             condition_encoder
         )
         condition_encoder.load_state_dict(encoder_state)
-        print("✓ Condition encoder loaded")
+        if verbose:
+            print("✓ Condition encoder loaded")
 
     if optimizer and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print("✓ Optimizer loaded")
+        if verbose:
+            print("✓ Optimizer loaded")
 
     return checkpoint

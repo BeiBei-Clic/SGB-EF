@@ -1,5 +1,6 @@
 """
 EditFlow连续流训练器 - 实现基于连续时间流匹配的编辑流模型训练
+使用 Hugging Face Accelerate 进行分布式训练加速
 """
 
 import torch
@@ -11,6 +12,8 @@ import json
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 from ..utils.special_tokens import SpecialTokensManager
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
@@ -29,34 +32,57 @@ class EditFlowManager:
 
     def __init__(self, args):
         self.args = args
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.set_seed(args.seed)
 
-        # 多GPU设置
-        self.use_data_parallel = getattr(args, 'use_data_parallel', False) and torch.cuda.is_available()
-        if self.use_data_parallel:
-            self.gpu_count = torch.cuda.device_count()
-            self.device_ids = list(range(self.gpu_count))
-            print(f"多GPU模式: 使用 {self.gpu_count} 块GPU")
-        else:
-            self.gpu_count = 1
-            self.device_ids = [0] if torch.cuda.is_available() else None
+        # 初始化 Accelerate - 自动处理分布式训练设置
+        self.accelerator = Accelerator(
+            mixed_precision='fp16' if getattr(args, 'use_fp16', True) else 'no',
+            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
+            log_with=getattr(args, 'log_with', None)
+        )
+
+        # 设置随机种子
+        set_seed(args.seed)
+
+        # 设备信息
+        self.device = self.accelerator.device
+        if self.accelerator.is_local_main_process:
+            print("=== EditFlow符号回归预训练 (使用 Accelerate 加速) ===")
+            print(f"样本数: {getattr(self.args, 'num_samples', 'N/A')}")
+            print(f"最大维度: {getattr(self.args, 'max_dim', 'N/A')}")
+            print(f"表达式最大长度: {getattr(self.args, 'max_expr_length', 'N/A')}")
+            print(f"数据读取批次大小: {getattr(self.args, 'read_batch_size', 'N/A')}")
+            print(f"调试模式: {'开启' if getattr(self.args, 'debug', False) else '关闭'}")
+            print(f"批次大小: {getattr(self.args, 'batch_size', 'N/A')}")
+            print(f"训练轮数: {getattr(self.args, 'num_epochs', 'N/A')}")
+            print(f"学习率: {getattr(self.args, 'learning_rate', 'N/A')}")
+            print(f"测试集比例: {getattr(self.args, 'test_split', 'N/A')}")
+            print(f"评估频率: 每{getattr(self.args, 'eval_every', 'N/A')}轮")
+            print(f"基础模型: {getattr(self.args, 'base_model_name', 'N/A')}")
+            print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
+            print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
+            print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
+
+            print(f"\nAccelerate 初始化完成")
+            print(f"  设备: {self.device}")
+            print(f"  分布式训练: {self.accelerator.distributed_type}")
+            print(f"  进程数: {self.accelerator.num_processes}")
+            print(f"  混合精度: {self.accelerator.mixed_precision}")
+
+            # 显示GPU信息
+            from ..utils.gpu_monitor import display_gpu_info
+            display_gpu_info()
 
         # 时间调度器
         self.scheduler = KappaScheduler(scheduler_type='cubic')
 
     def set_seed(self, seed: int):
-        import random
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+        """设置随机种子 - 现在使用 Accelerate 的 set_seed"""
+        set_seed(seed)
 
     def prepare_data(self, tokenizer):
         """准备训练数据，优先从本地缓存文件加载，并划分训练集和测试集"""
-        print("准备连续流训练数据...")
+        if self.accelerator.is_local_main_process:
+            print("准备连续流训练数据...")
 
         # 数据文件路径
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
@@ -67,11 +93,12 @@ class EditFlowManager:
             max_dim=self.args.max_dim,
             n_points=self.args.n_points,
             max_depth=self.args.max_depth,
-            max_expr_length=self.args.max_expr_length
+            max_expr_length=self.args.max_expr_length,
+            verbose=self.accelerator.is_local_main_process
         )
 
         # 加载维度索引，如果不存在则扫描文件并保存索引
-        dimension_samples = load_dimension_index(cache_filename)
+        dimension_samples = load_dimension_index(cache_filename, verbose=self.accelerator.is_local_main_process)
 
         # 划分训练集和测试集
         test_split = getattr(self.args, 'test_split', 0.2)
@@ -109,17 +136,23 @@ class EditFlowManager:
                 num_workers=0, collate_fn=custom_collate_fn
             )
 
+            # 使用 Accelerate 准备 DataLoader
+            train_dataloader = self.accelerator.prepare(train_dataloader)
+            test_dataloader = self.accelerator.prepare(test_dataloader)
+
             train_dataloaders[dim] = train_dataloader
             test_dataloaders[dim] = test_dataloader
             train_datasets[dim] = train_dataset
             test_datasets[dim] = test_dataset
 
-            print(f"维度 {dim}: 训练样本 {len(train_positions)}, 测试样本 {len(test_positions)}")
+            if self.accelerator.is_local_main_process:
+                print(f"维度 {dim}: 训练样本 {len(train_positions)}, 测试样本 {len(test_positions)}")
 
-        print(f"数据划分完成:")
-        print(f"  训练集: {sum(len(dataset) for dataset in train_datasets.values())} 个样本")
-        print(f"  测试集: {sum(len(dataset) for dataset in test_datasets.values())} 个样本")
-        print(f"  分布在 {len(train_datasets)} 个维度组中")
+        if self.accelerator.is_local_main_process:
+            print(f"数据划分完成:")
+            print(f"  训练集: {sum(len(dataset) for dataset in train_datasets.values())} 个样本")
+            print(f"  测试集: {sum(len(dataset) for dataset in test_datasets.values())} 个样本")
+            print(f"  分布在 {len(train_datasets)} 个维度组中")
 
         return train_dataloaders, train_datasets, test_dataloaders, test_datasets
 
@@ -133,26 +166,31 @@ class EditFlowManager:
         Returns:
             model, condition_encoder, criterion, optimizer, tokenizer
         """
-        print("初始化tokenizer和模型...")
+        if self.accelerator.is_local_main_process:
+            print("初始化tokenizer和模型...")
 
         # 初始化tokenizer
         model_name = getattr(self.args, 'base_model_name', "google-bert/bert-base-uncased")
         cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        print(f"正在加载tokenizer: {model_name}")
-        print(f"模型缓存目录: {cache_dir}")
+        if self.accelerator.is_local_main_process:
+            print(f"正在加载tokenizer: {model_name}")
+            print(f"模型缓存目录: {cache_dir}")
         tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-        print(f"✓ Tokenizer加载完成，原始词表大小: {tokenizer.vocab_size}")
+        if self.accelerator.is_local_main_process:
+            print(f"✓ Tokenizer加载完成，原始词表大小: {tokenizer.vocab_size}")
 
         # 初始化特殊符号管理器并添加缺失的符号
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.args.max_dim)
         special_tokens_manager.ensure_special_tokens()
 
-        print("初始化条件编码器...")
+        if self.accelerator.is_local_main_process:
+            print("初始化条件编码器...")
         condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name).to(self.device)
 
-        print("初始化EditFlow模型...")
+        if self.accelerator.is_local_main_process:
+            print("初始化EditFlow模型...")
         config = EditFlowConfig(
             max_seq_len=self.args.max_expr_length,
             condition_dim=condition_encoder.output_dim,
@@ -170,20 +208,22 @@ class EditFlowManager:
         )
 
         # 如果提供了检查点路径，加载预训练模型
-        load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer)
+        load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer, verbose=self.accelerator.is_local_main_process)
 
-        # 使用DataParallel包装模型以支持多GPU
-        if self.use_data_parallel and self.gpu_count > 1:
-            print(f"使用DataParallel包装模型...")
-            model = torch.nn.DataParallel(model, device_ids=self.device_ids)
-            condition_encoder = torch.nn.DataParallel(condition_encoder, device_ids=self.device_ids)
+        # 使用 Accelerate 准备模型、优化器和数据加载器
+        if self.accelerator.is_local_main_process:
+            print(f"使用 Accelerate 准备模型和优化器...")
+            print(f"  进程数: {self.accelerator.num_processes}")
+            print(f"  设备: {self.accelerator.device}")
+            print(f"  混合精度: {self.accelerator.mixed_precision}")
 
-            # 多GPU设置优化
-            effective_batch_size = self.args.batch_size * self.gpu_count
-            print(f"有效批次大小: {effective_batch_size} (每个GPU: {self.args.batch_size})")
+        model, condition_encoder, optimizer = self.accelerator.prepare(
+            model, condition_encoder, optimizer
+        )
 
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"EditFlow模型参数数量: {total_params:,}")
+        if self.accelerator.is_local_main_process:
+            print(f"EditFlow模型参数数量: {total_params:,}")
 
         return model, condition_encoder, criterion, optimizer, tokenizer
 
@@ -218,7 +258,7 @@ class EditFlowManager:
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
         # 调试：检查概率分布（仅在debug模式且为第一个batch时）
-        if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
+        if debug_info and debug_info.get('is_first_batch', False) and debug_mode and self.accelerator.is_local_main_process:
             print(f"[DEBUG] {debug_info.get('context', '')} z0_probs 形状: {z0_probs.shape}")
             print(f"[DEBUG] {debug_info.get('context', '')} z1_probs 形状: {z1_probs.shape}")
             print(f"[DEBUG] {debug_info.get('context', '')} vocab_size: {config.vocab_size}")
@@ -288,7 +328,7 @@ class EditFlowManager:
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
 
         # 调试：打印u矩阵
-        if debug:
+        if debug and self.accelerator.is_local_main_process:
             print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
             print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
             print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
@@ -309,16 +349,17 @@ class EditFlowManager:
         total_loss = 0.0
         num_batches = 0
         gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
+
+        # 显示进度条
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}")
 
-        # 处理DataParallel包装的情况
+        # 处理模型配置
         config = model.module.config if hasattr(model, 'module') else model.config
 
         # 在epoch开始时清零梯度
         optimizer.zero_grad()
 
-        if self.use_data_parallel and self.gpu_count > 1:
-            progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
+        progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
 
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
@@ -328,7 +369,7 @@ class EditFlowManager:
 
             # 调试输出：解码z0和z1的token序列（仅在debug模式且第一个batch时）
             debug_mode = getattr(self.args, 'debug', False)
-            if batch_idx == 0 and debug_mode:  # 只在debug模式且第一个batch输出调试信息
+            if batch_idx == 0 and debug_mode and self.accelerator.is_local_main_process:
                 print(f"\n[DEBUG] 维度 {dimension} - 第一个batch的token解码信息:")
 
                 # 解码z0_token_ids
@@ -370,12 +411,13 @@ class EditFlowManager:
 
             grad_norm = 0.0
             if not torch.isnan(loss):
-                loss.backward()
+                # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
+                self.accelerator.backward(loss)
 
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
                     # 统一计算梯度范数并裁剪
                     all_params = list(model.parameters()) + list(condition_encoder.parameters())
-                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                    grad_norm = self.accelerator.clip_grad_norm_(all_params, 1.0)
                     optimizer.step()
                     optimizer.zero_grad()  # 在step后清零梯度，为下一次累积做准备
 
@@ -384,14 +426,26 @@ class EditFlowManager:
 
             postfix_dict = {
                 'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}'
+                'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
+                'gpu_load': get_gpu_memory_usage_string(max_gpus=3)
             }
-            if self.use_data_parallel and self.gpu_count > 1:
-                postfix_dict['gpu_load'] = get_gpu_memory_usage_string(max_gpus=3)
 
             progress_bar.set_postfix(postfix_dict)
 
-        return total_loss / num_batches, num_batches
+        # 等待所有进程完成
+        self.accelerator.wait_for_everyone()
+
+        # 收集平均损失（跨进程）
+        total_loss_tensor = torch.tensor(total_loss, device=self.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.device)
+
+        # 使用 Accelerate 收集所有进程的损失
+        gathered_losses = self.accelerator.gather(total_loss_tensor)
+        gathered_batches = self.accelerator.gather(num_batches_tensor)
+
+        avg_loss = gathered_losses.sum().item() / gathered_batches.sum().item()
+
+        return avg_loss, num_batches
 
     def evaluate(self, model, condition_encoder, criterion, test_dataloaders, test_datasets):
         """测试集评估"""
@@ -419,51 +473,73 @@ class EditFlowManager:
                         total_loss += loss.item()
                         num_batches += 1
 
-        return total_loss / num_batches if num_batches > 0 else float('inf')
+        # 等待所有进程完成
+        self.accelerator.wait_for_everyone()
 
-    
+        # 使用 Accelerate 收集所有进程的损失
+        total_loss_tensor = torch.tensor(total_loss, device=self.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.device)
+
+        gathered_losses = self.accelerator.gather(total_loss_tensor)
+        gathered_batches = self.accelerator.gather(num_batches_tensor)
+
+        avg_loss = gathered_losses.sum().item() / gathered_batches.sum().item() if gathered_batches.sum().item() > 0 else float('inf')
+
+        return avg_loss
+
+
     def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config, is_final=False):
+        # 等待所有进程同步
+        self.accelerator.wait_for_everyone()
+
         os.makedirs(self.args.save_dir, exist_ok=True)
         checkpoint_path = os.path.join(
             self.args.save_dir,
             "continuous_flow_final.pth" if is_final else f"editflow_epoch_{epoch+1}.pth"
         )
 
+        # 使用 unwrap_model 获取原始模型（未包装的）
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        unwrapped_encoder = self.accelerator.unwrap_model(condition_encoder)
+
         checkpoint_data = {
             'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'condition_encoder_state_dict': condition_encoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
+            'model_state_dict': unwrapped_model.state_dict(),
+            'condition_encoder_state_dict': unwrapped_encoder.state_dict(),
+            'optimizer_state_dict': self.accelerator.get_state_dict(optimizer),
             'loss': loss,
             'config': config,
             'args': self.args,
-            'use_data_parallel': self.use_data_parallel,
-            'gpu_count': self.gpu_count,
-            'model_was_dataparallel': hasattr(model, 'module'),
-            'encoder_was_dataparallel': hasattr(condition_encoder, 'module'),
-            'saved_with_dataparallel_setting': self.use_data_parallel and self.gpu_count > 1
+            'accelerate_config': {
+                'distributed_type': str(self.accelerator.distributed_type),
+                'num_processes': self.accelerator.num_processes,
+                'mixed_precision': str(self.accelerator.mixed_precision),
+            }
         }
 
         if is_final:
             checkpoint_data['scheduler_type'] = 'cubic'
 
-        torch.save(checkpoint_data, checkpoint_path)
+        # 使用 Accelerate 的 save 方法
+        self.accelerator.save(checkpoint_data, checkpoint_path)
+
         return checkpoint_path
 
     def train(self):
-        print(f"使用设备: {self.device}")
-
         # 检查检查点并加载模型
         checkpoint_path = find_latest_checkpoint(self.args)
-        print(f"{'找到检查点' if checkpoint_path else '未找到检查点，将从基础模型开始训练'}: {checkpoint_path or ''}")
+        if self.accelerator.is_local_main_process:
+            print(f"使用设备: {self.device}")
+            print(f"{'找到检查点' if checkpoint_path else '未找到检查点，将从基础模型开始训练'}: {checkpoint_path or ''}")
 
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
         train_dataloaders, train_datasets, test_dataloaders, test_datasets = self.prepare_data(tokenizer)
 
         model_params = sum(p.numel() for p in model.parameters())
         encoder_params = sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad)
-        print(f"模型参数数量: {model_params:,}, 条件编码器参数数量: {encoder_params:,}")
-        print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
+        if self.accelerator.is_local_main_process:
+            print(f"模型参数数量: {model_params:,}, 条件编码器参数数量: {encoder_params:,}")
+            print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
 
         config = model.module.config if hasattr(model, 'module') else model.config
         eval_every = getattr(self.args, 'eval_every', 5)
@@ -480,28 +556,33 @@ class EditFlowManager:
                 )
                 total_loss += dim_loss * dim_batches
                 total_batches += dim_batches
-                print(f"维度 {dim} 平均损失: {dim_loss:.4f}")
+                if self.accelerator.is_local_main_process:
+                    print(f"维度 {dim} 平均损失: {dim_loss:.4f}")
 
             avg_loss = total_loss / total_batches
-            print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
+            if self.accelerator.is_local_main_process:
+                print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
 
             # 测试集评估
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:
                 test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloaders, test_datasets)
-                print(f"测试集损失: {test_loss:.4f}")
+                if self.accelerator.is_local_main_process:
+                    print(f"测试集损失: {test_loss:.4f}")
 
             # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
                 checkpoint_path = self.save_checkpoint(
                     model, condition_encoder, optimizer, avg_loss, epoch, config
                 )
-                print(f"检查点已保存到: {checkpoint_path}")
+                if self.accelerator.is_local_main_process:
+                    print(f"检查点已保存到: {checkpoint_path}")
 
         # 保存最终模型
         final_path = self.save_checkpoint(
             model, condition_encoder, optimizer, avg_loss, self.args.num_epochs - 1, config, is_final=True
         )
-        print(f"最终模型已保存到: {final_path}")
+        if self.accelerator.is_local_main_process:
+            print(f"最终模型已保存到: {final_path}")
         return model, condition_encoder
 
     def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None, max_expr_length=None):
@@ -516,15 +597,17 @@ class EditFlowManager:
             input_dim: 输入维度，如果为None则自动推断
             max_expr_length: 表达式最大token长度，如果为None则使用args中的值
         """
-        print("开始符号回归推理...")
-        print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
+        if self.accelerator.is_local_main_process:
+            print("开始符号回归推理...")
+            print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
 
         # 加载模型
         checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
-        if checkpoint_path:
-            print(f"使用检查点: {checkpoint_path}")
-        else:
-            print("未找到检查点，将使用基础模型进行推理")
+        if self.accelerator.is_local_main_process:
+            if checkpoint_path:
+                print(f"使用检查点: {checkpoint_path}")
+            else:
+                print("未找到检查点，将使用基础模型进行推理")
 
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
@@ -556,7 +639,8 @@ class EditFlowManager:
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
         if not success:
-            print(f"警告：无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差")
+            if self.accelerator.is_local_main_process:
+                print(f"警告：无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差")
             residuals = y_values
         else:
             # 计算残差：真实值 - 预测值
@@ -580,7 +664,7 @@ class EditFlowManager:
         # 确保所有需要的符号都在tokenizer中
         special_tokens_manager.ensure_special_tokens()
 
-        if debug_mode:
+        if debug_mode and self.accelerator.is_local_main_process:
             print(f"调试模式: {'开启' if debug_mode else '关闭'}")
             print(f"推理步数: {n_steps}")
             print(f"输入数据形状: x_values={x_values.shape}, y_values={y_values.shape}")
@@ -588,10 +672,10 @@ class EditFlowManager:
             print(f"初始表达式: {','.join(current_tokens)}")
 
         for step in range(n_steps):
-            if not debug_mode:
+            if not debug_mode and self.accelerator.is_local_main_process:
                 print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
 
-            if debug_mode:
+            if debug_mode and self.accelerator.is_local_main_process:
                 print(f"\n[DEBUG] === 推理步骤 {step + 1}/{n_steps} ===")
                 print(f"[DEBUG] 当前表达式: {','.join(current_tokens) if current_tokens else '<空白>'}")
 
@@ -600,7 +684,7 @@ class EditFlowManager:
             max_len = getattr(self.args, 'max_expr_length', 128)
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
-                if debug_mode:
+                if debug_mode and self.accelerator.is_local_main_process:
                     print(f"[DEBUG] 表达式过长，截断至 {max_len-1} 个token")
 
             # 使用统一的特殊token管理
@@ -616,7 +700,7 @@ class EditFlowManager:
 
             t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
 
-            if debug_mode:
+            if debug_mode and self.accelerator.is_local_main_process:
                 print(f"[DEBUG] 时间步t: {t[0,0]:.4f}")
                 print(f"[DEBUG] tokenized_expr长度: {len(tokenized_expr)}")
                 print(f"[DEBUG] 有效token数量: {attention_mask[0].sum().item()}")
@@ -634,7 +718,7 @@ class EditFlowManager:
                 base_length = int(attention_mask[0].sum().item())
                 effective_length = max(base_length, min(10, input_ids.size(1)))
 
-                if debug_mode:
+                if debug_mode and self.accelerator.is_local_main_process:
                     print(f"[DEBUG] 操作强度形状: lambda_ins={lambda_ins.shape}, lambda_sub={lambda_sub.shape}, lambda_del={lambda_del.shape}")
                     print(f"[DEBUG] 基础长度: {base_length}, 有效长度: {effective_length}")
 
@@ -662,60 +746,60 @@ class EditFlowManager:
                         best_score = lambda_del[pos]
                         best_action = ('delete', current_token_idx)
 
-                if debug_mode:
+                if debug_mode and self.accelerator.is_local_main_process:
                     print(f"[DEBUG] 最佳操作: {best_action}, 分数: {best_score:.4f}")
 
                 if best_action and best_score > 0.01:
                     action_type, pos = best_action
 
-                    if debug_mode:
+                    if debug_mode and self.accelerator.is_local_main_process:
                         print(f"[DEBUG] 执行操作: {action_type.upper()} 位置{pos}")
 
                     if action_type == 'insert':
                         best_token = torch.argmax(insert_probs[0, pos]).item()
-                        if debug_mode:
+                        if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 选择插入的token ID: {best_token}")
 
                         # 直接使用tokenizer转换token ID为token名称
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
                         current_tokens.insert(pos, best_token_name)
-                        if debug_mode:
+                        if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 成功插入token: '{best_token_name}'")
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
-                        if debug_mode:
+                        if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 选择替换的token ID: {best_token}")
                             print(f"[DEBUG] 替换前: '{current_tokens[pos]}'")
 
                         # 直接使用tokenizer转换token ID为token名称
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
                         current_tokens[pos] = best_token_name
-                        if debug_mode:
+                        if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 成功替换为: '{best_token_name}'")
 
                     elif action_type == 'delete' and pos < len(current_tokens):
                         deleted_token = current_tokens[pos]
                         del current_tokens[pos]
-                        if debug_mode:
+                        if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 删除token: '{deleted_token}'")
                 else:
-                    if debug_mode:
+                    if debug_mode and self.accelerator.is_local_main_process:
                         print(f"[DEBUG] 未找到有效操作 (最高分数: {best_score:.4f} <= 0.01)")
 
             if len(current_tokens) > 50:
                 old_len = len(current_tokens)
                 current_tokens = current_tokens[:50]
-                if debug_mode:
+                if debug_mode and self.accelerator.is_local_main_process:
                     print(f"[DEBUG] 表达式过长，从{old_len}截断至50个token")
 
         # 返回最终的表达式
         final_expression = ','.join(current_tokens) if current_tokens else ""
-        if debug_mode:
+        if debug_mode and self.accelerator.is_local_main_process:
             print(f"\n[DEBUG] 推理完成！")
             print(f"[DEBUG] 最终表达式: {final_expression}")
             print(f"[DEBUG] 最终表达式长度: {len(current_tokens)}")
-        else:
+        elif self.accelerator.is_local_main_process:
             print(f"最终表达式: {final_expression}")
 
         return final_expression

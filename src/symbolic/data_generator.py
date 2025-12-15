@@ -75,12 +75,13 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
         "exp_cur1": str(curr_expr)
     }
 
-def load_dimension_index(filename: str) -> Dict[int, List[int]]:
+def load_dimension_index(filename: str, verbose: bool = True) -> Dict[int, List[int]]:
     """加载维度索引文件，如果不存在则扫描数据文件并保存索引"""
     index_filename = filename.replace('.txt', '_dimension_index.json')
 
     if os.path.exists(index_filename):
-        print(f"发现维度索引文件 {index_filename}，正在加载...")
+        if verbose:
+            print(f"发现维度索引文件 {index_filename}，正在加载...")
         with open(index_filename, 'r', encoding='utf-8') as f:
             index_data = json.load(f)
 
@@ -89,11 +90,13 @@ def load_dimension_index(filename: str) -> Dict[int, List[int]]:
         for dim_str, positions in index_data.items():
             dimension_samples[int(dim_str)] = positions
 
-        print(f"维度索引加载完成，共发现 {len(dimension_samples)} 个维度")
+        if verbose:
+            print(f"维度索引加载完成，共发现 {len(dimension_samples)} 个维度")
         return dimension_samples
 
     # 维度索引不存在，需要扫描文件
-    print(f"维度索引不存在，正在扫描文件进行维度统计...")
+    if verbose:
+        print(f"维度索引不存在，正在扫描文件进行维度统计...")
     dimension_samples = {}  # 存储每个维度的样本位置索引
 
     with open(filename, 'r', encoding='utf-8') as f:
@@ -110,7 +113,8 @@ def load_dimension_index(filename: str) -> Dict[int, List[int]]:
                     dimension_samples[dim] = []
                 dimension_samples[dim].append(pos)
 
-    print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
+    if verbose:
+        print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
 
     # 保存维度索引到缓存文件
     os.makedirs(os.path.dirname(index_filename), exist_ok=True)
@@ -122,7 +126,7 @@ def load_dimension_index(filename: str) -> Dict[int, List[int]]:
 
     return dimension_samples
 
-def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, max_expr_length: int = 24, batch_size: int = 50000):
+def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 100, max_depth: int = 4, max_expr_length: int = 24, batch_size: int = 50000, verbose: bool = True):
     """生成用于EditFlow连续流训练的数据文件，支持断点续传
 
     Args:
@@ -151,33 +155,38 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
     # 1. 主文件存在且无批次文件 → 数据完整
     if os.path.exists(filename) and not any(os.path.exists(f) for f in batch_filenames):
-        print(f"发现完整数据文件 {filename}")
+        if verbose:
+            print(f"发现完整数据文件 {filename}")
         return
 
     # 1.5. 主文件存在且有批次文件 → 直接进入合并阶段（跳过生成）
     if os.path.exists(filename) and any(os.path.exists(f) for f in batch_filenames):
-        print(f"发现主文件和批次文件，直接进入合并阶段...")
-        print(f"将追加剩余批次文件到主文件...")
+        if verbose:
+            print(f"发现主文件和批次文件，直接进入合并阶段...")
+            print(f"将追加剩余批次文件到主文件...")
         merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count=None)
         return
 
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
-    print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
+    if verbose:
+        print(f"分批生成 {num_samples} 个连续流训练样本，每批 {batch_size} 个...")
 
     # 检查已完成的批次
     completed_batches = [i for i, bf in enumerate(batch_filenames) if os.path.exists(bf)]
 
     if completed_batches:
-        print(f"发现已完成 {len(completed_batches)} 个批次，将从第 {len(completed_batches) + 1} 批开始继续生成...")
+        if verbose:
+            print(f"发现已完成 {len(completed_batches)} 个批次，将从第 {len(completed_batches) + 1} 批开始继续生成...")
 
     # 按批次顺序生成
     for batch_idx in range(len(completed_batches), num_batches):
         current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
         batch_start_time = time.time()
 
-        print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
+        if verbose:
+                print(f"\n生成第 {batch_idx + 1}/{num_batches} 批数据 ({current_batch_size} 个样本)...")
 
         batch_samples, dimension_count, sample_count = [], {}, 0
         pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
@@ -351,7 +360,8 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
 
         # 立即保存当前批次
         batch_filename = batch_filenames[batch_idx]
-        print(f"保存数据到 {batch_filename}...")
+        if verbose:
+            print(f"保存数据到 {batch_filename}...")
         os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
         with open(batch_filename, 'w', encoding='utf-8') as f:
             for sample in batch_samples:

@@ -1,6 +1,7 @@
 """
 EditFlow连续流符号回归预训练主脚本
 实现基于多步连续流匹配的编辑流模型训练
+使用 Hugging Face Accelerate 进行分布式训练加速
 """
 
 import argparse
@@ -55,30 +56,12 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--save_every", type=int, default=10, help="每多少轮保存一次")
 
-    # 多GPU参数
-    parser.add_argument("--use_data_parallel", action="store_true", default=True, help="是否使用多GPU并行训练")
+    # 多GPU参数 - 现在由 Accelerate 自动管理
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
+    parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
 
     args = parser.parse_args()
-
-    print("=== EditFlow符号回归预训练 ===")
-    print(f"样本数: {args.num_samples}")
-    print(f"最大维度: {args.max_dim}")
-    print(f"表达式最大长度: {args.max_expr_length}")
-    print(f"数据读取批次大小: {args.read_batch_size}")
-    print(f"调试模式: {'开启' if args.debug else '关闭'}")
-    print(f"批次大小: {args.batch_size}")
-    print(f"训练轮数: {args.num_epochs}")
-    print(f"学习率: {args.learning_rate}")
-    print(f"测试集比例: {args.test_split}")
-    print(f"评估频率: 每{args.eval_every}轮")
-    print(f"基础模型: {args.base_model_name}")
-    print(f"条件嵌入模型: {args.condition_model_name}")
-    print(f"多GPU并行: {args.use_data_parallel}")
-    print(f"梯度累积步数: {args.gradient_accumulation_steps}")
-
-    # 显示GPU信息
-    display_gpu_info()
 
     # 设置随机种子
     set_seed(args.seed)
@@ -87,7 +70,9 @@ def main():
     manager = EditFlowManager(args)
     model, condition_encoder = manager.train()
 
-    print("\nEditFlow训练完成!")
+    # 只有在主进程才打印完成信息
+    if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
+        print("\nEditFlow训练完成!")
 
 
 if __name__ == "__main__":

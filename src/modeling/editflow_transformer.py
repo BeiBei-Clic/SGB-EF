@@ -104,6 +104,10 @@ class EditFlowTransformer(nn.Module):
             if hasattr(config, 'vocab_size') and config.vocab_size and config.vocab_size > original_vocab_size:
                 print(f"调整模型embedding层: {original_vocab_size} -> {config.vocab_size}")
                 self.base_model.resize_token_embeddings(config.vocab_size)
+            # 禁用不需要的 pooler 层梯度（避免分布式训练错误）
+            if hasattr(self.base_model, 'pooler'):
+                for param in self.base_model.pooler.parameters():
+                    param.requires_grad = False
         else:
             raise ValueError("必须指定base_model_name")
 
@@ -168,8 +172,9 @@ class EditFlowTransformer(nn.Module):
         # 应用掩码
         if attention_mask is not None:
             invalid_mask = ~attention_mask.bool().unsqueeze(-1)
-            insert_logits = insert_logits.masked_fill(invalid_mask, -1e9)
-            substitute_logits = substitute_logits.masked_fill(invalid_mask, -1e9)
+            # 使用 FP16 兼容的负无穷值（-1e4 远大于 FP16 最小值 -65504）
+            insert_logits = insert_logits.masked_fill(invalid_mask, -1e4)
+            substitute_logits = substitute_logits.masked_fill(invalid_mask, -1e4)
             rates = rates * attention_mask.unsqueeze(-1)
 
         return rates, F.softmax(insert_logits, dim=-1), F.softmax(substitute_logits, dim=-1)

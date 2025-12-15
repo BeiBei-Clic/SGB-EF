@@ -18,7 +18,8 @@ def main():
         'base_model_name': "google-bert/bert-base-uncased",
         'condition_model_name': "nomic-ai/nomic-embed-text-v1.5",  # 条件嵌入模型名称
         'cache_dir': "models/huggingface_cache",  # 模型缓存目录
-        'use_data_parallel': False,
+        'use_fp16': False,  # 推理时关闭混合精度
+        'gradient_accumulation_steps': 1,  # 推理时不需要梯度累积
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 10,  # 添加最大维度参数，确保覆盖变量范围
