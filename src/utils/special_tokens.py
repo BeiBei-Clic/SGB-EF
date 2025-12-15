@@ -94,10 +94,6 @@ class SpecialTokensManager:
 
         return token_ids
 
-    def is_special_token(self, token: str) -> bool:
-        """检查token是否为特殊token"""
-        return token in self.special_tokens
-
     def setup_tokenizer_special_tokens(self):
         """
         设置分词器的特殊token属性
