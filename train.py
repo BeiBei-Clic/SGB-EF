@@ -7,17 +7,10 @@ EditFlow连续流符号回归预训练主脚本
 import argparse
 import os
 import random
-import warnings
 import numpy as np
 import torch
 
-# 强制过滤transformers的词汇扩展警告，在所有模块导入之前设置
-warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*mean_resizing=False.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*vocab expansion.*", category=UserWarning)
-
-# 设置环境变量来抑制transformers的警告输出
+# 设置环境变量来抑制transformers的警告输出 - 这是最有效的方法
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 

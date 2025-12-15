@@ -9,17 +9,11 @@ import time
 import argparse
 import os
 import json
-import warnings
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-
-# 过滤transformers的词汇扩展警告，避免重复输出
-warnings.filterwarnings("ignore", message=".*mean_resizing.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*multivariate normal distribution.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*mean_resizing=False.*", category=UserWarning)
 
 from ..utils.special_tokens import SpecialTokensManager
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
