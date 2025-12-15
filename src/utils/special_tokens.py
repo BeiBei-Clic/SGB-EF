@@ -157,7 +157,3 @@ class SpecialTokensManager:
 
         vocab = self._get_cached_vocab()
         return {func: vocab[func] for func in self.FUNCTIONS if func in vocab}
-
-    def get_current_vocab_size(self) -> int:
-        """获取当前词表大小"""
-        return len(self.tokenizer.get_vocab())

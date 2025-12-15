@@ -197,7 +197,7 @@ class FlowDataset(torch.utils.data.Dataset):
         # 设置分词器的特殊token属性
         self.special_tokens_manager.setup_tokenizer_special_tokens()
 
-        self.vocab_size = self.special_tokens_manager.get_current_vocab_size()
+        self.vocab_size = len(self.special_tokens_manager.tokenizer.get_vocab())
         self.pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
         self.bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
         self.gap_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
