@@ -17,12 +17,12 @@ BINARY_OPS = ['add', 'sub', 'mul', 'div', 'pow']
 
 def timed_simplify(expr: sp.Expr, max_time: float = 1) -> sp.Expr:
     """带时间限制的化简函数"""
-    start_time = time.time()
+    deadline = time.time() + max_time
     simplified = expr
 
-    if time.time() - start_time < max_time:
+    if time.time() < deadline:
         simplified = sp.together(simplified)
-    if time.time() - start_time < max_time:
+    if time.time() < deadline:
         simplified = sp.radsimp(simplified)
 
     return simplified
@@ -43,15 +43,15 @@ def expr_to_tree(expr: sp.Expr) -> str:
     args = expr.args
 
     if 'add' in func_name:
-        return f'add,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) > 1 else "0"}'
+        return f'add,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "0"}'
     elif 'sub' in func_name:
-        return f'sub,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) > 1 else "0"}'
+        return f'sub,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "0"}'
     elif 'mul' in func_name:
-        return f'mul,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) > 1 else "1"}'
+        return f'mul,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
     elif 'div' in func_name or 'truediv' in func_name:
-        return f'div,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) > 1 else "1"}'
+        return f'div,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
     elif 'pow' in func_name:
-        return f'pow,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) > 1 else "1"}'
+        return f'pow,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
     elif 'sin' in func_name:
         return f'sin,{expr_to_tree(args[0])}'
     elif 'cos' in func_name:
@@ -72,12 +72,12 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
     """生成随机表达式 - 增加超时保护和详细日志"""
-    start_time = time.time()
+    deadline = time.time() + 1.5
     symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
 
     def generate_expr(depth: int) -> sp.Expr:
         # 超时检查
-        if time.time() - start_time > 1.5:
+        if time.time() > deadline:
             raise TimeoutError("表达式生成超时")
 
         if depth >= max_depth:
@@ -170,39 +170,21 @@ def reduce_expression(expr: sp.Expr) -> sp.Expr:
 
     # 处理一元操作
     if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
-        if len(args) >= 1:
-            # 一元操作删减：直接返回操作数
-            return args[0]
-        else:
-            return sp.Integer(1)
+        # 一元操作删减：直接返回操作数
+        return args[0] if args else sp.Integer(1)
 
     # 处理二元操作
-    elif 'add' in func_name or 'sub' in func_name:
-        if len(args) >= 2:
-            # 加减法删减：随机选择其中一个操作数
-            return random.choice(args)
-        else:
-            return args[0] if args else sp.Integer(0)
+    default_map = {
+        'add': 0, 'sub': 0,
+        'mul': 1, 'div': 1, 'truediv': 1, 'pow': 1
+    }
 
-    elif 'mul' in func_name or 'div' in func_name or 'truediv' in func_name:
-        if len(args) >= 2:
-            # 乘除法删减：随机选择其中一个操作数
-            return random.choice(args)
-        else:
-            return args[0] if args else sp.Integer(1)
-
-    elif 'pow' in func_name:
-        if len(args) >= 2:
-            # 幂运算删减：随机选择底数或指数
-            return random.choice(args)
-        else:
-            return args[0] if args else sp.Integer(1)
+    for op_key, default in default_map.items():
+        if op_key in func_name:
+            return random.choice(args) if len(args) >= 2 else (args[0] if args else sp.Integer(default))
 
     # 其他情况：随机选择一个参数
-    elif args:
-        return random.choice(args)
-    else:
-        return sp.Integer(1)
+    return random.choice(args) if args else sp.Integer(1)
 
 
 def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:

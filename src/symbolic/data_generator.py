@@ -15,10 +15,9 @@ import threading
 from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
-    log_sample_step, log_sample_success, log_sample_stuck,
-    log_expression_generation, log_expression_eval, log_retry_attempt,
-    log_batch_progress, log_reduction_sequence, log_data_generation_stats,
-    log_timeout_occurred, log_detailed_error
+    _write_log, log_sample_step,
+    log_expression_eval,
+    log_batch_progress
 )
 from src.symbolic.symbolic_utils import (
     expr_to_tree, generate_random_expr,
@@ -63,7 +62,7 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     log_sample_step(sample_id, "生成当前表达式(破坏)")
     curr_expr = corrupt_expression(target_expr, 0.5)
 
-    log_sample_success(sample_id)
+    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SUCCESS")
 
     return {
         "input_dimension": input_dimension,
@@ -189,7 +188,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
         while sample_count < current_batch_size:
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
             sample_start_time = time.time()
-            steps = []
 
             try:
                 if time.time() - sample_start_time > SAMPLE_TIMEOUT:  # 样本生成超时检查
@@ -208,7 +206,6 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
                 x_values = [list(point) for point in x_values_raw]
                 x_array = np.array(x_values)
-                log_data_generation_stats(sample_id, n_points, dim, (-5.0, 5.0))
 
                 # 生成目标表达式，添加超时保护和重试机制
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
@@ -222,21 +219,20 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         expr_str = str(target_expr)
                         retry_time = (time.time() - retry_start) * 1000
 
-                        steps.append(f"目标表达式: {expr_str}")
-                        log_expression_generation(sample_id, expr_str, max_depth, extra_info=f"retry={retry_count+1} | time={retry_time:.1f}ms")
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EXPR_GEN '{expr_str}' len={len(expr_str)}" + (f" | retry={retry_count+1} | time={retry_time:.1f}ms" if f"retry={retry_count+1} | time={retry_time:.1f}ms" else ""))
                         break
                     except TimeoutError as te:
                         retry_time = time.time() - retry_start
-                        log_timeout_occurred(sample_id, "generate_random_expr", 2.0, extra_info=f"dim={dim}, attempt={retry_count+1}, duration={retry_time:.1f}s")
-                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, "timeout", extra_info=f"dim={dim}")
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] TIMEOUT generate_random_expr >2.0s | dim={dim}, attempt={retry_count+1}, duration={retry_time:.1f}s")
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY {retry_count + 1}/{MAX_RETRIES} timeout dim={dim}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
-                            log_detailed_error(sample_id, "generate_random_expr_timeout", te, f"all {MAX_RETRIES} attempts timed out")
+                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_timeout: {type(te).__name__}: {te}")
                     except Exception as expr_error:
-                        log_retry_attempt(sample_id, retry_count + 1, MAX_RETRIES, f"error: {str(expr_error)[:30]}")
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY {retry_count + 1}/{MAX_RETRIES} error: {str(expr_error)[:30]}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
-                            log_detailed_error(sample_id, "generate_random_expr_failed", expr_error, f"all {MAX_RETRIES} attempts failed")
+                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_failed: {type(expr_error).__name__}: {expr_error}")
 
                 if target_expr is None:
                     sample_count += 1
@@ -274,8 +270,7 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                 # 生成删减序列
                 log_sample_step(sample_id, "生成删减序列")
                 reduction_sequence = generate_reduction_sequence(target_expr)
-                steps.append(f"删减序列长度: {len(reduction_sequence)}")
-                log_reduction_sequence(sample_id, expr_str, reduction_sequence, str(reduction_sequence[-1]) if reduction_sequence else "")
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] REDUCE {len(reduction_sequence)} steps")
 
                 # 为删减序列中的每个表达式创建样本
                 for i, reduced_expr in enumerate(reduction_sequence):
@@ -301,8 +296,10 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         continue
 
                     # 转换为token序列
-                    target_tokens = expr_to_tree(target_expr).split(',')
-                    curr_tokens = expr_to_tree(curr_expr).split(',')
+                    target_tree = expr_to_tree(target_expr)
+                    curr_tree = expr_to_tree(curr_expr)
+                    target_tokens = target_tree.split(',')
+                    curr_tokens = curr_tree.split(',')
 
                     # 对齐到Z空间，包含gap token
                     z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
@@ -313,9 +310,9 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                         "y_target": y_target.tolist(),
                         "y_curr": y_curr.tolist(),
                         "residuals": (y_target - y_curr).tolist(),
-                        "tree_gt": expr_to_tree(target_expr),
+                        "tree_gt": target_tree,
                         "exp_gt": str(target_expr),
-                        "tree_cur1": expr_to_tree(curr_expr),
+                        "tree_cur1": curr_tree,
                         "exp_cur1": str(curr_expr),
                         "curr_tokens": curr_tokens,
                         "target_tokens": target_tokens,
@@ -326,13 +323,13 @@ def generate_flow_samples(num_samples: int, max_dim: int = 5, n_points: int = 10
                     sample_count += 1
                     pbar.update(1)
 
-                log_sample_success(sample_id)
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SUCCESS")
 
             except Exception as e:
                 duration = time.time() - sample_start_time
-                steps.append(f"错误: {str(e)}")
-                log_detailed_error(sample_id, "sample_generation", e, f"duration={duration:.2f}s, steps={len(steps)}")
-                log_sample_stuck(sample_id, duration, steps)
+                steps = [f"错误: {str(e)}"]
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR sample_generation: {type(e).__name__}: {e}")
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] STUCK {duration:.1f}s steps={len(steps)}")
                 print(f"警告: 生成样本时出错，跳过该样本: {e}")
                 continue
 
