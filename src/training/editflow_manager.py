@@ -80,7 +80,7 @@ class EditFlowManager:
         set_seed(seed)
 
     def prepare_data(self, tokenizer):
-        """准备训练数据，优先从本地缓存文件加载，并划分训练集和测试集"""
+        """准备训练数据，合并所有维度的数据"""
         if self.accelerator.is_local_main_process:
             print("准备连续流训练数据...")
 
@@ -97,64 +97,69 @@ class EditFlowManager:
             verbose=self.accelerator.is_local_main_process
         )
 
-        # 加载维度索引，如果不存在则扫描文件并保存索引
+        # 等待数据生成完成
+        self.accelerator.wait_for_everyone()
+
         dimension_samples = load_dimension_index(cache_filename, verbose=self.accelerator.is_local_main_process)
 
-        # 划分训练集和测试集
+        # === 修改开始：合并所有维度的位置索引 ===
+        all_train_positions = []
+        all_test_positions = []
         test_split = getattr(self.args, 'test_split', 0.2)
-        train_dataloaders = {}
-        test_dataloaders = {}
-        train_datasets = {}
-        test_datasets = {}
 
-        for dim, all_positions in dimension_samples.items():
-            # 打乱样本位置索引
-            np.random.shuffle(all_positions)
+        for dim, positions in dimension_samples.items():
+            # 这里的 shuffle 配合 set_seed 保证所有进程打乱顺序一致
+            np.random.shuffle(positions)
+            split_idx = int(len(positions) * (1 - test_split))
 
-            # 计算划分点
-            split_idx = int(len(all_positions) * (1 - test_split))
-            train_positions = all_positions[:split_idx]
-            test_positions = all_positions[split_idx:]
+            all_train_positions.extend(positions[:split_idx])
+            all_test_positions.extend(positions[split_idx:])
 
-            # 创建基于位置的文件数据集
-            train_dataset = FlowDataset(
-                train_positions, cache_filename, tokenizer,
-                max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
-            )
-            test_dataset = FlowDataset(
-                test_positions, cache_filename, tokenizer,
-                max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
-            )
+        # 再次整体打乱，让不同维度的样本混合，有助于模型泛化
+        np.random.shuffle(all_train_positions)
+        np.random.shuffle(all_test_positions)
 
-            # 创建DataLoader
-            train_dataloader = torch.utils.data.DataLoader(
-                train_dataset, batch_size=self.args.batch_size, shuffle=True,
-                num_workers=0, collate_fn=custom_collate_fn
-            )
-            test_dataloader = torch.utils.data.DataLoader(
-                test_dataset, batch_size=self.args.batch_size, shuffle=False,
-                num_workers=0, collate_fn=custom_collate_fn
-            )
+        # 创建单一的训练和测试数据集
+        train_dataset = FlowDataset(
+            all_train_positions, cache_filename, tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
+        )
+        test_dataset = FlowDataset(
+            all_test_positions, cache_filename, tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
+        )
 
-            # 使用 Accelerate 准备 DataLoader
-            train_dataloader = self.accelerator.prepare(train_dataloader)
-            test_dataloader = self.accelerator.prepare(test_dataloader)
+        # 关键参数：num_workers 和 drop_last
+        # num_workers > 0 可以防止IO阻塞导致的GPU等待
+        # drop_last=True 保证每个进程的 batch 数量严格一致，防止 DDP 卡死
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=4,  # 恢复多进程数据加载
+            collate_fn=custom_collate_fn,
+            drop_last=True, # 防止尾部batch不齐导致的死锁
+            pin_memory=True
+        )
 
-            train_dataloaders[dim] = train_dataloader
-            test_dataloaders[dim] = test_dataloader
-            train_datasets[dim] = train_dataset
-            test_datasets[dim] = test_dataset
+        test_dataloader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=custom_collate_fn,
+            drop_last=False # 测试集通常不需要 drop_last，除非 evaluate 也有同步逻辑
+        )
 
-            if self.accelerator.is_local_main_process:
-                print(f"维度 {dim}: 训练样本 {len(train_positions)}, 测试样本 {len(test_positions)}")
+        # 使用 Accelerate 准备
+        train_dataloader, test_dataloader = self.accelerator.prepare(
+            train_dataloader, test_dataloader
+        )
 
         if self.accelerator.is_local_main_process:
-            print(f"数据划分完成:")
-            print(f"  训练集: {sum(len(dataset) for dataset in train_datasets.values())} 个样本")
-            print(f"  测试集: {sum(len(dataset) for dataset in test_datasets.values())} 个样本")
-            print(f"  分布在 {len(train_datasets)} 个维度组中")
+            print(f"数据准备完成: 训练集 {len(all_train_positions)} 样本, 测试集 {len(all_test_positions)} 样本")
 
-        return train_dataloaders, train_datasets, test_dataloaders, test_datasets
+        return train_dataloader, train_dataset, test_dataloader, test_dataset
 
     def setup_models(self, checkpoint_path=None):
         """
@@ -220,6 +225,12 @@ class EditFlowManager:
         model, condition_encoder, optimizer = self.accelerator.prepare(
             model, condition_encoder, optimizer
         )
+
+        # 如果有checkpoint，使用Accelerate的load_state方法加载完整状态
+        if checkpoint_path:
+            if self.accelerator.is_local_main_process:
+                print(f"Loading complete training state from {checkpoint_path}")
+            self.accelerator.load_state(checkpoint_path)
 
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if self.accelerator.is_local_main_process:
@@ -367,6 +378,7 @@ class EditFlowManager:
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
             residuals = batch['residuals'].to(self.device)
+            dim_mask = batch['dim_mask'].to(self.device)
             z0_token_ids = batch['z0_token_ids'].to(self.device)
             z1_token_ids = batch['z1_token_ids'].to(self.device)
 
@@ -447,11 +459,12 @@ class EditFlowManager:
         gathered_losses = self.accelerator.gather(total_loss_tensor)
         gathered_batches = self.accelerator.gather(num_batches_tensor)
 
-        avg_loss = gathered_losses.sum().item() / gathered_batches.sum().item()
+        total_batches = gathered_batches.sum().item()
+        avg_loss = gathered_losses.sum().item() / total_batches if total_batches > 0 else 0.0
 
         return avg_loss, num_batches
 
-    def evaluate(self, model, condition_encoder, criterion, test_dataloaders, test_datasets):
+    def evaluate(self, model, condition_encoder, criterion, test_dataloader, test_dataset):
         """测试集评估"""
         model.eval()
         condition_encoder.eval()
@@ -461,21 +474,21 @@ class EditFlowManager:
         config = model.module.config if hasattr(model, 'module') else model.config
 
         with torch.no_grad():
-            for dim, dataloader in test_dataloaders.items():
-                dataset = test_datasets[dim]
-                for batch in dataloader:
-                    x_values = batch['x_values'].to(self.device)
-                    residuals = batch['residuals'].to(self.device)
-                    z0_token_ids = batch['z0_token_ids'].to(self.device)
-                    z1_token_ids = batch['z1_token_ids'].to(self.device)
+            # === 修改：不再循环 dim，直接遍历 dataloader ===
+            for batch in test_dataloader:
+                x_values = batch['x_values'].to(self.device)
+                residuals = batch['residuals'].to(self.device)
+                dim_mask = batch['dim_mask'].to(self.device)
+                z0_token_ids = batch['z0_token_ids'].to(self.device)
+                z1_token_ids = batch['z1_token_ids'].to(self.device)
 
-                    condition_embeddings = condition_encoder(x_values, residuals)
-                    forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config)
-                    loss = self.compute_loss(forward_results, criterion, dataset, debug=False)
+                condition_embeddings = condition_encoder(x_values, residuals)
+                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset, config)
+                loss = self.compute_loss(forward_results, criterion, test_dataset, debug=False)
 
-                    if not torch.isnan(loss):
-                        total_loss += loss.item()
-                        num_batches += 1
+                if not torch.isnan(loss):
+                    total_loss += loss.item()
+                    num_batches += 1
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()
@@ -487,7 +500,8 @@ class EditFlowManager:
         gathered_losses = self.accelerator.gather(total_loss_tensor)
         gathered_batches = self.accelerator.gather(num_batches_tensor)
 
-        avg_loss = gathered_losses.sum().item() / gathered_batches.sum().item() if gathered_batches.sum().item() > 0 else float('inf')
+        total_batches = gathered_batches.sum().item()
+        avg_loss = gathered_losses.sum().item() / total_batches if total_batches > 0 else float('inf')
 
         return avg_loss
 
@@ -496,38 +510,43 @@ class EditFlowManager:
         # 等待所有进程同步
         self.accelerator.wait_for_everyone()
 
-        os.makedirs(self.args.save_dir, exist_ok=True)
-        checkpoint_path = os.path.join(
+        # 创建checkpoint目录
+        checkpoint_dir = os.path.join(
             self.args.save_dir,
-            "continuous_flow_final.pth" if is_final else f"editflow_epoch_{epoch+1}.pth"
+            "continuous_flow_final" if is_final else f"checkpoint_epoch_{epoch+1}"
         )
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # 使用 unwrap_model 获取原始模型（未包装的）
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        unwrapped_encoder = self.accelerator.unwrap_model(condition_encoder)
+        # 使用 Accelerate 的 save_state 方法（推荐的正确方式）
+        self.accelerator.save_state(checkpoint_dir)
 
-        checkpoint_data = {
-            'epoch': epoch + 1,
-            'model_state_dict': unwrapped_model.state_dict(),
-            'condition_encoder_state_dict': unwrapped_encoder.state_dict(),
-            'optimizer_state_dict': self.accelerator.get_state_dict(optimizer),
-            'loss': loss,
-            'config': config,
-            'args': self.args,
-            'accelerate_config': {
-                'distributed_type': str(self.accelerator.distributed_type),
-                'num_processes': self.accelerator.num_processes,
-                'mixed_precision': str(self.accelerator.mixed_precision),
+        # 另外保存模型配置信息
+        if self.accelerator.is_local_main_process:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            unwrapped_encoder = self.accelerator.unwrap_model(condition_encoder)
+
+            config_data = {
+                'epoch': epoch + 1,
+                'model_state_dict': unwrapped_model.state_dict(),
+                'condition_encoder_state_dict': unwrapped_encoder.state_dict(),
+                'loss': loss,
+                'config': config,
+                'args': self.args,
+                'accelerate_config': {
+                    'distributed_type': str(self.accelerator.distributed_type),
+                    'num_processes': self.accelerator.num_processes,
+                    'mixed_precision': str(self.accelerator.mixed_precision),
+                }
             }
-        }
 
-        if is_final:
-            checkpoint_data['scheduler_type'] = 'cubic'
+            if is_final:
+                config_data['scheduler_type'] = 'cubic'
 
-        # 使用 Accelerate 的 save 方法
-        self.accelerator.save(checkpoint_data, checkpoint_path)
+            # 保存配置信息
+            config_path = os.path.join(checkpoint_dir, "training_config.json")
+            torch.save(config_data, config_path)
 
-        return checkpoint_path
+        return checkpoint_dir
 
     def train(self):
         # 检查检查点并加载模型
@@ -537,7 +556,9 @@ class EditFlowManager:
             print(f"{'找到检查点' if checkpoint_path else '未找到检查点，将从基础模型开始训练'}: {checkpoint_path or ''}")
 
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
-        train_dataloaders, train_datasets, test_dataloaders, test_datasets = self.prepare_data(tokenizer)
+
+        # 注意这里接收返回值的变化
+        train_dataloader, train_dataset, test_dataloader, test_dataset = self.prepare_data(tokenizer)
 
         model_params = sum(p.numel() for p in model.parameters())
         encoder_params = sum(p.numel() for p in condition_encoder.parameters() if p.requires_grad)
@@ -549,27 +570,19 @@ class EditFlowManager:
         eval_every = getattr(self.args, 'eval_every', 5)
 
         for epoch in range(self.args.num_epochs):
-            total_loss, total_batches = 0.0, 0
+            # === 修改开始：不再循环 dim，直接传整个 dataloader ===
+            # 这里传入 "Mixed" 作为维度名称仅用于显示
+            avg_loss, num_batches = self.train_epoch(
+                model, condition_encoder, criterion, optimizer,
+                train_dataloader, train_dataset, epoch, "Mixed"
+            )
 
-            # 训练所有维度
-            for dim, dataloader in train_dataloaders.items():
-                dataset = train_datasets[dim]
-                dim_loss, dim_batches = self.train_epoch(
-                    model, condition_encoder, criterion, optimizer,
-                    dataloader, dataset, epoch, dim
-                )
-                total_loss += dim_loss * dim_batches
-                total_batches += dim_batches
-                if self.accelerator.is_local_main_process:
-                    print(f"维度 {dim} 平均损失: {dim_loss:.4f}")
-
-            avg_loss = total_loss / total_batches
             if self.accelerator.is_local_main_process:
-                print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
+                print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
 
-            # 测试集评估
+            # 修改 evaluate 调用，传入单个 dataloader
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:
-                test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloaders, test_datasets)
+                test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloader, test_dataset)
                 if self.accelerator.is_local_main_process:
                     print(f"测试集损失: {test_loss:.4f}")
 
@@ -587,6 +600,16 @@ class EditFlowManager:
         )
         if self.accelerator.is_local_main_process:
             print(f"最终模型已保存到: {final_path}")
+
+        # 显式清理分布式资源
+        try:
+            self.accelerator.free_memory()
+            if self.accelerator.is_local_main_process:
+                print("✓ 分布式资源已清理")
+        except Exception as e:
+            if self.accelerator.is_local_main_process:
+                print(f"⚠️ 资源清理时出现警告: {e}")
+
         return model, condition_encoder
 
     def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None, max_expr_length=None):

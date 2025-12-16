@@ -85,12 +85,18 @@ grep "跳过复杂表达式" logs/sample_generation.log | wc -l
 ## 分布式训练
 
 ```bash
-  accelerate launch \
-      --num_processes=3 \
-      --num_machines=1 \
-      --mixed_precision=fp16 \
-      --dynamo_backend=no \
-      --multi_gpu \
-      train.py \
-      --num_samples 10000000
+accelerate launch \
+    --num_processes=3 \
+    --num_machines=1 \
+    --mixed_precision=fp16 \
+    --dynamo_backend=no \
+    --multi_gpu \
+    train.py \
+    --num_samples 10000000
+```
+
+## 分布式训练管理
+```bash
+pkill -9 train.py
+pkill -9 accelerate
 ```

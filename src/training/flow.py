@@ -125,9 +125,9 @@ class ContinuousFlowLoss:
 
 
 class FlowDataset(torch.utils.data.Dataset):
-    """连续流数据集 (z0, z1, x_values, residuals) - 基于文件按需读取，避免内存溢出"""
+    """连续流数据集 (z0, z1, x_values, residuals) - 支持内存预加载和文件按需读取"""
 
-    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False):
+    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False, preload_to_memory=False):
         """
         基于文件位置索引的数据集
 
@@ -138,12 +138,14 @@ class FlowDataset(torch.utils.data.Dataset):
             max_dim: 最大维度
             max_expr_length: 表达式最大长度
             verbose: 是否输出详细日志
+            preload_to_memory: 是否预加载数据到内存（性能优化）
         """
         self.positions = positions
         self.filename = filename
         self.tokenizer = tokenizer
         self.max_expr_length = max_expr_length
         self.max_dim = max_dim
+        self.preload_to_memory = preload_to_memory
         self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
 
         # 设置分词器的特殊token属性
@@ -154,8 +156,29 @@ class FlowDataset(torch.utils.data.Dataset):
         self.bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
         self.gap_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
 
+        # 预加载数据到内存（可选）
+        self.data_cache = None
+        if self.preload_to_memory:
+            self._preload_data(verbose)
+
     def __len__(self):
         return len(self.positions)
+
+    def _preload_data(self, verbose=False):
+        """预加载数据到内存以提高IO性能"""
+        if verbose:
+            print(f"预加载 {len(self.positions)} 个样本到内存...")
+
+        self.data_cache = []
+        with open(self.filename, 'r', encoding='utf-8') as f:
+            for pos in self.positions:
+                f.seek(pos)
+                line = f.readline().strip()
+                sample = json.loads(line)
+                self.data_cache.append(sample)
+
+        if verbose:
+            print(f"数据预加载完成，占用约 {len(self.data_cache) * 0.5:.1f} MB 内存")
 
     def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
         """将token列表转换为token ID列表"""
@@ -166,11 +189,15 @@ class FlowDataset(torch.utils.data.Dataset):
         return token_ids
 
     def __getitem__(self, idx):
-        # 从文件指定位置读取样本
-        with open(self.filename, 'r', encoding='utf-8') as f:
-            f.seek(self.positions[idx])
-            line = f.readline().strip()
-            sample = json.loads(line)
+        # 如果数据已预加载到内存，直接从缓存读取
+        if self.data_cache is not None:
+            sample = self.data_cache[idx]
+        else:
+            # 从文件指定位置读取样本
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                f.seek(self.positions[idx])
+                line = f.readline().strip()
+                sample = json.loads(line)
 
         x_values = torch.FloatTensor(sample['x_values'])
         residuals = torch.FloatTensor(sample['residuals'])
@@ -198,12 +225,92 @@ class FlowDataset(torch.utils.data.Dataset):
 
 
 def custom_collate_fn(batch):
-    return {
-        'x_values': torch.stack([item['x_values'] for item in batch]),
-        'residuals': torch.stack([item['residuals'] for item in batch]),
+    """处理不同维度数据的collate函数，使用padding + mask方案"""
+    if len(batch) == 0:
+        return {
+            'x_values': torch.empty(0, 0, 0),
+            'residuals': torch.empty(0, 0),
+            'dim_mask': torch.empty(0, 0),
+            'z0_token_ids': torch.empty(0, 0),
+            'z1_token_ids': torch.empty(0, 0),
+            'gap_token': None
+        }
+
+    # 找到最大维度和n_points
+    max_dim = 0
+    max_n_points = 0
+    original_dims = []
+
+    for i, item in enumerate(batch):
+        x_val = item['x_values']  # [n_points, current_dim]
+        resid = item['residuals']  # [n_points]
+
+        # 确保x_values至少是2维的
+        if x_val.dim() == 1:
+            x_val = x_val.unsqueeze(1)  # [n_points, 1]
+
+        # 确保residuals是1维的
+        if resid.dim() > 1:
+            resid = resid.squeeze()
+
+        current_dim = x_val.shape[1]
+        current_n_points = x_val.shape[0]
+
+        max_dim = max(max_dim, current_dim)
+        max_n_points = max(max_n_points, current_n_points)
+        original_dims.append(current_dim)
+
+    # Padding所有数据到最大形状
+    x_values_padded = []
+    residuals_padded = []
+    dim_masks = []
+
+    for i, item in enumerate(batch):
+        x_val = item['x_values'].clone()  # [n_points, current_dim]
+        resid = item['residuals'].clone()  # [n_points]
+
+        # 确保x_values至少是2维的
+        if x_val.dim() == 1:
+            x_val = x_val.unsqueeze(1)
+
+        # 确保residuals是1维的
+        if resid.dim() > 1:
+            resid = resid.squeeze()
+
+        current_n_points = x_val.shape[0]
+        current_dim = x_val.shape[1]
+
+        # Padding n_points维度（如果需要）
+        if current_n_points < max_n_points:
+            padding_points = torch.zeros(max_n_points - current_n_points, x_val.shape[1], dtype=x_val.dtype)
+            x_val = torch.cat([x_val, padding_points], dim=0)
+
+            padding_resid = torch.zeros(max_n_points - current_n_points, dtype=resid.dtype)
+            resid = torch.cat([resid, padding_resid], dim=0)
+
+        # Padding dim维度
+        if current_dim < max_dim:
+            padding_dim = torch.zeros(x_val.shape[0], max_dim - current_dim, dtype=x_val.dtype)
+            x_val = torch.cat([x_val, padding_dim], dim=1)
+
+        # 创建维度mask：1表示有效维度，0表示padding
+        dim_mask = torch.zeros(max_dim, dtype=torch.float32)
+        dim_mask[:current_dim] = 1.0
+
+        x_values_padded.append(x_val)          # [max_n_points, max_dim]
+        residuals_padded.append(resid)         # [max_n_points]
+        dim_masks.append(dim_mask)             # [max_dim]
+
+    result = {
+        'x_values': torch.stack(x_values_padded),     # [batch_size, max_n_points, max_dim]
+        'residuals': torch.stack(residuals_padded),   # [batch_size, max_n_points]
+        'dim_mask': torch.stack(dim_masks),           # [batch_size, max_dim]
         'z0_token_ids': torch.stack([item['z0_token_ids'] for item in batch]),
         'z1_token_ids': torch.stack([item['z1_token_ids'] for item in batch]),
-        'gap_token': batch[0]['gap_token']
+        'gap_token': batch[0]['gap_token'],
+        'original_dims': original_dims  # 记录原始维度，供调试使用
     }
+
+    return result
 
 

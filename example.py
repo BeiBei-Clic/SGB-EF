@@ -47,7 +47,7 @@ def main():
         model_path=model_path,
         x_data=x_data,
         y_data=y_data,
-        debug_mode=False,  # 开启调试模式
+        debug_mode=True,  # 开启调试模式
         n_steps=30  # 减少步数以便观察
     )
 
