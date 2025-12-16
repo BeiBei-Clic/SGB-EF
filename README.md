@@ -92,7 +92,8 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_samples 10000000
+    --num_samples 10000000\
+    --batch_size 48
 ```
 
 ## 分布式训练管理

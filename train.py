@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--save_every", type=int, default=10, help="每多少轮保存一次")
 
     # 多GPU参数 - 现在由 Accelerate 自动管理
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
 
