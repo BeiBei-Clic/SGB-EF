@@ -40,7 +40,7 @@ def main():
     print(f"y_data 形状: {y_data.shape}")
 
     # 模型路径
-    model_path = "checkpoints/editflow_epoch_10.pth"
+    model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（会自动推断input_dim并生成动态初始表达式）
     predicted_expression = manager.symbolic_regression(

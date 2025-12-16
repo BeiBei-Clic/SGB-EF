@@ -704,14 +704,23 @@ class EditFlowManager:
 
         condition = condition_encoder(x_values, residuals)
 
+        # 构建初始前缀表达式（与训练格式一致）
         if input_dim == 1:
+            # 一维情况：初始表达式为 x0
             current_tokens = ['x0']
         else:
+            # 多维情况：使用嵌套的add前缀表达式，例如 add,x0,x1 表示 (x0 + x1)
+            # 对于三个变量：add,add,x0,x1,x2 表示 ((x0 + x1) + x2)
             current_tokens = []
+            for i in range(input_dim - 1):
+                current_tokens.append('add')
+
+            # 添加所有变量
             for i in range(input_dim):
-                if i > 0:
-                    current_tokens.append('+')
                 current_tokens.append(f'x{i}')
+
+            # 对于3个变量：add,add,x0,x1,x2
+            # 对于2个变量：add,x0,x1
 
         # 初始化token管理器，确保覆盖数据维度
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
@@ -737,6 +746,35 @@ class EditFlowManager:
 
             tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
 
+            # 详细调试：验证输入ID的正确性
+            if debug_mode and self.accelerator.is_local_main_process:
+                print(f"\n[DEBUG] === 输入ID验证 ===")
+                print(f"[DEBUG] 当前表达式tokens: {current_tokens}")
+                print(f"[DEBUG] tokenized_expr IDs: {tokenized_expr}")
+                print(f"[DEBUG] tokenizer词表大小: {len(special_tokens_manager.tokenizer.get_vocab())}")
+
+                # 验证每个token ID的有效性
+                vocab = special_tokens_manager.tokenizer.get_vocab()
+                valid_ids = []
+                invalid_ids = []
+                for i, token_id in enumerate(tokenized_expr):
+                    token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
+                    if token_id < len(vocab) and token_name in vocab:
+                        valid_ids.append((i, token_id, token_name, vocab[token_name]))
+                    else:
+                        invalid_ids.append((i, token_id, token_name))
+
+                print(f"[DEBUG] 有效token IDs: {valid_ids}")
+                if invalid_ids:
+                    print(f"[DEBUG] ❌ 无效token IDs: {invalid_ids}")
+                else:
+                    print(f"[DEBUG] ✅ 所有token ID都有效！")
+
+                # 检查是否有重复或UNK token
+                unk_token_id = vocab.get('<unk>', None)
+                if unk_token_id in tokenized_expr:
+                    print(f"[DEBUG] ⚠️ 警告：发现UNK token (ID={unk_token_id})")
+
             max_len = getattr(self.args, 'max_expr_length', 128)
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
@@ -758,14 +796,57 @@ class EditFlowManager:
 
             if debug_mode and self.accelerator.is_local_main_process:
                 print(f"[DEBUG] 时间步t: {t[0,0]:.4f}")
-                print(f"[DEBUG] tokenized_expr长度: {len(tokenized_expr)}")
+                print(f"[DEBUG] 最终input_ids长度: {len(tokenized_expr)}")
                 print(f"[DEBUG] 有效token数量: {attention_mask[0].sum().item()}")
+
+                # 验证最终输入给模型的input_ids
+                print(f"\n[DEBUG] === 模型输入验证 ===")
+                print(f"[DEBUG] 最终input_ids: {input_ids[0].tolist()}")
+
+                # 解码完整的input_ids序列
+                decoded_tokens = []
+                for token_id in input_ids[0].tolist():
+                    token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
+                    decoded_tokens.append(token_name)
+                print(f"[DEBUG] 解码的token序列: {decoded_tokens}")
+
+                # 检查input_ids的统计信息
+                input_ids_np = input_ids[0].cpu().numpy()
+                print(f"[DEBUG] input_ids统计: min={input_ids_np.min()}, max={input_ids_np.max()}, mean={input_ids_np.mean():.2f}")
+                print(f"[DEBUG] 有效token范围: 0-{len(vocab)-1}")
+
+                # 确认没有无效的token ID
+                if input_ids_np.max() >= len(vocab):
+                    print(f"[DEBUG] ❌ 错误：存在超出词表范围的token ID！")
+                else:
+                    print(f"[DEBUG] ✅ 所有token ID都在有效范围内！")
 
             with torch.no_grad():
                 rates, insert_probs, substitute_probs = model(
                     input_ids=input_ids, attention_mask=attention_mask,
                     time_steps=t, condition=condition
                 )
+
+                # 调试：检查模型输出的原始值
+                if debug_mode and self.accelerator.is_local_main_process and step == 0:
+                    print(f"\n[DEBUG] === 模型原始输出分析 ===")
+                    print(f"[DEBUG] rates形状: {rates.shape}")
+                    print(f"[DEBUG] rates前5个位置的原始值:")
+                    for i in range(min(5, rates.size(1))):
+                        print(f"[DEBUG]   位置{i}: INS={rates[0, i, 0]:.6f}, SUB={rates[0, i, 1]:.6f}, DEL={rates[0, i, 2]:.6f}")
+
+                    # 检查是否所有位置都完全相同
+                    rates_flat = rates[0, :, :].cpu().numpy()
+                    unique_rows = np.unique(rates_flat, axis=0)
+                    print(f"[DEBUG] 总位置数: {rates_flat.shape[0]}")
+                    print(f"[DEBUG] 唯一输出数量: {unique_rows.shape[0]}")
+                    if unique_rows.shape[0] < rates_flat.shape[0]:
+                        print(f"[DEBUG] ⚠️  确实存在位置间输出重复！")
+
+                    # 检查insert_probs的分布
+                    top_insert_tokens = torch.topk(insert_probs[0, 1], 5)  # 检查位置1的top5
+                    print(f"[DEBUG] 位置1的insert top5 token IDs: {top_insert_tokens.indices.tolist()}")
+                    print(f"[DEBUG] 位置1的insert top5 概率: {top_insert_tokens.values.tolist()}")
 
                 lambda_ins = rates[0, :, 0].cpu().numpy()
                 lambda_sub = rates[0, :, 1].cpu().numpy()
