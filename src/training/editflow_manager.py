@@ -80,26 +80,55 @@ class EditFlowManager:
         set_seed(seed)
 
     def prepare_data(self, tokenizer):
-        """准备训练数据，合并所有维度的数据"""
+        """准备训练数据，支持多进程并行生成"""
+
+        # 1. 获取当前进程信息
+        current_rank = self.accelerator.process_index
+        world_size = self.accelerator.num_processes
+
         if self.accelerator.is_local_main_process:
-            print("准备连续流训练数据...")
+            print(f"准备连续流训练数据 (并行生成模式: {world_size} 进程)...")
 
-        # 数据文件路径
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
+        temp_dir = "data/temp"
 
-        # 生成数据（如果需要），内部会检查文件是否存在并决定是否需要生成
+        # 2. 所有进程都参与生成！
+        # 传递 rank 和 world_size，并设置 skip_merge=True
         generate_flow_samples(
             num_samples=self.args.num_samples,
             max_dim=self.args.max_dim,
             n_points=self.args.n_points,
             max_depth=self.args.max_depth,
             max_expr_length=self.args.max_expr_length,
-            verbose=self.accelerator.is_local_main_process
+            verbose=True,  # 每个进程都可以输出一点日志
+            process_rank=current_rank,  # 传入当前 rank
+            world_size=world_size,      # 传入总进程数
+            skip_merge=True             # 重要：生成完不要自己合并！
         )
 
-        # 等待数据生成完成
+        # 3. 同步屏障：等待所有进程完成各自的批次生成
+        if self.accelerator.is_local_main_process:
+            print("[主进程] 等待所有进程完成数据生成...")
+
         self.accelerator.wait_for_everyone()
 
+        # 4. 仅由主进程执行合并操作
+        if self.accelerator.is_local_main_process:
+            print("[主进程] 所有数据生成完毕，开始合并文件...")
+            from src.symbolic.data_generator import merge_batches_to_main_file
+
+            # 重新计算批次信息以调用合并逻辑
+            batch_size = 50000  # 需确保与生成时一致
+            num_batches = (self.args.num_samples + batch_size - 1) // batch_size
+            batch_filenames = [f"{temp_dir}/{os.path.basename(cache_filename).replace('.txt', f'_batch_{i + 1}.txt')}" for i in range(num_batches)]
+
+            # 执行合并
+            merge_batches_to_main_file(cache_filename, batch_filenames, num_batches, total_dimension_count=None)
+
+        # 5. 再次同步，确保文件合并完成，其他进程才能读取
+        self.accelerator.wait_for_everyone()
+
+        # 加载索引（此时文件已完整）
         dimension_samples = load_dimension_index(cache_filename, verbose=self.accelerator.is_local_main_process)
 
         # === 修改开始：合并所有维度的位置索引 ===
