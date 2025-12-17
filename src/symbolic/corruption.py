@@ -6,7 +6,14 @@ import random
 import time
 import sympy as sp
 from src.utils.timeout_utils import TimeoutError
-from src.symbolic.symbolic_utils import simplify_expr
+
+
+def simplify_expr(expr: sp.Expr) -> sp.Expr:
+    """化简表达式"""
+    simplified = expr
+    simplified = sp.together(simplified)
+    simplified = sp.radsimp(simplified)
+    return simplified
 
 
 def replace_variables(expr: sp.Expr) -> sp.Expr:

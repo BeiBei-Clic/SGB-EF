@@ -42,39 +42,13 @@ echo $HF_ENDPOINT
 
 ## 数据生成日志监控
 
-### 日志文件
-
-- **主日志**: `logs/sample_generation.log` - 记录详细的样本生成过程
-- **性能日志**: `logs/performance.log` - 记录性能监控信息
-
-### 检查数据生成卡顿
-
 当数据生成卡住时，使用以下命令快速定位问题：
+查看日志最后20行
 
 ```bash
-# 1. 查看最新的生成状态
-tail -f logs/sample_generation.log
-
-# 2. 查找耗时操作和警告
-grep "WARNING\|TIME" logs/sample_generation.log | tail -10
-
-# 3. 查找表达式重试原因
-grep "RETRY_\|重新生成表达式" logs/sample_generation.log | tail -20
-
-# 4. 查看各个步骤的耗时分布
-grep "| time=" logs/sample_generation.log | tail -10
-
-# 5. 查找超时的表达式生成
-grep "TIMEOUT\|timeout" logs/sample_generation.log | tail -10
+tail -n 2000 logs/sample_generation.log
 ```
 
-### 常见卡顿原因
-
-- **表达式生成超时**: `TIMEOUT generate_random_expr >2.0s`
-- **表达式长度问题**: `RETRY_EXPRESSION_TOO_LONG` 或 `RETRY_EXPRESSION_TOKENS_TOO_FEW`
-- **删减序列慢**: `WARNING: generate_reduction_sequence took XXXms`
-- **对齐计算慢**: `WARNING: Levenshtein alignment took XXXms`
-- **表达式破坏慢**: `WARNING: Expression corruption took XXXms`
 
 ## 分布式训练
 
