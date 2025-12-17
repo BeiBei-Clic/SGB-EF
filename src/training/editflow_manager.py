@@ -82,50 +82,45 @@ class EditFlowManager:
     def prepare_data(self, tokenizer):
         """准备训练数据，支持多进程并行生成"""
 
-        # 1. 获取当前进程信息
-        current_rank = self.accelerator.process_index
-        world_size = self.accelerator.num_processes
+        # 设置NCCL超时时间为无穷大，避免等待时超时
+        import os
+        os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
 
-        if self.accelerator.is_local_main_process:
-            print(f"准备连续流训练数据 (并行生成模式: {world_size} 进程)...")
-
+        # 1. 数据生成阶段：只使用主进程（单进程）
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
         temp_dir = "data/temp"
 
-        # 2. 所有进程都参与生成！
-        # 传递 rank 和 world_size，并设置 skip_merge=True
-        generate_flow_samples(
-            num_samples=self.args.num_samples,
-            max_dim=self.args.max_dim,
-            n_points=self.args.n_points,
-            max_depth=self.args.max_depth,
-            max_expr_length=self.args.max_expr_length,
-            verbose=True,  # 每个进程都可以输出一点日志
-            process_rank=current_rank,  # 传入当前 rank
-            world_size=world_size,      # 传入总进程数
-            skip_merge=True             # 重要：生成完不要自己合并！
-        )
-
-        # 3. 同步屏障：等待所有进程完成各自的批次生成
+        # 只有主进程负责数据生成，避免NCCL通信问题
         if self.accelerator.is_local_main_process:
-            print("[主进程] 等待所有进程完成数据生成...")
+            print(f"准备连续流训练数据 (单进程生成模式)...")
+            print(f"NCCL超时设置为: {os.environ.get('NCCL_TIMEOUT')} 秒")
 
+            # 调用数据生成函数，使用单进程模式
+            generate_flow_samples(
+                num_samples=self.args.num_samples,
+                max_dim=self.args.max_dim,
+                n_points=self.args.n_points,
+                max_depth=self.args.max_depth,
+                max_expr_length=self.args.max_expr_length,
+                verbose=True,  # 单进程模式下显示详细日志
+                process_rank=0,      # 固定使用rank 0
+                world_size=1,        # 单进程模式
+                skip_merge=False     # 单进程模式直接合并
+            )
+        else:
+            # 非主进程跳过数据生成，等待主进程完成
+            print(f"[Rank {self.accelerator.process_index}] 跳过数据生成，等待主进程完成...")
+            print(f"NCCL超时设置为: {os.environ.get('NCCL_TIMEOUT')} 秒")
+
+        # 2. 同步屏障：等待主进程完成数据生成
+        print(f"[Rank {self.accelerator.process_index}] 等待主进程完成数据生成...")
         self.accelerator.wait_for_everyone()
 
-        # 4. 仅由主进程执行合并操作
         if self.accelerator.is_local_main_process:
-            print("[主进程] 所有数据生成完毕，开始合并文件...")
-            from src.symbolic.data_generator import merge_batches_to_main_file
+            print("[主进程] 数据生成完成，开始训练阶段")
 
-            # 重新计算批次信息以调用合并逻辑
-            batch_size = 50000  # 需确保与生成时一致
-            num_batches = (self.args.num_samples + batch_size - 1) // batch_size
-            batch_filenames = [f"{temp_dir}/{os.path.basename(cache_filename).replace('.txt', f'_batch_{i + 1}.txt')}" for i in range(num_batches)]
-
-            # 执行合并
-            merge_batches_to_main_file(cache_filename, batch_filenames, num_batches, total_dimension_count=None)
-
-        # 5. 再次同步，确保文件合并完成，其他进程才能读取
+        # 3. 同步屏障：确保所有进程都能访问到完整的数据文件
+        print(f"[Rank {self.accelerator.process_index}] 准备开始训练阶段...")
         self.accelerator.wait_for_everyone()
 
         # 加载索引（此时文件已完整）

@@ -14,6 +14,10 @@ import torch
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
+# 设置NCCL超时时间为无穷大，避免数据生成时的等待超时
+os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
+os.environ["NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
+
 from src.training.editflow_manager import EditFlowManager
 from src.utils.gpu_monitor import display_gpu_info
 from src.utils.special_tokens import SpecialTokensManager

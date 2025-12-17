@@ -93,7 +93,6 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_samples 10000000\
-    --debug False\
     --batch_size 48
 ```
 

@@ -22,8 +22,8 @@ def main():
         'gradient_accumulation_steps': 1,  # 推理时不需要梯度累积
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
-        'max_dim': 10,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 12  # 最大表达式长度
+        'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
+        'max_expr_length': 6  # 最大表达式长度
     })()
 
     manager = EditFlowManager(args)
