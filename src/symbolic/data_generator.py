@@ -137,7 +137,6 @@ def generate_flow_samples(
     # === 新增参数 ===
     process_rank: int = 0,
     world_size: int = 1,
-    skip_merge: bool = False
 ):
     """生成用于EditFlow连续流训练的数据文件，支持断点续传和多进程并行生成
 
@@ -151,14 +150,9 @@ def generate_flow_samples(
         verbose: 是否显示详细输出
         process_rank: 当前进程ID (0, 1, 2...)
         world_size: 总进程数
-        skip_merge: 是否跳过合并步骤（并行生成时必须跳过，最后统一合并）
     """
 
-    # === 关键修改1: 设置独立的随机种子 ===
-    # 基础种子 + 进程ID，确保每个进程生成的数据不重复
-    current_time = int(time.time()) % (2**32 - 1)
-    # 加上 process_rank 防止同一毫秒启动时种子相同
-    seed_val = current_time + process_rank * 1000
+    seed_val = int(time.time()) % (2**32 - 1)
     random.seed(seed_val)
     np.random.seed(seed_val)
 
@@ -174,41 +168,27 @@ def generate_flow_samples(
 
     # 1. 主文件存在且无批次文件 → 数据完整
     if os.path.exists(filename) and not any(os.path.exists(f) for f in batch_filenames):
-        if verbose and process_rank == 0:
+        if verbose:
             print(f"发现完整数据文件 {filename}")
         return
 
     # 1.5. 主文件存在且有批次文件 → 直接进入合并阶段（跳过生成）
     if os.path.exists(filename) and any(os.path.exists(f) for f in batch_filenames):
-        if verbose and process_rank == 0:
+        if verbose:
             print(f"发现主文件和批次文件，直接进入合并阶段...")
             print(f"将追加剩余批次文件到主文件...")
-        if not skip_merge:
             merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count=None)
         return
 
-    # === 关键修改2: 任务分配 (Stride) ===
-    # 只有主进程负责打印"分批生成"的日志
-    if verbose and process_rank == 0:
-        print(f"分批生成 {num_samples} 个样本，共 {num_batches} 批，{world_size} 个进程并行处理...")
-
-    # 检查已完成的批次
-    completed_batches = [i for i, bf in enumerate(batch_filenames) if os.path.exists(bf)]
-
-    # !!! 核心逻辑修改 !!!
-    # 使用 range 的步长(step)功能进行任务分发
-    # 例如 world_size=3:
-    # 进程0 处理: 0, 3, 6, 9...
-    # 进程1 处理: 1, 4, 7, 10...
-    # 进程2 处理: 2, 5, 8, 11...
-
-    my_batches = range(process_rank, num_batches, world_size)
+    # === 单进程数据生成 ===
+    if verbose:
+        print(f"分批生成 {num_samples} 个样本，共 {num_batches} 批...")
 
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
-    # 遍历分配给当前进程的批次
-    for batch_idx in my_batches:
+    # 遍历所有批次
+    for batch_idx in range(num_batches):
         # 获取当前批次的文件名
         batch_filename = batch_filenames[batch_idx]
         current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
@@ -217,15 +197,15 @@ def generate_flow_samples(
         # 如果这个批次文件已经存在，直接跳过
         if os.path.exists(batch_filename):
             if verbose:
-                print(f"[Rank {process_rank}] 跳过已存在的批次 {batch_idx + 1}")
+                print(f"跳过已存在的批次 {batch_idx + 1}")
             continue
 
         if verbose:
-            print(f"[Rank {process_rank}] 开始生成第 {batch_idx + 1}/{num_batches} 批...")
+            print(f"开始生成第 {batch_idx + 1}/{num_batches} 批...")
 
         batch_samples, dimension_count, sample_count = [], {}, 0
-        # 添加rank标识到进度条
-        pbar = tqdm(total=current_batch_size, desc=f"[Rank {process_rank}] 第{batch_idx + 1}批")
+        # 进度条
+        pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
         SAMPLE_TIMEOUT = 5.0  # 样本最大处理时间
 
         # 记录批次开始
@@ -397,27 +377,25 @@ def generate_flow_samples(
         # 立即保存当前批次
         batch_filename = batch_filenames[batch_idx]
         if verbose:
-            print(f"[Rank {process_rank}] 保存数据到 {batch_filename}...")
+            print(f"保存数据到 {batch_filename}...")
         os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
         with open(batch_filename, 'w', encoding='utf-8') as f:
             for sample in batch_samples:
                 sample_line = json.dumps(sample, ensure_ascii=False)
                 f.write(sample_line + '\n')
-        print(f"[Rank {process_rank}] 已保存 {len(batch_samples)} 个样本到 {batch_filename}")
+        print(f"已保存 {len(batch_samples)} 个样本到 {batch_filename}")
         if verbose:
-            print(f"[Rank {process_rank}] 第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
-            print(f"[Rank {process_rank}] 当前批次维度分布:")
+            print(f"第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
+            print(f"当前批次维度分布:")
             for dim, count in sorted(dimension_count.items()):
                 print(f"  {dim}维: {count} 个样本")
 
-    # === 关键修改3: 跳过自动合并 ===
-    if not skip_merge:
-        # 只有在非并行模式，或者显式要求合并时才执行
-        if verbose and process_rank == 0:
-            print(f"\n按批次顺序合并所有剩余批次文件到主文件...")
-        merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count)
-        if verbose and process_rank == 0:
-            print(f"所有数据已保存到: {filename}")
+    # === 合并批次文件 ===
+    if verbose:
+        print(f"\n按批次顺序合并所有批次文件到主文件...")
+    merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count)
+    if verbose:
+        print(f"所有数据已保存到: {filename}")
 
 
 def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_batches: int, total_dimension_count: Dict = None):

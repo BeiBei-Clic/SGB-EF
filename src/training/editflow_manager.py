@@ -105,7 +105,6 @@ class EditFlowManager:
                 verbose=True,  # 单进程模式下显示详细日志
                 process_rank=0,      # 固定使用rank 0
                 world_size=1,        # 单进程模式
-                skip_merge=False     # 单进程模式直接合并
             )
         else:
             # 非主进程跳过数据生成，等待主进程完成
