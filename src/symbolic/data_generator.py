@@ -2,37 +2,28 @@
 符号回归数据生成器，用于EditFlow预训练
 """
 
-import datetime
 import numpy as np
 import random
-import sympy as sp
 import os
 import warnings
 import time
 import json
 import pickle
 import logging
-import threading
+import datetime
 from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
     _write_log, log_sample_step,
-    log_expression_eval,
     log_batch_progress
 )
-from src.symbolic.symbolic_utils import (
-    expr_to_tree, generate_random_expr,
-    generate_reduction_sequence,
-    evaluate_expression_safe,
-    levenshtein_alignment_with_gap,
-)
-from src.symbolic.corruption import corrupt_expression
+from src.symbolic.sample_generator import generate_single_sample, set_log_writer
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 常量定义
-MAX_RETRIES = 10  # 表达式生成和计算的最大重试次数
+MAX_RETRIES = 5  # 表达式生成和计算的最大重试次数
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
@@ -152,6 +143,9 @@ def generate_flow_samples(
         world_size: 总进程数
     """
 
+    # 设置样本生成器的日志写入函数
+    set_log_writer(_write_log)
+
     seed_val = int(time.time()) % (2**32 - 1)
     random.seed(seed_val)
     np.random.seed(seed_val)
@@ -206,178 +200,63 @@ def generate_flow_samples(
         batch_samples, dimension_count, sample_count = [], {}, 0
         # 进度条
         pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
-        SAMPLE_TIMEOUT = 5.0  # 样本最大处理时间
-
+  
         # 记录批次开始
         log_batch_progress(batch_idx, num_batches, batch_idx * batch_size, num_samples)
 
+        SAMPLE_TIMEOUT = 30.0  # 单个样本生成超时时间（秒）
+
         while sample_count < current_batch_size:
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
-            sample_start_time = time.time()
 
             try:
-                dim = random.randint(1, max_dim)
-                dimension_count[dim] = dimension_count.get(dim, 0) + 1
-
-                log_sample_step(sample_id, "开始生成样本", f"批次{batch_idx+1}, 维度{dim}, 样本数{sample_count}/{current_batch_size}")
-
-                # 生成数据点
-                log_sample_step(sample_id, "生成数据点", f"{n_points}个点, {dim}维")
-                x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, dim))
-                x_values = [list(point) for point in x_values_raw]
-                x_array = np.array(x_values)
-
-                # 生成目标表达式，添加超时保护和重试机制
-                log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
-                target_expr = None
-                expr_valid = False
-
-                for retry_count in range(MAX_RETRIES):
-                    retry_start = time.time()
-                    try:
-                        log_sample_step(sample_id, f"表达式生成尝试 {retry_count+1}/{MAX_RETRIES}", f"维度={dim}")
-                        target_expr = with_timeout(generate_random_expr, 2.0, dim, max_depth)
-                        expr_str = str(target_expr)
-                        retry_time = (time.time() - retry_start) * 1000
-
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EXPR_GEN '{expr_str}' len={len(expr_str)}" + (f" | retry={retry_count+1} | time={retry_time:.1f}ms" if f"retry={retry_count+1} | time={retry_time:.1f}ms" else ""))
-
-                        # 验证表达式是否符合要求
-                        expr_tree = expr_to_tree(target_expr)
-                        expr_tokens = expr_tree.split(',')
-
-                        if len(expr_tokens) <= 1:
-                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_TOKENS_TOO_FEW retry={retry_count+1} tokens={len(expr_tokens)} expr='{expr_str}'")
-                            continue  # 继续下一次重试
-
-                        if len(expr_str) > max_expr_length:
-                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_TOO_LONG retry={retry_count+1} length={len(expr_str)} expr='{expr_str[:50]}{'...' if len(expr_str) > 50 else ''}'")
-                            continue  # 继续下一次重试
-
-                        if target_expr.has(sp.I) or 'I' in expr_str:
-                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_COMPLEX retry={retry_count+1} expr='{expr_str}'")
-                            continue  # 继续下一次重试
-
-                        # 表达式验证通过
-                        expr_valid = True
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EXPRESSION_ACCEPTED retry={retry_count+1} tokens={len(expr_tokens)} length={len(expr_str)} expr='{expr_str}'")
-                        break  # 退出重试循环
-
-                    except TimeoutError as te:
-                        retry_time = time.time() - retry_start
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] TIMEOUT generate_random_expr >2.0s | dim={dim}, attempt={retry_count+1}, duration={retry_time:.1f}s")
-                        if retry_count == MAX_RETRIES - 1:
-                            log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
-                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_timeout: {type(te).__name__}: {te}")
-                    except Exception as expr_error:
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY {retry_count + 1}/{MAX_RETRIES} error: {str(expr_error)[:30]}")
-                        if retry_count == MAX_RETRIES - 1:
-                            log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
-                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_failed: {type(expr_error).__name__}: {expr_error}")
-
-                if not expr_valid:
-                    # 表达式验证失败，重新生成样本
-                    continue
-
-                expr_str = str(target_expr)
-
-                # 尝试计算目标值
-                log_sample_step(sample_id, "计算目标表达式值")
-                eval_start = time.time()
-                success, y_target = evaluate_expression_safe(
-                    target_expr, x_array,
-                    error_callback=lambda err: log_expression_eval(sample_id, expr_str, (time.time() - eval_start) * 1000, False, err)
+                # 使用带超时保护的样本生成函数
+                generated_samples = with_timeout(
+                    generate_single_sample,
+                    SAMPLE_TIMEOUT,
+                    sample_id,
+                    max_dim,
+                    n_points,
+                    max_depth,
+                    max_expr_length,
+                    MAX_RETRIES,
+                    batch_idx,
+                    current_batch_size,
+                    sample_count
                 )
-                eval_time = (time.time() - eval_start) * 1000
-                if success:
-                    log_expression_eval(sample_id, expr_str, eval_time, True)
-                if not success:
-                    # 不增加sample_count，直接重新生成
+
+                # 如果成功生成样本，添加到批次中
+                if generated_samples:
+                    # 获取维度信息用于统计
+                    dim = generated_samples[0]["input_dimension"]
+                    dimension_count[dim] = dimension_count.get(dim, 0) + 1
+
+                    # 添加生成的样本到批次
+                    for sample in generated_samples:
+                        if sample_count >= current_batch_size:
+                            break
+                        batch_samples.append(sample)
+                        sample_count += 1
+                        pbar.update(1)
+                else:
+                    # 样本生成失败，记录并继续
+                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] FAILED: No samples generated")
                     continue
 
-                # 生成删减序列
-                log_sample_step(sample_id, "生成删减序列")
-                reduction_start = time.time()
-                reduction_sequence = generate_reduction_sequence(target_expr)
-                reduction_time = (time.time() - reduction_start) * 1000
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] REDUCE {len(reduction_sequence)} steps | time={reduction_time:.1f}ms")
-
-                # 为删减序列中的每个表达式创建样本
-                for i, reduced_expr in enumerate(reduction_sequence):
-                    if sample_count >= current_batch_size:
-                        break
-
-                    log_sample_step(sample_id, f"处理删减表达式 {i+1}/{len(reduction_sequence)}", f"表达式: {str(reduced_expr)}")
-
-                    # 对删减后的表达式应用额外的随机破坏
-                    corruption_start = time.time()
-                    curr_expr = corrupt_expression(reduced_expr)
-                    corruption_time = (time.time() - corruption_start) * 1000
-                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] CORRUPT step{i+1} | time={corruption_time:.1f}ms")
-
-                    # 检查删减后的表达式是否与目标表达式相同，如果相同则无学习意义
-                    if curr_expr == target_expr:
-                        log_sample_step(sample_id, f"跳过相同的删减表达式 {i+1}", f"破坏后表达式与目标表达式相同")
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SKIP_DUPLICATE step{i+1}")
-                        continue
-
-                    # 检查删减后的表达式是否包含复数单位
-                    if curr_expr.has(sp.I) or 'I' in str(curr_expr):
-                        log_sample_step(sample_id, f"跳过复数删减表达式 {i+1}", f"表达式包含复数单位")
-                        continue
-
-                    # 尝试计算当前值
-                    eval_curr_start = time.time()
-                    success, y_curr = evaluate_expression_safe(
-                        curr_expr, x_array,
-                        error_callback=lambda err: log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {err}")
-                    )
-                    eval_curr_time = (time.time() - eval_curr_start) * 1000
-                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EVAL_CURR step{i+1} success={success} | time={eval_curr_time:.1f}ms")
-                    if not success:
-                        continue
-
-                    # 转换为token序列
-                    tree_start = time.time()
-                    target_tree = expr_to_tree(target_expr)
-                    curr_tree = expr_to_tree(curr_expr)
-                    target_tokens = target_tree.split(',')
-                    curr_tokens = curr_tree.split(',')
-                    tree_time = (time.time() - tree_start) * 1000
-
-                    # 对齐到Z空间，包含gap token
-                    align_start = time.time()
-                    z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
-                    align_time = (time.time() - align_start) * 1000
-                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ALIGN step{i+1} | tree_time={tree_time:.1f}ms align_time={align_time:.1f}ms tokens={len(curr_tokens)}→{len(target_tokens)}")
-
-                    batch_samples.append({
-                        "input_dimension": dim,
-                        "x_values": x_values,  # 保持与原代码一致的字段名
-                        "y_target": y_target.tolist(),
-                        "y_curr": y_curr.tolist(),
-                        "residuals": (y_target - y_curr).tolist(),
-                        "tree_gt": target_tree,
-                        "exp_gt": str(target_expr),
-                        "tree_cur1": curr_tree,
-                        "exp_cur1": str(curr_expr),
-                        "curr_tokens": curr_tokens,
-                        "target_tokens": target_tokens,
-                        "z0_tokens": z0_tokens,
-                        "z1_tokens": z1_tokens
-                    })
-
-                    sample_count += 1
-                    pbar.update(1)
-
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SUCCESS")
+            except TimeoutError:
+                # 超时处理
+                log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] TIMEOUT: Sample generation exceeded {SAMPLE_TIMEOUT}s")
+                sample_count += 1  # 增加计数避免无限循环
+                pbar.update(1)
+                continue
 
             except Exception as e:
-                duration = time.time() - sample_start_time
-                steps = [f"错误: {str(e)}"]
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR sample_generation: {type(e).__name__}: {e}")
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] STUCK {duration:.1f}s steps={len(steps)}")
+                # 其他异常处理
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR: {type(e).__name__}: {e}")
                 print(f"警告: 生成样本时出错，跳过该样本: {e}")
+                sample_count += 1  # 增加计数避免无限循环
+                pbar.update(1)
                 continue
 
         pbar.close()

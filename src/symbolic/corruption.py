@@ -6,19 +6,7 @@ import random
 import time
 import sympy as sp
 from src.utils.timeout_utils import TimeoutError
-
-
-def timed_simplify(expr: sp.Expr, max_time: float = 1) -> sp.Expr:
-    """带时间限制的化简函数"""
-    deadline = time.time() + max_time
-    simplified = expr
-
-    if time.time() < deadline:
-        simplified = sp.together(simplified)
-    if time.time() < deadline:
-        simplified = sp.radsimp(simplified)
-
-    return simplified
+from src.symbolic.symbolic_utils import simplify_expr
 
 
 def replace_variables(expr: sp.Expr) -> sp.Expr:
@@ -55,7 +43,7 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
 
     if corruption_type == 'simplify':
         scaled_expr = expr * random.uniform(0.5, 2.0)
-        return timed_simplify(scaled_expr, max_time=1)
+        return simplify_expr(scaled_expr)
     elif corruption_type == 'replace_constant' and expr.is_Number:
         return sp.Rational(random.randint(-5, 5))
     elif corruption_type == 'replace_variable':

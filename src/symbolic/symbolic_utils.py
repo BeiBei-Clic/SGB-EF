@@ -7,7 +7,6 @@ import time
 import numpy as np
 import sympy as sp
 from typing import List, Tuple
-from src.utils.timeout_utils import TimeoutError
 from src.symbolic.corruption import corrupt_expression, replace_variables
 
 
@@ -16,16 +15,11 @@ UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
 BINARY_OPS = ['add', 'sub', 'mul', 'div', 'pow']
 
 
-def timed_simplify(expr: sp.Expr, max_time: float = 1) -> sp.Expr:
-    """带时间限制的化简函数"""
-    deadline = time.time() + max_time
+def simplify_expr(expr: sp.Expr) -> sp.Expr:
+    """化简表达式"""
     simplified = expr
-
-    if time.time() < deadline:
-        simplified = sp.together(simplified)
-    if time.time() < deadline:
-        simplified = sp.radsimp(simplified)
-
+    simplified = sp.together(simplified)
+    simplified = sp.radsimp(simplified)
     return simplified
 
 
@@ -72,15 +66,10 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
-    """生成随机表达式 - 增加超时保护和详细日志"""
-    deadline = time.time() + 1.5
+    """生成随机表达式"""
     symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
 
     def generate_expr(depth: int) -> sp.Expr:
-        # 超时检查
-        if time.time() > deadline:
-            raise TimeoutError("表达式生成超时")
-
         if depth >= max_depth:
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
@@ -97,16 +86,11 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
     # 生成表达式
     expr = generate_expr(0)
 
-    # 简化表达式（带超时保护）
+    # 简化表达式
     try:
-        expr = timed_simplify(expr, max_time=0.5)
+        expr = simplify_expr(expr)
     except Exception as e:
         pass  # 简化失败就使用原始表达式
-
-    # 检查并移除复数单位I
-    if expr.has(sp.I):
-        expr = expr.replace(sp.I, sp.Integer(1))
-        expr = timed_simplify(expr, max_time=0.5)
 
     return expr
 
@@ -191,7 +175,7 @@ def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:
             # 强制简化为常数
             reduced_expr = sp.Integer(1)
 
-        current_expr = timed_simplify(reduced_expr, max_time=0.5)
+        current_expr = simplify_expr(reduced_expr)
         iterations += 1
 
     # 确保序列中包含最简形式
@@ -314,16 +298,9 @@ def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
         - 成功: (True, 结果数组)
         - 失败: (False, None)
     """
-    from src.utils.timeout_utils import TimeoutError, with_timeout
-
     try:
-        # 为evaluate_expr添加3秒超时保护，防止复杂表达式卡死
-        result = with_timeout(evaluate_expr, 3.0, expr, x_values)
+        result = evaluate_expr(expr, x_values)
         return True, result
-    except TimeoutError as e:
-        if error_callback:
-            error_callback(f"计算超时: {str(e)}")
-        return False, None
     except Exception as e:
         if error_callback:
             error_callback(str(e))
