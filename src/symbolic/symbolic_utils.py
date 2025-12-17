@@ -8,6 +8,7 @@ import numpy as np
 import sympy as sp
 from typing import List, Tuple
 from src.utils.timeout_utils import TimeoutError
+from src.symbolic.corruption import corrupt_expression, replace_variables
 
 
 # 运算符定义
@@ -83,7 +84,7 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
         if depth >= max_depth:
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
-        if random.random() < 0.7:  # 70%概率创建操作节点
+        if random.random() < 0.5:  # 50%概率创建操作节点
             if random.choice(['unary', 'binary']) == 'unary':
                 op = random.choice(UNARY_OPS)
                 return apply_unary_op(op, generate_expr(depth + 1))
@@ -98,8 +99,7 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
 
     # 简化表达式（带超时保护）
     try:
-        simplified = timed_simplify(expr, max_time=0.5)
-        expr = simplified
+        expr = timed_simplify(expr, max_time=0.5)
     except Exception as e:
         pass  # 简化失败就使用原始表达式
 
@@ -133,26 +133,6 @@ def apply_binary_op(op: str, left: sp.Expr, right: sp.Expr) -> sp.Expr:
     return left + right
 
 
-def corrupt_expression(expr: sp.Expr, corruption_prob: float = 0.5) -> sp.Expr:
-    """对表达式应用随机破坏"""
-    if random.random() >= corruption_prob:
-        return expr
-
-    corruption_type = random.choice(['simplify', 'replace_constant', 'mutate_operator'])
-
-    if corruption_type == 'simplify':
-        scaled_expr = expr * random.uniform(0.5, 2.0)
-        return timed_simplify(scaled_expr, max_time=1)
-    elif corruption_type == 'replace_constant' and expr.is_Number:
-        return sp.Rational(random.randint(-5, 5))
-    elif corruption_type == 'mutate_operator' and hasattr(expr, 'args') and len(expr.args) >= 2:
-        func_name = str(expr.func).lower()
-        if 'add' in func_name:
-            return expr.args[0] - expr.args[1]
-        elif 'mul' in func_name:
-            return expr.args[0] / (expr.args[1] + sp.Rational(1, 100))
-
-    return expr
 
 
 def reduce_expression(expr: sp.Expr) -> sp.Expr:

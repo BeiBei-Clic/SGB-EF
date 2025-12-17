@@ -22,17 +22,17 @@ from src.utils.log_utils import (
 )
 from src.symbolic.symbolic_utils import (
     expr_to_tree, generate_random_expr,
-    corrupt_expression,
     generate_reduction_sequence,
     evaluate_expression_safe,
     levenshtein_alignment_with_gap,
 )
+from src.symbolic.corruption import corrupt_expression
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 常量定义
-MAX_RETRIES = 3  # 表达式生成和计算的最大重试次数
+MAX_RETRIES = 10  # 表达式生成和计算的最大重试次数
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
@@ -216,12 +216,6 @@ def generate_flow_samples(
             sample_start_time = time.time()
 
             try:
-                if time.time() - sample_start_time > SAMPLE_TIMEOUT:  # 样本生成超时检查
-                    log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
-                    sample_count += 1
-                    pbar.update(1)
-                    continue
-
                 dim = random.randint(1, max_dim)
                 dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
@@ -261,11 +255,18 @@ def generate_flow_samples(
                             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_failed: {type(expr_error).__name__}: {expr_error}")
 
                 if target_expr is None:
-                    sample_count += 1
-                    pbar.update(1)
+                    # 表达式生成失败，重新生成而不是跳过样本
                     continue
 
                 expr_str = str(target_expr)
+
+                # 检查表达式token数量，如果只有一个token则重新生成
+                expr_tree = expr_to_tree(target_expr)
+                expr_tokens = expr_tree.split(',')
+                if len(expr_tokens) <= 1:
+                    log_sample_step(sample_id, "重新生成表达式", f"表达式token数量过少: {len(expr_tokens)} <= 1")
+                    # 不增加sample_count，直接重新生成
+                    continue
 
                 # 如果表达式太复杂，重新生成
                 if len(expr_str) > max_expr_length:
@@ -306,7 +307,12 @@ def generate_flow_samples(
                     log_sample_step(sample_id, f"处理删减表达式 {i+1}/{len(reduction_sequence)}", f"表达式: {str(reduced_expr)}")
 
                     # 对删减后的表达式应用额外的随机破坏
-                    curr_expr = corrupt_expression(reduced_expr, corruption_prob=0.3)
+                    curr_expr = corrupt_expression(reduced_expr)
+
+                    # 检查删减后的表达式是否与目标表达式相同，如果相同则无学习意义
+                    if curr_expr == target_expr:
+                        log_sample_step(sample_id, f"跳过相同的删减表达式 {i+1}", f"破坏后表达式与目标表达式相同")
+                        continue
 
                     # 检查删减后的表达式是否包含复数单位
                     if curr_expr.has(sp.I) or 'I' in str(curr_expr):
