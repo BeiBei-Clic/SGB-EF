@@ -48,6 +48,8 @@ def replace_variables(expr: sp.Expr) -> sp.Expr:
 
 
 def corrupt_expression(expr: sp.Expr) -> sp.Expr:
+    """对表达式进行破坏，模拟计算错误"""
+    corruption_start = time.time()
     """对表达式应用随机破坏"""
     corruption_type = random.choice(['simplify', 'replace_constant', 'mutate_operator', 'replace_variable'])
 
@@ -233,5 +235,9 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
                     return operand ** 2
                 elif mutation_type == 'sin':
                     return sp.sin(operand)
+
+    corruption_time = (time.time() - corruption_start) * 1000
+    if corruption_time > 500:  # 超过500ms记录警告
+        print(f"WARNING: Expression corruption took {corruption_time:.1f}ms for type '{corruption_type}'")
 
     return expr

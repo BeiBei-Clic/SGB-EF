@@ -44,43 +44,37 @@ echo $HF_ENDPOINT
 
 ### 日志文件
 
-- **详细日志**: `logs/sample_generation.log` - 记录所有样本生成步骤
-- **卡住样本日志**: `logs/sample_stuck.log` - 只记录出错的样本信息
+- **主日志**: `logs/sample_generation.log` - 记录详细的样本生成过程
+- **性能日志**: `logs/performance.log` - 记录性能监控信息
 
-### 实时监控
+### 检查数据生成卡顿
+
+当数据生成卡住时，使用以下命令快速定位问题：
 
 ```bash
-# 查看正在生成的样本
+# 1. 查看最新的生成状态
 tail -f logs/sample_generation.log
 
-# 查看卡住的样本
-tail -f logs/sample_stuck.log
+# 2. 查找耗时操作和警告
+grep "WARNING\|TIME" logs/sample_generation.log | tail -10
 
-# 查看最新数据文件
-ls -la data/ | tail -5
+# 3. 查找表达式重试原因
+grep "RETRY_\|重新生成表达式" logs/sample_generation.log | tail -20
 
-# 查看数据生成进度
-ls -la data/*batch*.txt | wc -l
+# 4. 查看各个步骤的耗时分布
+grep "| time=" logs/sample_generation.log | tail -10
+
+# 5. 查找超时的表达式生成
+grep "TIMEOUT\|timeout" logs/sample_generation.log | tail -10
 ```
 
-### 日志分析
+### 常见卡顿原因
 
-```bash
-# 统计卡住样本数量
-grep -c "卡住样本记录" logs/sample_stuck.log
-
-# 查看最常见的错误类型
-grep "错误:" logs/sample_stuck.log | sort | uniq -c | sort -nr
-
-# 查看数据生成时间分布
-grep "开始生成" logs/sample_generation.log | awk '{print $1}' | sort | uniq -c
-
-# 查看当前批次进度
-grep "第.*批" logs/sample_generation.log | tail -1
-
-# 统计复杂表达式样本
-grep "跳过复杂表达式" logs/sample_generation.log | wc -l
-```
+- **表达式生成超时**: `TIMEOUT generate_random_expr >2.0s`
+- **表达式长度问题**: `RETRY_EXPRESSION_TOO_LONG` 或 `RETRY_EXPRESSION_TOKENS_TOO_FEW`
+- **删减序列慢**: `WARNING: generate_reduction_sequence took XXXms`
+- **对齐计算慢**: `WARNING: Levenshtein alignment took XXXms`
+- **表达式破坏慢**: `WARNING: Expression corruption took XXXms`
 
 ## 分布式训练
 
@@ -92,7 +86,7 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_samples 1000\
+    --num_samples 100000\
     --batch_size 48
 ```
 

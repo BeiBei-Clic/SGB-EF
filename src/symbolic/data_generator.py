@@ -230,6 +230,7 @@ def generate_flow_samples(
                 # 生成目标表达式，添加超时保护和重试机制
                 log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
                 target_expr = None
+                expr_valid = False
 
                 for retry_count in range(MAX_RETRIES):
                     retry_start = time.time()
@@ -240,11 +241,31 @@ def generate_flow_samples(
                         retry_time = (time.time() - retry_start) * 1000
 
                         _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EXPR_GEN '{expr_str}' len={len(expr_str)}" + (f" | retry={retry_count+1} | time={retry_time:.1f}ms" if f"retry={retry_count+1} | time={retry_time:.1f}ms" else ""))
-                        break
+
+                        # 验证表达式是否符合要求
+                        expr_tree = expr_to_tree(target_expr)
+                        expr_tokens = expr_tree.split(',')
+
+                        if len(expr_tokens) <= 1:
+                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_TOKENS_TOO_FEW retry={retry_count+1} tokens={len(expr_tokens)} expr='{expr_str}'")
+                            continue  # 继续下一次重试
+
+                        if len(expr_str) > max_expr_length:
+                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_TOO_LONG retry={retry_count+1} length={len(expr_str)} expr='{expr_str[:50]}{'...' if len(expr_str) > 50 else ''}'")
+                            continue  # 继续下一次重试
+
+                        if target_expr.has(sp.I) or 'I' in expr_str:
+                            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY_EXPRESSION_COMPLEX retry={retry_count+1} expr='{expr_str}'")
+                            continue  # 继续下一次重试
+
+                        # 表达式验证通过
+                        expr_valid = True
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EXPRESSION_ACCEPTED retry={retry_count+1} tokens={len(expr_tokens)} length={len(expr_str)} expr='{expr_str}'")
+                        break  # 退出重试循环
+
                     except TimeoutError as te:
                         retry_time = time.time() - retry_start
                         _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] TIMEOUT generate_random_expr >2.0s | dim={dim}, attempt={retry_count+1}, duration={retry_time:.1f}s")
-                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RETRY {retry_count + 1}/{MAX_RETRIES} timeout dim={dim}")
                         if retry_count == MAX_RETRIES - 1:
                             log_sample_step(sample_id, "跳过生成超时的表达式", f"已重试{MAX_RETRIES}次")
                             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_timeout: {type(te).__name__}: {te}")
@@ -254,31 +275,11 @@ def generate_flow_samples(
                             log_sample_step(sample_id, "跳过生成失败的表达式", f"已重试{MAX_RETRIES}次")
                             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR generate_random_expr_failed: {type(expr_error).__name__}: {expr_error}")
 
-                if target_expr is None:
-                    # 表达式生成失败，重新生成而不是跳过样本
+                if not expr_valid:
+                    # 表达式验证失败，重新生成样本
                     continue
 
                 expr_str = str(target_expr)
-
-                # 检查表达式token数量，如果只有一个token则重新生成
-                expr_tree = expr_to_tree(target_expr)
-                expr_tokens = expr_tree.split(',')
-                if len(expr_tokens) <= 1:
-                    log_sample_step(sample_id, "重新生成表达式", f"表达式token数量过少: {len(expr_tokens)} <= 1")
-                    # 不增加sample_count，直接重新生成
-                    continue
-
-                # 如果表达式太复杂，重新生成
-                if len(expr_str) > max_expr_length:
-                    log_sample_step(sample_id, "重新生成表达式", f"表达式过长: {len(expr_str)} > {max_expr_length}")
-                    # 不增加sample_count，直接重新生成
-                    continue
-
-                # 预先检查表达式是否可能导致复数问题
-                if target_expr.has(sp.I) or 'I' in expr_str:
-                    log_sample_step(sample_id, "重新生成表达式", f"表达式包含复数单位I")
-                    # 不增加sample_count，直接重新生成
-                    continue
 
                 # 尝试计算目标值
                 log_sample_step(sample_id, "计算目标表达式值")
@@ -296,8 +297,10 @@ def generate_flow_samples(
 
                 # 生成删减序列
                 log_sample_step(sample_id, "生成删减序列")
+                reduction_start = time.time()
                 reduction_sequence = generate_reduction_sequence(target_expr)
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] REDUCE {len(reduction_sequence)} steps")
+                reduction_time = (time.time() - reduction_start) * 1000
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] REDUCE {len(reduction_sequence)} steps | time={reduction_time:.1f}ms")
 
                 # 为删减序列中的每个表达式创建样本
                 for i, reduced_expr in enumerate(reduction_sequence):
@@ -307,11 +310,15 @@ def generate_flow_samples(
                     log_sample_step(sample_id, f"处理删减表达式 {i+1}/{len(reduction_sequence)}", f"表达式: {str(reduced_expr)}")
 
                     # 对删减后的表达式应用额外的随机破坏
+                    corruption_start = time.time()
                     curr_expr = corrupt_expression(reduced_expr)
+                    corruption_time = (time.time() - corruption_start) * 1000
+                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] CORRUPT step{i+1} | time={corruption_time:.1f}ms")
 
                     # 检查删减后的表达式是否与目标表达式相同，如果相同则无学习意义
                     if curr_expr == target_expr:
                         log_sample_step(sample_id, f"跳过相同的删减表达式 {i+1}", f"破坏后表达式与目标表达式相同")
+                        _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SKIP_DUPLICATE step{i+1}")
                         continue
 
                     # 检查删减后的表达式是否包含复数单位
@@ -320,21 +327,29 @@ def generate_flow_samples(
                         continue
 
                     # 尝试计算当前值
+                    eval_curr_start = time.time()
                     success, y_curr = evaluate_expression_safe(
                         curr_expr, x_array,
                         error_callback=lambda err: log_sample_step(sample_id, f"跳过计算失败的删减表达式 {i+1}", f"计算错误: {err}")
                     )
+                    eval_curr_time = (time.time() - eval_curr_start) * 1000
+                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EVAL_CURR step{i+1} success={success} | time={eval_curr_time:.1f}ms")
                     if not success:
                         continue
 
                     # 转换为token序列
+                    tree_start = time.time()
                     target_tree = expr_to_tree(target_expr)
                     curr_tree = expr_to_tree(curr_expr)
                     target_tokens = target_tree.split(',')
                     curr_tokens = curr_tree.split(',')
+                    tree_time = (time.time() - tree_start) * 1000
 
                     # 对齐到Z空间，包含gap token
+                    align_start = time.time()
                     z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+                    align_time = (time.time() - align_start) * 1000
+                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ALIGN step{i+1} | tree_time={tree_time:.1f}ms align_time={align_time:.1f}ms tokens={len(curr_tokens)}→{len(target_tokens)}")
 
                     batch_samples.append({
                         "input_dimension": dim,
