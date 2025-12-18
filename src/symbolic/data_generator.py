@@ -17,6 +17,8 @@ from src.utils.log_utils import (
     _write_log, log_sample_step,
     log_batch_progress
 )
+from src.symbolic.symbolic_utils import generate_random_expr, evaluate_expression_safe, expr_to_tree
+from src.symbolic.corruption import corrupt_expression
 from src.symbolic.sample_generator import generate_single_sample, set_log_writer
 from tqdm import tqdm
 
@@ -52,7 +54,7 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
 
     # 生成当前表达式
     log_sample_step(sample_id, "生成当前表达式(破坏)")
-    curr_expr = corrupt_expression(target_expr, 0.5)
+    curr_expr = corrupt_expression(target_expr)
 
     _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SUCCESS")
 
