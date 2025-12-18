@@ -203,5 +203,4 @@ def generate_single_sample(
         duration = time.time() - sample_start_time
         _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR sample_generation: {type(e).__name__}: {e}")
         _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] STUCK {duration:.1f}s")
-        print(f"警告: 生成样本时出错，跳过该样本: {e}")
         return []

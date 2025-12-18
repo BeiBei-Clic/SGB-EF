@@ -204,7 +204,7 @@ def generate_flow_samples(
         # 记录批次开始
         log_batch_progress(batch_idx, num_batches, batch_idx * batch_size, num_samples)
 
-        SAMPLE_TIMEOUT = 30.0  # 单个样本生成超时时间（秒）
+        SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
 
         while sample_count < current_batch_size:
             sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
@@ -254,7 +254,6 @@ def generate_flow_samples(
             except Exception as e:
                 # 其他异常处理
                 _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR: {type(e).__name__}: {e}")
-                print(f"警告: 生成样本时出错，跳过该样本: {e}")
                 sample_count += 1  # 增加计数避免无限循环
                 pbar.update(1)
                 continue

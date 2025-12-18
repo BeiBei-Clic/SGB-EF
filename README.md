@@ -60,7 +60,7 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_samples 100000\
+    --num_samples 10000000\
     --batch_size 48
 ```
 

@@ -67,30 +67,95 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
     """生成随机表达式"""
+    import time
+    import datetime
+    start_time = time.time()
+
+    def log_debug(step: str, details: str = ""):
+        """记录调试日志"""
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        message = f"[GENERATE_RANDOM_EXPR] {step}"
+        if details:
+            message += f" | {details}"
+        try:
+            from src.utils.log_utils import _write_log
+            if _write_log:
+                _write_log(f"{timestamp} {message}")
+        except:
+            pass
+
+    log_debug("开始", f"input_dimension={input_dimension}, max_depth={max_depth}")
+
+    # 创建符号
+    symbol_start = time.time()
     symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
+    symbol_time = (time.time() - symbol_start) * 1000
+    log_debug("符号创建完成", f"{symbol_time:.1f}ms, symbols={[str(s) for s in symbols]}")
+
+    # 递归生成表达式的计数器
+    recursion_count = 0
+    max_recursions = 1000  # 防止无限递归
 
     def generate_expr(depth: int) -> sp.Expr:
-        if depth >= max_depth:
-            return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
+        nonlocal recursion_count
+        recursion_count += 1
 
-        if random.random() < 0.5:  # 50%概率创建操作节点
-            if random.choice(['unary', 'binary']) == 'unary':
+        if recursion_count > max_recursions:
+            raise Exception(f"递归次数过多: {recursion_count} > {max_recursions}")
+
+        if depth >= max_depth:
+            result = random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
+            log_debug(f"递归底层(depth={depth})", str(result))
+            return result
+
+        node_type = "operation" if random.random() < 0.5 else "leaf"
+        log_debug(f"递归层(depth={depth})", f"选择{node_type}")
+
+        if node_type == "operation":
+            op_type = random.choice(['unary', 'binary'])
+            log_debug(f"递归层(depth={depth})", f"选择{op_type}操作")
+
+            if op_type == 'unary':
                 op = random.choice(UNARY_OPS)
-                return apply_unary_op(op, generate_expr(depth + 1))
+                log_debug(f"递归层(depth={depth})", f"应用一元操作{op}")
+                operand = generate_expr(depth + 1)
+                result = apply_unary_op(op, operand)
+                log_debug(f"递归层(depth={depth})", f"{op}({operand}) = {result}")
+                return result
             else:
                 op = random.choice(BINARY_OPS)
-                return apply_binary_op(op, generate_expr(depth + 1), generate_expr(depth + 1))
+                log_debug(f"递归层(depth={depth})", f"应用二元操作{op}")
+                left = generate_expr(depth + 1)
+                right = generate_expr(depth + 1)
+                result = apply_binary_op(op, left, right)
+                log_debug(f"递归层(depth={depth})", f"{left} {op} {right} = {result}")
+                return result
         else:
-            return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
+            result = random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
+            log_debug(f"递归层(depth={depth})", f"叶子节点 {result}")
+            return result
 
     # 生成表达式
+    log_debug("开始生成表达式")
+    gen_start = time.time()
     expr = generate_expr(0)
+    gen_time = (time.time() - gen_start) * 1000
+    log_debug("表达式生成完成", f"{gen_time:.1f}ms, 递归次数={recursion_count}, 表达式={expr}")
 
     # 简化表达式
+    log_debug("开始简化表达式")
+    simplify_start = time.time()
     try:
         expr = simplify_expr(expr)
+        simplify_time = (time.time() - simplify_start) * 1000
+        log_debug("表达式简化成功", f"{simplify_time:.1f}ms, 简化后={expr}")
     except Exception as e:
-        pass  # 简化失败就使用原始表达式
+        simplify_time = (time.time() - simplify_start) * 1000
+        log_debug("表达式简化失败", f"{simplify_time:.1f}ms, 错误={e}, 使用原始表达式")
+        # 简化失败就使用原始表达式
+
+    total_time = (time.time() - start_time) * 1000
+    log_debug("generate_random_expr完成", f"总时间={total_time:.1f}ms, 最终表达式={expr}")
 
     return expr
 
