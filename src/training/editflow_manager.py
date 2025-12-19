@@ -28,7 +28,14 @@ from ..utils.gpu_monitor import get_gpu_memory_info, get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 
 class EditFlowManager:
-    """EditFlow模型管理器 - 支持训练和推理功能"""
+    """EditFlow模型管理器 - 支持训练和推理功能
+
+    新增功能：多时间步采样训练
+    - num_timesteps参数控制每个样本采样的时间步数量
+    - 默认值为20，可以大幅提升训练数据利用效率
+    - 每个原始样本将生成num_timesteps个训练实例
+    - 在训练过程中会自动进行损失聚合，确保梯度计算正确
+    """
 
     def __init__(self, args):
         self.args = args
@@ -61,6 +68,7 @@ class EditFlowManager:
             print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
             print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
             print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
+            print(f"时间步采样数: {getattr(self.args, 'num_timesteps', 20)} (每个样本生成的时间步训练数量)")
 
             print(f"\nAccelerate 初始化完成")
             print(f"  设备: {self.device}")
@@ -258,23 +266,33 @@ class EditFlowManager:
 
   
     def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info=None):
-        batch_size = z0_token_ids.size(0)
-        t = torch.rand(batch_size, 1, device=self.device)
+        # 多时间步采样参数
+        num_timesteps = getattr(self.args, 'num_timesteps', 20)  # 默认每个样本采样20个时间步
+
+        original_batch_size = z0_token_ids.size(0)
 
         # 获取debug参数
         debug_mode = getattr(self.args, 'debug', False)
 
-        # 调试：检查z0和z1 token IDs的有效性（仅在debug模式且为第一个batch时）
-        # if debug_info and debug_info.get('is_first_batch', False) and debug_mode:
-        #     print(f"\n[DEBUG] {debug_info.get('context', '')} z0_token_ids统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}, shape={z0_token_ids.shape}")
-        #     print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}, shape={z1_token_ids.shape}")
-        #     print(f"[DEBUG] vocab_size={config.vocab_size}")
+        # 为每个样本采样多个时间步
+        t = torch.rand(original_batch_size, num_timesteps, 1, device=self.device)  # [B, K, 1]
 
-        #     # 检查是否有越界的token IDs
-        #     z0_valid = (z0_token_ids >= 0) & (z0_token_ids < config.vocab_size)
-        #     z1_valid = (z1_token_ids >= 0) & (z1_token_ids < config.vocab_size)
-        #     print(f"[DEBUG] z0_token_ids有效率: {z0_valid.float().mean().item():.4f}")
-        #     print(f"[DEBUG] z1_token_ids有效率: {z1_valid.float().mean().item():.4f}")
+        # 扩展条件嵌入到多时间步
+        # condition_embeddings: [B, D] -> [B, K, D]
+        condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1)
+
+        # 扩展token序列到多时间步
+        # z0_token_ids: [B, L] -> [B*K, L]
+        z0_token_ids_expanded = z0_token_ids.unsqueeze(1).expand(-1, num_timesteps, -1).contiguous()
+        z1_token_ids_expanded = z1_token_ids.unsqueeze(1).expand(-1, num_timesteps, -1).contiguous()
+
+        # 重塑为标准批次格式
+        z0_token_ids = z0_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
+        z1_token_ids = z1_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
+        t = t.reshape(original_batch_size * num_timesteps, -1)
+        condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, -1)
+
+        batch_size = z0_token_ids.size(0)  # 更新batch_size为扩展后的大小
 
         # z0 token序列转换为概率分布
         batch_size, seq_len = z0_token_ids.shape
@@ -288,20 +306,22 @@ class EditFlowManager:
 
         # 调试：检查概率分布（仅在debug模式且为第一个batch时）
         if debug_info and debug_info.get('is_first_batch', False) and debug_mode and self.accelerator.is_local_main_process:
+            print(f"[DEBUG] {debug_info.get('context', '')} 多时间步采样: num_timesteps={num_timesteps}")
+            print(f"[DEBUG] {debug_info.get('context', '')} 原始批次大小: {original_batch_size}, 扩展后批次大小: {batch_size}")
             print(f"[DEBUG] {debug_info.get('context', '')} z0_probs 形状: {z0_probs.shape}")
             print(f"[DEBUG] {debug_info.get('context', '')} z1_probs 形状: {z1_probs.shape}")
             print(f"[DEBUG] {debug_info.get('context', '')} vocab_size: {config.vocab_size}")
             print(f"[DEBUG] {debug_info.get('context', '')} z0_token_ids 统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}")
             print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids 统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}")
 
-            # 检查每个位置的token ID和对应的概率
+            # 检查前几个样本的token ID和时间步
             for i in range(min(3, z0_token_ids.size(0))):
-                print(f"[DEBUG] 样本 {i} z0_token_ids: {z0_token_ids[i].tolist()}")
-                print(f"[DEBUG] 样本 {i} z1_token_ids: {z1_token_ids[i].tolist()}")
-                # 检查第一个位置的one-hot概率
-                token_id_0 = z0_token_ids[i, 0].item()
-                print(f"[DEBUG] 样本 {i} 位置0 token_id={token_id_0}, 对应概率: {z0_probs[i, 0, token_id_0].item()}")
-            print(f"[DEBUG] t: min={t.min().item()}, max={t.max().item()}, mean={t.mean().item():.4f}")
+                sample_idx = i // num_timesteps  # 原始样本索引
+                t_idx = i % num_timesteps       # 时间步索引
+                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} z0_token_ids: {z0_token_ids[i].tolist()}")
+                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} z1_token_ids: {z1_token_ids[i].tolist()}")
+                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} t: {t[i].item():.4f}")
+            print(f"[DEBUG] 时间步统计: min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}")
 
 
         z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler, debug=debug_mode)
@@ -341,6 +361,9 @@ class EditFlowManager:
         effective_vocab_size = forward_results['vocab_size']
         gap_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
 
+        # 获取时间步采样数量
+        num_timesteps = getattr(self.args, 'num_timesteps', 20)
+
         lambda_ins = pred_rates[:, :, 0:1]
         lambda_sub = pred_rates[:, :, 1:2]
         lambda_del = pred_rates[:, :, 2:3]
@@ -358,6 +381,8 @@ class EditFlowManager:
 
         # 调试：打印u矩阵
         if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG COMPUTE_LOSS] 多时间步采样: num_timesteps={num_timesteps}")
+            print(f"[DEBUG COMPUTE_LOSS] 扩展后批次大小: {pred_rates.size(0)}")
             print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
             print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
             print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
@@ -366,7 +391,7 @@ class EditFlowManager:
             print(f"[DEBUG COMPUTE_LOSS] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
             print(f"[DEBUG COMPUTE_LOSS] u_mask shape: {u_mask.shape}")
             print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
-            print(f"[DEBUG COMPUTE_LOSS] t: {t.squeeze(-1)}")
+            print(f"[DEBUG COMPUTE_LOSS] t shape: {t.shape}, t范围: [{t.min().item():.4f}, {t.max().item():.4f}]")
 
         loss = criterion(u_z, u_mask, t, effective_vocab_size)
         return loss
@@ -459,10 +484,13 @@ class EditFlowManager:
 
             # 只在主进程更新进度条显示
             if self.accelerator.is_local_main_process:
+                # 获取时间步采样数量用于显示
+                num_timesteps = getattr(self.args, 'num_timesteps', 20)
                 postfix_dict = {
                     'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
                     'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
-                    'gpu_load': get_gpu_memory_usage_string(max_gpus=3)
+                    'gpu_load': get_gpu_memory_usage_string(max_gpus=3),
+                    't_steps': num_timesteps  # 显示时间步采样数量
                 }
                 progress_bar.set_postfix(postfix_dict)
 
