@@ -94,26 +94,29 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
                     # 延迟创建进度条：等到第一个样本成功生成时才创建
                     if verbose and not pbar_created and pbar is None:
-                        # 使用批次号作为position，确保每个批次都有唯一的显示位置
-                        position = batch_idx % 40  # 限制在40行内
+                        # 每个批次使用固定的唯一position，确保不互相覆盖
+                        position = batch_idx + 2  # 从第2行开始，每个批次占用一行
                         pbar = tqdm(
                             total=current_batch_size,
-                            desc=f"B{batch_idx+1}",
+                            desc=f"B{batch_idx+1:>2}",  # 右对齐，保持宽度一致
                             position=position,
-                            leave=False,
+                            leave=True,  # 保持进度条显示，避免被其他输出覆盖
                             unit="样本",
-                            ncols=100,
-                            bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{rate_fmt}]',
-                            mininterval=1.0,  # 1秒更新一次，减少闪烁
-                            initial=sample_count,  # 设置初始值，避免从0开始的闪烁
-                            file=sys.stdout
+                            ncols=80,
+                            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                            mininterval=3.0,  # 3秒更新一次，减少刷新频率
+                            initial=sample_count,
+                            file=sys.stdout,
+                            smoothing=0.3  # 平滑速率显示
                         )
                         pbar_created = True
 
-                    if pbar:
-                        pbar.update(1)
                     sample_count += 1
                     dimension_count[dim] = dimension_count.get(dim, 0) + 1
+
+                    # 每10个样本更新一次进度条，减少频繁刷新
+                    if pbar and sample_count % 10 == 0:
+                        pbar.update(10)
             else:
                 # 样本生成失败，记录并继续（不增加sample_count）
                 _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] FAILED: No samples generated")
@@ -130,8 +133,12 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] ERROR: {type(e).__name__}: {e}")
             continue
 
-    # 关闭进度条
+    # 关闭进度条，确保最终计数正确
     if pbar:
+        # 更新剩余的样本数（可能不是10的倍数）
+        remaining_samples = sample_count % 10
+        if remaining_samples > 0:
+            pbar.update(remaining_samples)
         pbar.close()
 
     # 立即保存当前批次到文件
