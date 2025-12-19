@@ -11,6 +11,7 @@ import json
 import datetime
 import multiprocessing
 from typing import List, Dict, Tuple
+from tqdm import tqdm
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
     _write_log, log_sample_step
@@ -56,6 +57,19 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
     SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
 
+    # 创建进度条
+    pbar = None
+    if verbose:
+        # 使用tqdm创建进度条，设置position和leave参数以支持多进程并行显示
+        pbar = tqdm(
+            total=current_batch_size,
+            desc=f"{process_prefix} 生成进度",
+            position=process_id,
+            leave=False,
+            unit="样本",
+            ncols=80
+        )
+
     while sample_count < current_batch_size:
         sample_id = f"{process_prefix}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
 
@@ -79,32 +93,35 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             if generated_samples:
                 # 获取维度信息用于统计
                 dim = generated_samples[0]["input_dimension"]
-                dimension_count[dim] = dimension_count.get(dim, 0) + 1
 
                 # 添加生成的样本到批次
                 for sample in generated_samples:
                     if sample_count >= current_batch_size:
                         break
                     batch_samples.append(sample)
+                    if pbar:
+                        pbar.update(1)
                     sample_count += 1
+                    dimension_count[dim] = dimension_count.get(dim, 0) + 1
             else:
-                # 样本生成失败，记录并继续
+                # 样本生成失败，记录并继续（不增加sample_count）
                 _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] FAILED: No samples generated")
-                sample_count += 1  # 增加计数避免无限循环
                 continue
 
         except TimeoutError:
-            # 超时处理
+            # 超时处理（不增加sample_count）
             log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] TIMEOUT: Sample generation exceeded {SAMPLE_TIMEOUT}s")
-            sample_count += 1  # 增加计数避免无限循环
             continue
 
         except Exception as e:
-            # 其他异常处理
+            # 其他异常处理（不增加sample_count）
             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] ERROR: {type(e).__name__}: {e}")
-            sample_count += 1  # 增加计数避免无限循环
             continue
+
+    # 关闭进度条
+    if pbar:
+        pbar.close()
 
     # 立即保存当前批次到文件
     if batch_samples:
@@ -115,7 +132,7 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                 f.write(sample_line + '\n')
 
         if verbose:
-            print(f"{process_prefix} 已保存 {len(batch_samples)} 个样本到 {batch_filename}")
+            print(f"\n{process_prefix} 已保存 {len(batch_samples)} 个样本到 {batch_filename}")
             print(f"{process_prefix} 批次维度分布:")
             for dim, count in sorted(dimension_count.items()):
                 print(f"  {dim}维: {count} 个样本")
@@ -205,7 +222,9 @@ def load_dimension_index(filename: str, verbose: bool = True) -> Dict[int, List[
         print(f"维度统计完成，共发现 {len(dimension_samples)} 个维度")
 
     # 保存维度索引到缓存文件
-    os.makedirs(os.path.dirname(index_filename), exist_ok=True)
+    index_dir = os.path.dirname(index_filename)
+    if index_dir:  # 只有当目录不为空时才创建
+        os.makedirs(index_dir, exist_ok=True)
     index_data = {}
     for dim, positions in dimension_samples.items():
         index_data[str(dim)] = [int(pos) for pos in positions]
@@ -315,18 +334,36 @@ def generate_flow_samples(
         with multiprocessing.Pool(processes=num_processes) as pool:
             # 使用imap_unordered来获得更好的负载均衡和实时进度反馈
             results = []
+            if verbose:
+                # 创建总体进度条
+                overall_pbar = tqdm(
+                    total=len(batch_tasks),
+                    desc="总体批次进度",
+                    position=num_processes,  # 放在最下方
+                    leave=True,
+                    unit="批次",
+                    ncols=80
+                )
+
             for i, result in enumerate(pool.imap_unordered(generate_batch_worker, batch_tasks)):
                 batch_idx, _, dimension_count = result
                 results.append(result)
 
                 if verbose:
-                    print(f"批次 {batch_idx + 1} 完成 (进度: {i + 1}/{len(batch_tasks)})")
+                    # 更新总体进度条
+                    if 'overall_pbar' in locals():
+                        overall_pbar.update(1)
+                        overall_pbar.set_postfix_str(f"批次 {batch_idx + 1} 完成")
+                    else:
+                        print(f"批次 {batch_idx + 1} 完成 (进度: {i + 1}/{len(batch_tasks)})")
 
                 # 累积维度统计
                 for dim, count in dimension_count.items():
                     total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
 
-            if verbose:
+            # 关闭总体进度条
+            if verbose and 'overall_pbar' in locals():
+                overall_pbar.close()
                 print(f"所有 {len(batch_tasks)} 个批次并行处理完成")
 
     if verbose and total_dimension_count:
@@ -356,7 +393,20 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
     else:
         print(f"\n=== 批次文件合并模式 ===")
 
-    dimension_samples = {}  # 存储每个维度的样本位置索引
+    # 加载已有的维度索引（断点续传时）
+    index_filename = filename.replace('.txt', '_dimension_index.json')
+    dimension_samples = {}
+
+    if os.path.exists(index_filename) and os.path.exists(filename):
+        # 如果索引文件和主文件都存在，加载已有索引
+        print(f"加载已有维度索引: {index_filename}")
+        with open(index_filename, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+
+        # 转换回原来的格式
+        for dim_str, positions in index_data.items():
+            dimension_samples[int(dim_str)] = positions
+        print(f"已加载 {len(dimension_samples)} 个维度的索引信息")
 
     with open(filename, 'a', encoding='utf-8') as main_file:
         for batch_idx in range(num_batches):
@@ -373,7 +423,7 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
                             batch_samples.append(sample)
                 print(f"已加载 {len(batch_samples)} 个样本")
                 for sample in batch_samples:
-                    # 记录当前位置
+                    # 记录当前位置（即将写入的位置）
                     pos = main_file.tell()
                     dim = sample['input_dimension']
                     if dim not in dimension_samples:
@@ -388,15 +438,14 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
                 os.remove(batch_filename)
                 print(f"已合并并删除批次文件: {batch_filename}")
 
-    # 保存维度索引文件
-    index_filename = filename.replace('.txt', '_dimension_index.json')
+    # 保存完整的维度索引文件（包含已有数据和新数据）
     os.makedirs(os.path.dirname(index_filename), exist_ok=True)
     index_data = {}
     for dim, positions in dimension_samples.items():
         index_data[str(dim)] = [int(pos) for pos in positions]
     with open(index_filename, 'w', encoding='utf-8') as f:
         json.dump(index_data, f, indent=2)
-    print(f"维度索引已保存到 {index_filename}")
+    print(f"完整维度索引已保存到 {index_filename}")
 
     # 根据模式打印维度分布
     if total_dimension_count is not None:
