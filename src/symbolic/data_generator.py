@@ -47,7 +47,7 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     np.random.seed(seed_val)
 
     # 设置日志进程标识
-    process_prefix = f"[P{process_id}-B{batch_idx+1}]"
+    process_prefix = f"[B{batch_idx+1}]"  # 使用批次号作为唯一标识
 
     # 批次开始信息通过进度条显示，避免额外print输出
 
@@ -57,24 +57,10 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
     SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
 
-    # 创建进度条
+    # 延迟创建进度条，等到真正开始生成样本时才创建
+    # 这样可以避免多进程初始化时的显示混乱
     pbar = None
-    if verbose:
-        # 给每个进程分配固定行，避免互相覆盖
-        max_processes = 32  # 最多支持32个进程
-        position = process_id % max_processes  # 进程0用第0行，进程1用第1行...
-
-        pbar = tqdm(
-            total=current_batch_size,
-            desc=f"P{process_id}-B{batch_idx+1}",
-            position=position,  # 每个进程固定一行
-            leave=True,  # 保持显示，不要清除
-            unit="样本",
-            ncols=80,
-            bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{rate_fmt}]',
-            mininterval=3.0,  # 3秒更新一次
-            file=sys.stdout
-        )
+    pbar_created = False
 
     while sample_count < current_batch_size:
         sample_id = f"{process_prefix}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
@@ -105,6 +91,25 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                     if sample_count >= current_batch_size:
                         break
                     batch_samples.append(sample)
+
+                    # 延迟创建进度条：等到第一个样本成功生成时才创建
+                    if verbose and not pbar_created and pbar is None:
+                        # 使用批次号作为position，确保每个批次都有唯一的显示位置
+                        position = batch_idx % 40  # 限制在40行内
+                        pbar = tqdm(
+                            total=current_batch_size,
+                            desc=f"B{batch_idx+1}",
+                            position=position,
+                            leave=False,
+                            unit="样本",
+                            ncols=100,
+                            bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{rate_fmt}]',
+                            mininterval=1.0,  # 1秒更新一次，减少闪烁
+                            initial=sample_count,  # 设置初始值，避免从0开始的闪烁
+                            file=sys.stdout
+                        )
+                        pbar_created = True
+
                     if pbar:
                         pbar.update(1)
                     sample_count += 1
@@ -305,6 +310,10 @@ def generate_flow_samples(
     # 开始数据生成
     if verbose:
         print(f"使用 {num_processes} 个进程并行生成 {num_samples} 个样本，共 {num_batches} 批...")
+        # 设置tqdm环境变量，避免自动隐藏进度条
+        os.environ['TQDM_DISABLE'] = ''
+        os.environ['TQDM_MININTERVAL'] = '1'
+        os.environ['TQDM_MAXLEVEL'] = '1000'  # 允许更多级别的嵌套进度条
 
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
@@ -340,39 +349,22 @@ def generate_flow_samples(
         with multiprocessing.Pool(processes=num_processes) as pool:
             # 使用imap_unordered来获得更好的负载均衡和实时进度反馈
             results = []
-            if verbose:
-                # 创建总体进度条，放在进程进度条下方
-                overall_pbar = tqdm(
-                    total=len(batch_tasks),
-                    desc=f"批次进度 ({len(batch_tasks)}批次)",
-                    position=40,  # 放在第40行，远离进程进度条
-                    leave=True,
-                    unit="批次",
-                    ncols=80,
-                    bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                    mininterval=2.0
-                )
+            completed_count = 0
 
-            for i, result in enumerate(pool.imap_unordered(generate_batch_worker, batch_tasks)):
+            for result in pool.imap_unordered(generate_batch_worker, batch_tasks):
                 batch_idx, _, dimension_count = result
                 results.append(result)
+                completed_count += 1
 
                 if verbose:
-                    # 更新总体进度条
-                    if 'overall_pbar' in locals():
-                        overall_pbar.update(1)
-                        overall_pbar.set_postfix_str(f"批次 {batch_idx + 1} 完成")
-                    else:
-                        print(f"批次 {batch_idx + 1} 完成 (进度: {i + 1}/{len(batch_tasks)})")
+                    print(f"\r批次 {batch_idx + 1} 完成 (进度: {completed_count}/{len(batch_tasks)})", end='', flush=True)
 
                 # 累积维度统计
                 for dim, count in dimension_count.items():
                     total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
 
-            # 关闭总体进度条
-            if verbose and 'overall_pbar' in locals():
-                overall_pbar.close()
-                print(f"所有 {len(batch_tasks)} 个批次并行处理完成")
+            if verbose:
+                print(f"\n所有 {len(batch_tasks)} 个批次并行处理完成")
 
     if verbose and total_dimension_count:
         print(f"\n已完成批次的维度分布:")
