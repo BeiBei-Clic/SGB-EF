@@ -9,21 +9,118 @@ import warnings
 import time
 import json
 import datetime
-from typing import List, Dict
+import multiprocessing
+from typing import List, Dict, Tuple
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
-    _write_log, log_sample_step,
-    log_batch_progress
+    _write_log, log_sample_step
 )
 from src.symbolic.symbolic_utils import generate_random_expr, evaluate_expression_safe, expr_to_tree
 from src.symbolic.corruption import corrupt_expression
 from src.symbolic.sample_generator import generate_single_sample, set_log_writer
-from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 常量定义
 MAX_RETRIES = 5  # 表达式生成和计算的最大重试次数
+
+def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]:
+    """单个进程处理一个批次的数据生成（用于多进程）
+
+    Args:
+        args: 包含所有必要参数的元组
+            (batch_idx, current_batch_size, max_dim, n_points, max_depth,
+             max_expr_length, batch_filename, verbose, process_id)
+
+    Returns:
+        Tuple[int, List[Dict], Dict[int, int]]:
+            (批次索引, 生成的样本列表, 维度统计)
+    """
+    (batch_idx, current_batch_size, max_dim, n_points, max_depth,
+     max_expr_length, batch_filename, verbose, process_id) = args
+
+    # 设置进程特定的随机种子
+    seed_val = (int(time.time()) + process_id * 1000 + batch_idx * 100) % (2**32 - 1)
+    random.seed(seed_val)
+    np.random.seed(seed_val)
+
+    # 设置日志进程标识
+    process_prefix = f"[P{process_id}-B{batch_idx+1}]"
+
+    if verbose:
+        print(f"{process_prefix} 开始生成第 {batch_idx + 1} 批，大小: {current_batch_size}")
+
+    batch_samples = []
+    dimension_count = {}
+    sample_count = 0
+
+    SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
+
+    while sample_count < current_batch_size:
+        sample_id = f"{process_prefix}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
+
+        try:
+            # 使用带超时保护的样本生成函数
+            generated_samples = with_timeout(
+                generate_single_sample,
+                SAMPLE_TIMEOUT,
+                sample_id,
+                max_dim,
+                n_points,
+                max_depth,
+                max_expr_length,
+                MAX_RETRIES,
+                batch_idx,
+                current_batch_size,
+                sample_count
+            )
+
+            # 如果成功生成样本，添加到批次中
+            if generated_samples:
+                # 获取维度信息用于统计
+                dim = generated_samples[0]["input_dimension"]
+                dimension_count[dim] = dimension_count.get(dim, 0) + 1
+
+                # 添加生成的样本到批次
+                for sample in generated_samples:
+                    if sample_count >= current_batch_size:
+                        break
+                    batch_samples.append(sample)
+                    sample_count += 1
+            else:
+                # 样本生成失败，记录并继续
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] FAILED: No samples generated")
+                sample_count += 1  # 增加计数避免无限循环
+                continue
+
+        except TimeoutError:
+            # 超时处理
+            log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
+            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] TIMEOUT: Sample generation exceeded {SAMPLE_TIMEOUT}s")
+            sample_count += 1  # 增加计数避免无限循环
+            continue
+
+        except Exception as e:
+            # 其他异常处理
+            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] ERROR: {type(e).__name__}: {e}")
+            sample_count += 1  # 增加计数避免无限循环
+            continue
+
+    # 立即保存当前批次到文件
+    if batch_samples:
+        os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
+        with open(batch_filename, 'w', encoding='utf-8') as f:
+            for sample in batch_samples:
+                sample_line = json.dumps(sample, ensure_ascii=False)
+                f.write(sample_line + '\n')
+
+        if verbose:
+            print(f"{process_prefix} 已保存 {len(batch_samples)} 个样本到 {batch_filename}")
+            print(f"{process_prefix} 批次维度分布:")
+            for dim, count in sorted(dimension_count.items()):
+                print(f"  {dim}维: {count} 个样本")
+
+    return batch_idx, batch_samples, dimension_count
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
@@ -125,8 +222,9 @@ def generate_flow_samples(
     max_expr_length: int = 24,
     batch_size: int = 50000,
     verbose: bool = True,
+    num_processes: int = None,
 ):
-    """生成用于EditFlow连续流训练的数据文件，支持断点续传
+    """生成用于EditFlow连续流训练的数据文件，支持断点续传和多进程并行处理
 
     Args:
         num_samples: 总样本数
@@ -136,6 +234,7 @@ def generate_flow_samples(
         max_expr_length: 表达式最大字符长度（默认24）
         batch_size: 批次大小
         verbose: 是否显示详细输出
+        num_processes: 进程数，None表示使用所有可用CPU核心
     """
 
     # 设置样本生成器的日志写入函数
@@ -169,19 +268,28 @@ def generate_flow_samples(
             merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count=None)
         return
 
+    # 设置多进程参数
+    if num_processes is None:
+        num_processes = multiprocessing.cpu_count()
+        if verbose:
+            print(f"使用所有 {num_processes} 个CPU核心进行并行处理")
+    else:
+        if verbose:
+            print(f"使用 {num_processes} 个进程进行并行处理")
+
     # 开始数据生成
     if verbose:
-        print(f"分批生成 {num_samples} 个样本，共 {num_batches} 批...")
+        print(f"使用 {num_processes} 个进程并行生成 {num_samples} 个样本，共 {num_batches} 批...")
 
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
-    # 遍历所有批次
+    # 收集需要处理的批次
+    batch_tasks = []
     for batch_idx in range(num_batches):
         # 获取当前批次的文件名
         batch_filename = batch_filenames[batch_idx]
         current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
-        batch_start_time = time.time()
 
         # 如果这个批次文件已经存在，直接跳过
         if os.path.exists(batch_filename):
@@ -189,100 +297,42 @@ def generate_flow_samples(
                 print(f"跳过已存在的批次 {batch_idx + 1}")
             continue
 
+        # 添加到任务列表，为每个任务分配一个进程ID
+        process_id = len(batch_tasks) % num_processes
+        batch_tasks.append((
+            batch_idx, current_batch_size, max_dim, n_points, max_depth,
+            max_expr_length, batch_filename, verbose, process_id
+        ))
+
+    if not batch_tasks:
         if verbose:
-            print(f"开始生成第 {batch_idx + 1}/{num_batches} 批...")
-
-        batch_samples, dimension_count, sample_count = [], {}, 0
-        # 进度条
-        pbar = tqdm(total=current_batch_size, desc=f"第{batch_idx + 1}批")
-  
-        # 记录批次开始
-        log_batch_progress(batch_idx, num_batches, batch_idx * batch_size, num_samples)
-
-        SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
-
-        while sample_count < current_batch_size:
-            sample_id = f"batch{batch_idx+1}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
-
-            try:
-                # 使用带超时保护的样本生成函数
-                generated_samples = with_timeout(
-                    generate_single_sample,
-                    SAMPLE_TIMEOUT,
-                    sample_id,
-                    max_dim,
-                    n_points,
-                    max_depth,
-                    max_expr_length,
-                    MAX_RETRIES,
-                    batch_idx,
-                    current_batch_size,
-                    sample_count
-                )
-
-                # 如果成功生成样本，添加到批次中
-                if generated_samples:
-                    # 获取维度信息用于统计
-                    dim = generated_samples[0]["input_dimension"]
-                    dimension_count[dim] = dimension_count.get(dim, 0) + 1
-
-                    # 添加生成的样本到批次
-                    for sample in generated_samples:
-                        if sample_count >= current_batch_size:
-                            break
-                        batch_samples.append(sample)
-                        sample_count += 1
-                        pbar.update(1)
-                else:
-                    # 样本生成失败，记录并继续
-                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] FAILED: No samples generated")
-                    continue
-
-            except TimeoutError:
-                # 超时处理
-                log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] TIMEOUT: Sample generation exceeded {SAMPLE_TIMEOUT}s")
-                sample_count += 1  # 增加计数避免无限循环
-                pbar.update(1)
-                continue
-
-            except Exception as e:
-                # 其他异常处理
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] ERROR: {type(e).__name__}: {e}")
-                sample_count += 1  # 增加计数避免无限循环
-                pbar.update(1)
-                continue
-
-        pbar.close()
-
-        # 计算批次统计
-        batch_duration = time.time() - batch_start_time
-        avg_time = batch_duration / current_batch_size if current_batch_size > 0 else 0
-        success_rate = len(batch_samples) / current_batch_size if current_batch_size > 0 else 0
-
-        # 记录批次完成统计
-        log_batch_progress(batch_idx, num_batches, (batch_idx + 1) * batch_size, num_samples,
-                          avg_time, success_rate)
-
-        # 累积维度统计
-        for dim, count in dimension_count.items():
-            total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
-
-        # 立即保存当前批次
-        batch_filename = batch_filenames[batch_idx]
+            print("所有批次文件已存在，跳过生成阶段")
+    else:
         if verbose:
-            print(f"保存数据到 {batch_filename}...")
-        os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
-        with open(batch_filename, 'w', encoding='utf-8') as f:
-            for sample in batch_samples:
-                sample_line = json.dumps(sample, ensure_ascii=False)
-                f.write(sample_line + '\n')
-        print(f"已保存 {len(batch_samples)} 个样本到 {batch_filename}")
-        if verbose:
-            print(f"第 {batch_idx + 1} 批完成并已保存到 {batch_filename}")
-            print(f"当前批次维度分布:")
-            for dim, count in sorted(dimension_count.items()):
-                print(f"  {dim}维: {count} 个样本")
+            print(f"开始并行处理 {len(batch_tasks)} 个批次...")
+
+        # 统一使用进程池处理（num_processes=1 时退化为单进程）
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            # 使用imap_unordered来获得更好的负载均衡和实时进度反馈
+            results = []
+            for i, result in enumerate(pool.imap_unordered(generate_batch_worker, batch_tasks)):
+                batch_idx, _, dimension_count = result
+                results.append(result)
+
+                if verbose:
+                    print(f"批次 {batch_idx + 1} 完成 (进度: {i + 1}/{len(batch_tasks)})")
+
+                # 累积维度统计
+                for dim, count in dimension_count.items():
+                    total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
+
+            if verbose:
+                print(f"所有 {len(batch_tasks)} 个批次并行处理完成")
+
+    if verbose and total_dimension_count:
+        print(f"\n已完成批次的维度分布:")
+        for dim, count in sorted(total_dimension_count.items()):
+            print(f"{dim}维: {count} 个样本")
 
     # === 合并批次文件 ===
     if verbose:
