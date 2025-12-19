@@ -93,7 +93,6 @@ class EditFlowManager:
         # 只有主进程负责数据生成，避免NCCL通信问题
         if self.accelerator.is_local_main_process:
             print(f"准备连续流训练数据 (单进程生成模式)...")
-            print(f"NCCL超时设置为: {os.environ.get('NCCL_TIMEOUT')} 秒")
 
             # 调用数据生成函数
             generate_flow_samples(
@@ -107,10 +106,8 @@ class EditFlowManager:
         else:
             # 非主进程跳过数据生成，等待主进程完成
             print(f"[Rank {self.accelerator.process_index}] 跳过数据生成，等待主进程完成...")
-            print(f"NCCL超时设置为: {os.environ.get('NCCL_TIMEOUT')} 秒")
 
         # 2. 同步屏障：等待主进程完成数据生成
-        print(f"[Rank {self.accelerator.process_index}] 等待主进程完成数据生成...")
         self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_local_main_process:

@@ -8,6 +8,7 @@ import os
 import warnings
 import time
 import json
+import sys
 import datetime
 import multiprocessing
 from typing import List, Dict, Tuple
@@ -48,8 +49,7 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     # 设置日志进程标识
     process_prefix = f"[P{process_id}-B{batch_idx+1}]"
 
-    if verbose:
-        print(f"{process_prefix} 开始生成第 {batch_idx + 1} 批，大小: {current_batch_size}")
+    # 批次开始信息通过进度条显示，避免额外print输出
 
     batch_samples = []
     dimension_count = {}
@@ -60,14 +60,20 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     # 创建进度条
     pbar = None
     if verbose:
-        # 使用tqdm创建进度条，设置position和leave参数以支持多进程并行显示
+        # 给每个进程分配固定行，避免互相覆盖
+        max_processes = 32  # 最多支持32个进程
+        position = process_id % max_processes  # 进程0用第0行，进程1用第1行...
+
         pbar = tqdm(
             total=current_batch_size,
-            desc=f"{process_prefix} 生成进度",
-            position=process_id,
-            leave=False,
+            desc=f"P{process_id}-B{batch_idx+1}",
+            position=position,  # 每个进程固定一行
+            leave=True,  # 保持显示，不要清除
             unit="样本",
-            ncols=80
+            ncols=80,
+            bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{rate_fmt}]',
+            mininterval=3.0,  # 3秒更新一次
+            file=sys.stdout
         )
 
     while sample_count < current_batch_size:
@@ -335,14 +341,16 @@ def generate_flow_samples(
             # 使用imap_unordered来获得更好的负载均衡和实时进度反馈
             results = []
             if verbose:
-                # 创建总体进度条
+                # 创建总体进度条，放在进程进度条下方
                 overall_pbar = tqdm(
                     total=len(batch_tasks),
-                    desc="总体批次进度",
-                    position=num_processes,  # 放在最下方
+                    desc=f"批次进度 ({len(batch_tasks)}批次)",
+                    position=40,  # 放在第40行，远离进程进度条
                     leave=True,
                     unit="批次",
-                    ncols=80
+                    ncols=80,
+                    bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                    mininterval=2.0
                 )
 
             for i, result in enumerate(pool.imap_unordered(generate_batch_worker, batch_tasks)):
