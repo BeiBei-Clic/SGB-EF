@@ -95,16 +95,14 @@ class EditFlowManager:
             print(f"准备连续流训练数据 (单进程生成模式)...")
             print(f"NCCL超时设置为: {os.environ.get('NCCL_TIMEOUT')} 秒")
 
-            # 调用数据生成函数，使用单进程模式
+            # 调用数据生成函数
             generate_flow_samples(
                 num_samples=self.args.num_samples,
                 max_dim=self.args.max_dim,
                 n_points=self.args.n_points,
                 max_depth=self.args.max_depth,
                 max_expr_length=self.args.max_expr_length,
-                verbose=True,  # 单进程模式下显示详细日志
-                process_rank=0,      # 固定使用rank 0
-                world_size=1,        # 单进程模式
+                verbose=True,  # 显示详细日志
             )
         else:
             # 非主进程跳过数据生成，等待主进程完成

@@ -8,10 +8,8 @@ import os
 import warnings
 import time
 import json
-import pickle
-import logging
 import datetime
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from src.utils.timeout_utils import TimeoutError, with_timeout
 from src.utils.log_utils import (
     _write_log, log_sample_step,
@@ -127,11 +125,8 @@ def generate_flow_samples(
     max_expr_length: int = 24,
     batch_size: int = 50000,
     verbose: bool = True,
-    # === 新增参数 ===
-    process_rank: int = 0,
-    world_size: int = 1,
 ):
-    """生成用于EditFlow连续流训练的数据文件，支持断点续传和多进程并行生成
+    """生成用于EditFlow连续流训练的数据文件，支持断点续传
 
     Args:
         num_samples: 总样本数
@@ -141,8 +136,6 @@ def generate_flow_samples(
         max_expr_length: 表达式最大字符长度（默认24）
         batch_size: 批次大小
         verbose: 是否显示详细输出
-        process_rank: 当前进程ID (0, 1, 2...)
-        world_size: 总进程数
     """
 
     # 设置样本生成器的日志写入函数
@@ -176,7 +169,7 @@ def generate_flow_samples(
             merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count=None)
         return
 
-    # === 单进程数据生成 ===
+    # 开始数据生成
     if verbose:
         print(f"分批生成 {num_samples} 个样本，共 {num_batches} 批...")
 
