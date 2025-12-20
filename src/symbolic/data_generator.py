@@ -8,7 +8,6 @@ import os
 import warnings
 import time
 import json
-import sys
 import datetime
 import multiprocessing
 from typing import List, Dict, Tuple
@@ -41,8 +40,14 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     (batch_idx, current_batch_size, max_dim, n_points, max_depth,
      max_expr_length, batch_filename, verbose, process_id) = args
 
-    # 设置进程特定的随机种子
-    seed_val = (int(time.time()) + process_id * 1000 + batch_idx * 100) % (2**32 - 1)
+    # 设置进程特定的随机种子，确保真正的随机性
+    # 使用高精度时间戳、进程ID、批次ID和额外随机因子
+    current_time_ms = int(time.time() * 1000000)  # 微秒级时间戳
+    # 使用多个因子组合，加上额外的随机性
+    seed_base = current_time_ms + (process_id << 16) + (batch_idx << 8) + os.getpid()
+    # 添加哈希操作增加随机性
+    seed_val = hash(str(seed_base)) & 0x7fffffff  # 确保为正数
+
     random.seed(seed_val)
     np.random.seed(seed_val)
 
@@ -57,13 +62,12 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
     SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
 
-    # 延迟创建进度条，等到真正开始生成样本时才创建
-    # 这样可以避免多进程初始化时的显示混乱
-    pbar = None
-    pbar_created = False
+    # 移除进度条，避免多进程显示混乱
 
     while sample_count < current_batch_size:
-        sample_id = f"{process_prefix}_sample{sample_count}_{int(time.time() * 1000) % 1000000}"
+        # 生成更随机的样本ID，避免重复
+        unique_factor = random.randint(0, 999999)
+        sample_id = f"{process_prefix}_sample{sample_count}_{os.getpid()}_{unique_factor}"
 
         try:
             # 使用带超时保护的样本生成函数
@@ -92,31 +96,8 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                         break
                     batch_samples.append(sample)
 
-                    # 延迟创建进度条：等到第一个样本成功生成时才创建
-                    if verbose and not pbar_created and pbar is None:
-                        # 每个批次使用固定的唯一position，确保不互相覆盖
-                        position = batch_idx + 2  # 从第2行开始，每个批次占用一行
-                        pbar = tqdm(
-                            total=current_batch_size,
-                            desc=f"B{batch_idx+1:>2}",  # 右对齐，保持宽度一致
-                            position=position,
-                            leave=True,  # 保持进度条显示，避免被其他输出覆盖
-                            unit="样本",
-                            ncols=80,
-                            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                            mininterval=3.0,  # 3秒更新一次，减少刷新频率
-                            initial=sample_count,
-                            file=sys.stdout,
-                            smoothing=0.3  # 平滑速率显示
-                        )
-                        pbar_created = True
-
                     sample_count += 1
                     dimension_count[dim] = dimension_count.get(dim, 0) + 1
-
-                    # 每10个样本更新一次进度条，减少频繁刷新
-                    if pbar and sample_count % 10 == 0:
-                        pbar.update(10)
             else:
                 # 样本生成失败，记录并继续（不增加sample_count）
                 _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] FAILED: No samples generated")
@@ -133,13 +114,7 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] ERROR: {type(e).__name__}: {e}")
             continue
 
-    # 关闭进度条，确保最终计数正确
-    if pbar:
-        # 更新剩余的样本数（可能不是10的倍数）
-        remaining_samples = sample_count % 10
-        if remaining_samples > 0:
-            pbar.update(remaining_samples)
-        pbar.close()
+    # 批次完成，无需关闭进度条
 
     # 立即保存当前批次到文件
     if batch_samples:
@@ -155,11 +130,14 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             for dim, count in sorted(dimension_count.items()):
                 print(f"  {dim}维: {count} 个样本")
 
-    return batch_idx, batch_samples, dimension_count
+    return batch_idx, len(batch_samples), dimension_count
 
 def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
     """生成单个样本"""
-    sample_id = f"sample_{input_dimension}dim_{int(time.time() * 1000) % 1000000}"
+    # 生成更随机的样本ID，包含时间戳和随机因子
+    timestamp_ms = int(time.time() * 1000000)
+    random_factor = random.randint(0, 999999)
+    sample_id = f"sample_{input_dimension}dim_{timestamp_ms}_{random_factor}"
 
     log_sample_step(sample_id, f"开始生成 {input_dimension}维样本")
 
@@ -277,7 +255,11 @@ def generate_flow_samples(
     # 设置样本生成器的日志写入函数
     set_log_writer(_write_log)
 
-    seed_val = int(time.time()) % (2**32 - 1)
+    # 使用高精度时间戳和系统信息生成主随机种子
+    main_time_ms = int(time.time() * 1000000)  # 微秒级时间戳
+    # 组合多个因子确保唯一性
+    main_seed_base = main_time_ms + os.getpid() + (num_samples & 0xffff)
+    seed_val = hash(str(main_seed_base)) & 0x7fffffff
     random.seed(seed_val)
     np.random.seed(seed_val)
 
@@ -317,10 +299,6 @@ def generate_flow_samples(
     # 开始数据生成
     if verbose:
         print(f"使用 {num_processes} 个进程并行生成 {num_samples} 个样本，共 {num_batches} 批...")
-        # 设置tqdm环境变量，避免自动隐藏进度条
-        os.environ['TQDM_DISABLE'] = ''
-        os.environ['TQDM_MININTERVAL'] = '1'
-        os.environ['TQDM_MAXLEVEL'] = '1000'  # 允许更多级别的嵌套进度条
 
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
@@ -353,18 +331,18 @@ def generate_flow_samples(
             print(f"开始并行处理 {len(batch_tasks)} 个批次...")
 
         # 统一使用进程池处理（num_processes=1 时退化为单进程）
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            # 使用imap_unordered来获得更好的负载均衡和实时进度反馈
-            results = []
-            completed_count = 0
+        if verbose:
+            print(f"开始处理 {len(batch_tasks)} 个批次任务...")
 
-            for result in pool.imap_unordered(generate_batch_worker, batch_tasks):
-                batch_idx, _, dimension_count = result
-                results.append(result)
-                completed_count += 1
+        try:
+            # 使用map方法确保所有任务同步完成，避免BrokenPipeError
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                results = pool.map(generate_batch_worker, batch_tasks)
 
+            # 处理所有结果（在pool已完全关闭后）
+            for batch_idx, sample_count, dimension_count in results:
                 if verbose:
-                    print(f"\r批次 {batch_idx + 1} 完成 (进度: {completed_count}/{len(batch_tasks)})", end='', flush=True)
+                    print(f"\r批次 {batch_idx + 1} 完成 (生成{sample_count}个样本)", end='', flush=True)
 
                 # 累积维度统计
                 for dim, count in dimension_count.items():
@@ -372,6 +350,11 @@ def generate_flow_samples(
 
             if verbose:
                 print(f"\n所有 {len(batch_tasks)} 个批次并行处理完成")
+
+        except (BrokenPipeError, KeyboardInterrupt) as e:
+            if verbose:
+                print(f"\n检测到进程通信中断: {type(e).__name__}")
+            raise
 
     if verbose and total_dimension_count:
         print(f"\n已完成批次的维度分布:")
