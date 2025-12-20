@@ -62,12 +62,15 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
-    parser.add_argument("--save_every", type=int, default=10, help="每多少轮保存一次")
+    parser.add_argument("--save_every", type=int, default=5, help="每多少轮保存一次")
 
     # 多GPU参数 - 现在由 Accelerate 自动管理
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
+
+    # 多时间步采样参数
+    parser.add_argument("--num_timesteps", type=int, default=20, help="每个样本的时间步采样数量")
 
     args = parser.parse_args()
 
