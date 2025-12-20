@@ -47,7 +47,6 @@ def main():
     parser.add_argument("--max_expr_length", type=int, default=6, help="表达式最大token长度")
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
-    parser.add_argument("--read_batch_size", type=int, default=50000, help="数据读取批次大小，避免一次性加载所有数据到内存")
     parser.add_argument("--debug", action="store_true", default=False, help="是否输出调试信息")
 
     # 模型参数
@@ -70,7 +69,7 @@ def main():
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
 
     # 多时间步采样参数
-    parser.add_argument("--num_timesteps", type=int, default=20, help="每个样本的时间步采样数量")
+    parser.add_argument("--num_timesteps", type=int, default=10, help="每个样本的时间步采样数量")
 
     args = parser.parse_args()
 

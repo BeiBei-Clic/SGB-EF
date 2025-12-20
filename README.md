@@ -61,7 +61,7 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_samples 10000000\
-    --batch_size 48
+    --batch_size 24
 ```
 
 ## 分布式训练管理

@@ -57,7 +57,6 @@ class EditFlowManager:
             print(f"样本数: {getattr(self.args, 'num_samples', 'N/A')}")
             print(f"最大维度: {getattr(self.args, 'max_dim', 'N/A')}")
             print(f"表达式最大长度: {getattr(self.args, 'max_expr_length', 'N/A')}")
-            print(f"数据读取批次大小: {getattr(self.args, 'read_batch_size', 'N/A')}")
             print(f"调试模式: {'开启' if getattr(self.args, 'debug', False) else '关闭'}")
             print(f"批次大小: {getattr(self.args, 'batch_size', 'N/A')}")
             print(f"训练轮数: {getattr(self.args, 'num_epochs', 'N/A')}")
