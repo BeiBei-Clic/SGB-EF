@@ -12,7 +12,7 @@ from transformers import AutoModel, AutoTokenizer
 class ConditionEncoder(nn.Module):
     """使用Hugging Face模型编码残差点集为条件向量"""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", verbose: bool = False):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", verbose: bool = False, max_length: int = 512):
         super().__init__()
 
         # 设置本地缓存目录
@@ -26,6 +26,7 @@ class ConditionEncoder(nn.Module):
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, padding_side='left', trust_remote_code=True)
         self.output_dim = self.model.config.hidden_size
+        self.max_length = max_length
 
     def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
         """
@@ -39,8 +40,7 @@ class ConditionEncoder(nn.Module):
         batch_size, num_points = residuals.shape
         input_dim = x_values.shape[2]  # 可以是1,2,3,4...任意维度
 
-        # 将数据点转换为文本
-        task = "Generate numerical embeddings for symbolic regression data points"
+        # 将数据点转换为紧凑的文本格式
         texts = []
 
         for b in range(batch_size):
@@ -48,18 +48,18 @@ class ConditionEncoder(nn.Module):
             for i in range(num_points):
                 # 统一处理：将x的所有维度作为一个列表，支持任意维度(1D,2D,3D,4D,...)
                 x_vals = [x_values[b, i, d].item() for d in range(input_dim)]
-                x_str = ','.join(f"{x_val:.6f}" for x_val in x_vals)
+                x_str = ','.join(f"{x_val:.4f}" for x_val in x_vals)  # 减少小数位节省空间
                 r_val = residuals[b, i].item()
-                point_texts.append(f"x: [{x_str}], r={r_val:.6f}")
+                point_texts.append(f"[{x_str}]{r_val:.4f}")  # 更紧凑的格式
 
-            texts.append(f"Instruct: {task}\nQuery: {' '.join(point_texts)}")
+            texts.append(' '.join(point_texts))  # 直接拼接所有点
         # print(texts)
         # 编码文本
         inputs = self.tokenizer(
             texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=self.max_length,
             return_tensors="pt"
         ).to(x_values.device)
 

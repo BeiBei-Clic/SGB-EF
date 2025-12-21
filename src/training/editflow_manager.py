@@ -217,7 +217,11 @@ class EditFlowManager:
 
         if self.accelerator.is_local_main_process:
             print("初始化条件编码器...")
-        condition_encoder = ConditionEncoder(model_name=self.args.condition_model_name, verbose=self.accelerator.is_local_main_process).to(self.device)
+        condition_encoder = ConditionEncoder(
+            model_name=self.args.condition_model_name,
+            verbose=self.accelerator.is_local_main_process,
+            max_length=getattr(self.args, 'condition_max_length', 512)
+        ).to(self.device)
 
         if self.accelerator.is_local_main_process:
             print("初始化EditFlow模型...")

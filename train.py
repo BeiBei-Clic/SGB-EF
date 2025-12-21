@@ -71,6 +71,9 @@ def main():
     # 多时间步采样参数
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
 
+    # 条件嵌入器参数
+    parser.add_argument("--condition_max_length", type=int, default=512, help="条件嵌入器的最大token长度")
+
     args = parser.parse_args()
 
     # 设置随机种子
