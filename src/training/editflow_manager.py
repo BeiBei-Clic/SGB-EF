@@ -218,9 +218,10 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print("初始化条件编码器...")
         condition_encoder = ConditionEncoder(
-            model_name=self.args.condition_model_name,
+            model_name=self.args.condition_model_name,  # 保持兼容性，但实际不使用
             verbose=self.accelerator.is_local_main_process,
-            max_length=getattr(self.args, 'condition_max_length', 512)
+            max_length=getattr(self.args, 'condition_max_length', 512),  # 保持兼容性，但实际不使用
+            args=self.args  # 传递args对象以使用SetTransformer参数
         ).to(self.device)
 
         if self.accelerator.is_local_main_process:
@@ -237,8 +238,9 @@ class EditFlowManager:
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
-            lr=self.args.learning_rate,
-            weight_decay=self.args.weight_decay
+            lr=self.args.learning_rate * 0.1,  # 降低学习率以防止梯度爆炸
+            weight_decay=self.args.weight_decay,
+            eps=1e-8  # 增加数值稳定性
         )
 
         # 如果提供了检查点路径，加载预训练模型
@@ -478,7 +480,23 @@ class EditFlowManager:
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
                     # 统一计算梯度范数并裁剪
                     all_params = list(model.parameters()) + list(condition_encoder.parameters())
-                    grad_norm = self.accelerator.clip_grad_norm_(all_params, 1.0)
+
+                    # 检查是否有NaN梯度 - 在gradient unscaling之前检查
+                    has_nan_grad = False
+                    for param in all_params:
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            has_nan_grad = True
+                            break
+
+                    if has_nan_grad:
+                        if self.accelerator.is_local_main_process:
+                            print(f"警告：检测到NaN梯度，跳过此次更新")
+                        optimizer.zero_grad()
+                        continue
+
+                    # 使用Accelerate的梯度裁剪（会自动处理混合精度）
+                    grad_norm = self.accelerator.clip_grad_norm_(all_params, 1.0)  # 恢复正常的梯度裁剪阈值
+
                     optimizer.step()
                     optimizer.zero_grad()  # 在step后清零梯度，为下一次累积做准备
 

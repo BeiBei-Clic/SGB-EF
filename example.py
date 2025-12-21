@@ -16,15 +16,23 @@ def main():
     args = type('Args', (), {
         'seed': 42,
         'base_model_name': "google-bert/bert-base-uncased",
-        'condition_model_name': "nomic-ai/nomic-embed-text-v1.5",  # 条件嵌入模型名称
+        'condition_model_name': "settransformer",  # 现在使用SetTransformer架构
         'cache_dir': "models/huggingface_cache",  # 模型缓存目录
         'use_fp16': False,  # 推理时关闭混合精度
         'gradient_accumulation_steps': 1,  # 推理时不需要梯度累积
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 6 , # 最大表达式长度
-        "num_timesteps":1
+        'max_expr_length': 6, # 最大表达式长度
+        "num_timesteps": 1,
+        # SetTransformer参数
+        'condition_dim_hidden': 128,
+        'condition_num_heads': 4,
+        'condition_num_inds': 32,
+        'condition_num_layers': 3,
+        'condition_num_seeds': 1,
+        'condition_dim_output': 128,
+        'condition_input_normalization': True
     })()
 
     manager = EditFlowManager(args)

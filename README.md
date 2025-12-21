@@ -60,9 +60,9 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_timesteps 20 \
+    --num_timesteps 10 \
     --num_samples 100000\
-    --batch_size 48
+    --batch_size 24
 ```
 
 ## 分布式训练管理
@@ -74,3 +74,8 @@ pkill -9 accelerate
 ## 数据生成时解决卡死的两个关键
 - **样本级别超时保护**：使用with_timeout装饰器，为每个样本设置超时时间，防止单个样本生成时间过长导致整个批次卡死。
 - **表达式生成时递归深度限制**：为了防止无限递归，设置最大递归深度，超过该深度时抛出异常。
+
+## 监控GPU使用情况
+```bash
+watch -n 1 -d nvidia-smi
+```

@@ -51,7 +51,7 @@ def main():
 
     # 模型参数
     parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
-    parser.add_argument("--condition_model_name", type=str, default="nomic-ai/nomic-embed-text-v1.5", help="条件嵌入模型名称")
+    parser.add_argument("--condition_model_name", type=str, default="settransformer", help="条件嵌入模型名称 (现在使用SetTransformer架构)")
     parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
     # 训练参数
@@ -71,8 +71,18 @@ def main():
     # 多时间步采样参数
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
 
-    # 条件嵌入器参数
-    parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")
+    # SetTransformer条件编码器参数
+    parser.add_argument("--condition_max_input_dim", type=int, default=6, help="SetTransformer支持的最大输入维度")
+    parser.add_argument("--condition_dim_hidden", type=int, default=128, help="SetTransformer隐藏层维度")
+    parser.add_argument("--condition_num_heads", type=int, default=4, help="SetTransformer注意力头数")
+    parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")
+    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数")
+    parser.add_argument("--condition_num_seeds", type=int, default=1, help="SetTransformer种子数")
+    parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
+    parser.add_argument("--condition_input_normalization", type=bool, default=True, help="是否对输入进行标准化")
+
+    # 保持向后兼容性，但现在不再使用的参数
+    parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度 (已废弃，保留以兼容)")
 
     args = parser.parse_args()
 
