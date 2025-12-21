@@ -69,7 +69,7 @@ def main():
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
 
     # 多时间步采样参数
-    parser.add_argument("--num_timesteps", type=int, default=10, help="每个样本的时间步采样数量")
+    parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
 
     args = parser.parse_args()
 

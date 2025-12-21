@@ -32,7 +32,7 @@ class EditFlowManager:
 
     新增功能：多时间步采样训练
     - num_timesteps参数控制每个样本采样的时间步数量
-    - 默认值为20，可以大幅提升训练数据利用效率
+    - 默认值为5（在train.py中定义），可以大幅提升训练数据利用效率
     - 每个原始样本将生成num_timesteps个训练实例
     - 在训练过程中会自动进行损失聚合，确保梯度计算正确
     """
@@ -67,7 +67,7 @@ class EditFlowManager:
             print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
             print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
             print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
-            print(f"时间步采样数: {getattr(self.args, 'num_timesteps', 20)} (每个样本生成的时间步训练数量)")
+            print(f"时间步采样数: {self.args.num_timesteps} (每个样本生成的时间步训练数量)")
 
             print(f"\nAccelerate 初始化完成")
             print(f"  设备: {self.device}")
@@ -266,7 +266,7 @@ class EditFlowManager:
   
     def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info=None):
         # 多时间步采样参数
-        num_timesteps = getattr(self.args, 'num_timesteps', 20)  # 默认每个样本采样20个时间步
+        num_timesteps = self.args.num_timesteps  # 使用命令行参数值
 
         original_batch_size = z0_token_ids.size(0)
 
@@ -361,7 +361,7 @@ class EditFlowManager:
         gap_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
 
         # 获取时间步采样数量
-        num_timesteps = getattr(self.args, 'num_timesteps', 20)
+        num_timesteps = self.args.num_timesteps
 
         lambda_ins = pred_rates[:, :, 0:1]
         lambda_sub = pred_rates[:, :, 1:2]
@@ -484,7 +484,7 @@ class EditFlowManager:
             # 只在主进程更新进度条显示
             if self.accelerator.is_local_main_process:
                 # 获取时间步采样数量用于显示
-                num_timesteps = getattr(self.args, 'num_timesteps', 20)
+                num_timesteps = self.args.num_timesteps
                 postfix_dict = {
                     'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
                     'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
