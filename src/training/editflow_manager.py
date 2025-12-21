@@ -699,7 +699,7 @@ class EditFlowManager:
         # 修正：计算初始残差 (真实值 - 初始表达式的预测值)
         # 构建初始表达式
         import sympy as sp
-        from ..symbolic.symbolic_utils import evaluate_expression_safe
+        from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants
 
         if input_dim == 1:
             # 一维情况：初始表达式为 x0
@@ -767,7 +767,6 @@ class EditFlowManager:
                 print(f"\n[DEBUG] === 输入ID验证 ===")
                 print(f"[DEBUG] 当前表达式tokens: {current_tokens}")
                 print(f"[DEBUG] tokenized_expr IDs: {tokenized_expr}")
-                print(f"[DEBUG] tokenizer词表大小: {len(special_tokens_manager.tokenizer.get_vocab())}")
 
                 # 验证每个token ID的有效性
                 vocab = special_tokens_manager.tokenizer.get_vocab()
@@ -828,8 +827,6 @@ class EditFlowManager:
 
                 # 检查input_ids的统计信息
                 input_ids_np = input_ids[0].cpu().numpy()
-                print(f"[DEBUG] input_ids统计: min={input_ids_np.min()}, max={input_ids_np.max()}, mean={input_ids_np.mean():.2f}")
-                print(f"[DEBUG] 有效token范围: 0-{len(vocab)-1}")
 
                 # 确认没有无效的token ID
                 if input_ids_np.max() >= len(vocab):
@@ -854,8 +851,6 @@ class EditFlowManager:
                     # 检查是否所有位置都完全相同
                     rates_flat = rates[0, :, :].cpu().numpy()
                     unique_rows = np.unique(rates_flat, axis=0)
-                    print(f"[DEBUG] 总位置数: {rates_flat.shape[0]}")
-                    print(f"[DEBUG] 唯一输出数量: {unique_rows.shape[0]}")
                     if unique_rows.shape[0] < rates_flat.shape[0]:
                         print(f"[DEBUG] ⚠️  确实存在位置间输出重复！")
 
@@ -936,6 +931,39 @@ class EditFlowManager:
                         del current_tokens[pos]
                         if debug_mode and self.accelerator.is_local_main_process:
                             print(f"[DEBUG] 删除token: '{deleted_token}'")
+
+                    # 在每次修改后评估表达式
+                    current_expr_str = ','.join(current_tokens)
+                    if debug_mode and self.accelerator.is_local_main_process:
+                        print(f"[DEBUG] 修改后的表达式: {current_expr_str}")
+
+                    # 评估表达式并进行常数优化
+                    eval_success, optimized_expr, loss = evaluate_expression_with_constants(
+                        current_expr_str, x_data, y_data
+                    )
+
+                    if eval_success:
+                        if debug_mode and self.accelerator.is_local_main_process:
+                            print(f"[DEBUG] ✓ 表达式评估成功，优化后损失: {loss:.6f}")
+                            print(f"[DEBUG] 优化后的表达式: {optimized_expr}")
+
+                        # 更新残差为基于优化后表达式的残差
+                        try:
+                            # 计算优化后表达式的预测值
+                            from ..symbolic.symbolic_utils import evaluate_expr
+                            y_pred_optimized = evaluate_expr(optimized_expr, x_data)
+                            # 更新残差：真实值 - 优化后的预测值
+                            new_residuals = y_data - y_pred_optimized
+                            # 重新计算条件
+                            condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
+                            if debug_mode and self.accelerator.is_local_main_process:
+                                print(f"[DEBUG] 残差已更新，MSE: {np.mean(new_residuals**2):.6f}")
+                        except Exception as e:
+                            if debug_mode and self.accelerator.is_local_main_process:
+                                print(f"[DEBUG] ⚠️ 更新残差失败: {e}")
+                    else:
+                        if debug_mode and self.accelerator.is_local_main_process:
+                            print(f"[DEBUG] ❌ 表达式评估失败，保持当前状态")
                 else:
                     if debug_mode and self.accelerator.is_local_main_process:
                         print(f"[DEBUG] 未找到有效操作 (最高分数: {best_score:.4f} <= 0.01)")
@@ -949,9 +977,7 @@ class EditFlowManager:
         # 返回最终的表达式
         final_expression = ','.join(current_tokens) if current_tokens else ""
         if debug_mode and self.accelerator.is_local_main_process:
-            print(f"\n[DEBUG] 推理完成！")
             print(f"[DEBUG] 最终表达式: {final_expression}")
-            print(f"[DEBUG] 最终表达式长度: {len(current_tokens)}")
         elif self.accelerator.is_local_main_process:
             print(f"最终表达式: {final_expression}")
 

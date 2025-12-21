@@ -6,7 +6,8 @@ import random
 import time
 import numpy as np
 import sympy as sp
-from typing import List, Tuple
+from typing import List, Tuple, Union
+from scipy.optimize import minimize
 from src.symbolic.corruption import corrupt_expression, replace_variables
 
 
@@ -348,6 +349,60 @@ def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
     return result
 
 
+def tree_to_expr(tree_str: str) -> sp.Expr:
+    """将前序遍历字符串转换为SymPy表达式"""
+    if not tree_str or tree_str.strip() == '':
+        return sp.Integer(1)
+
+    # 如果是单纯的符号或常数
+    if ',' not in tree_str:
+        if tree_str == 'constant':
+            return sp.Symbol('c')  # 用符号c表示常数
+        elif tree_str.startswith('x') and tree_str[1:].isdigit():
+            return sp.Symbol(tree_str)
+        else:
+            # 尝试解析为数字
+            try:
+                return sp.Rational(float(tree_str))
+            except:
+                return sp.Symbol(tree_str)
+
+    # 使用迭代方式解析前序遍历
+    tokens = tree_str.split(',')
+
+    def parse_expression(tokens_iter):
+        """递归解析表达式"""
+        try:
+            token = next(tokens_iter)
+        except StopIteration:
+            return sp.Integer(1)
+
+        if token == 'constant':
+            return sp.Symbol('c')
+        elif token.startswith('x') and token[1:].isdigit():
+            return sp.Symbol(token)
+        elif token in UNARY_OPS:
+            # 一元操作: op,operand
+            operand = parse_expression(tokens_iter)
+            return apply_unary_op(token, operand)
+        elif token in BINARY_OPS:
+            # 二元操作: op,left,right
+            left = parse_expression(tokens_iter)
+            right = parse_expression(tokens_iter)
+            return apply_binary_op(token, left, right)
+        else:
+            # 尝试解析为数字
+            try:
+                return sp.Rational(float(token))
+            except:
+                return sp.Symbol(token)
+
+    # 创建迭代器并解析
+    return parse_expression(iter(tokens))
+
+
+
+
 def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
                              error_callback=None) -> Tuple[bool, np.ndarray]:
     """
@@ -370,3 +425,138 @@ def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
         if error_callback:
             error_callback(str(e))
         return False, None
+
+
+def extract_constants(expr: sp.Expr) -> List[sp.Symbol]:
+    """提取表达式中的常数符号"""
+    return [s for s in expr.free_symbols if s.name == 'c']
+
+
+def optimize_constants(expr: sp.Expr, x_values: np.ndarray, y_values: np.ndarray) -> Tuple[sp.Expr, float, bool]:
+    """
+    使用BFGS优化表达式中的常数
+
+    Args:
+        expr: 包含常数符号的表达式
+        x_values: 输入数据
+        y_values: 目标值
+
+    Returns:
+        (优化后的表达式, 最优损失, 是否成功)
+    """
+    constants = extract_constants(expr)
+
+    if not constants:
+        # 没有常数，直接计算当前表达式的MSE
+        try:
+            n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
+            symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
+
+            # 创建计算函数
+            f = sp.lambdify(symbols, expr, 'numpy')
+
+            # 计算预测值
+            if x_values.ndim > 1:
+                y_pred = f(*[x_values[:, i] for i in range(n_dims)])
+            else:
+                y_pred = f(x_values)
+
+            # 计算MSE
+            mse = float(np.mean((y_pred - y_values) ** 2))
+            return expr, mse, True
+        except Exception as e:
+            return expr, float('inf'), False
+
+    # 获取表达式中的变量
+    n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
+    symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
+
+    # 构建数值计算函数
+    numerical_expr = expr
+    for c in constants:
+        numerical_expr = numerical_expr.subs(c, sp.Symbol(f'const_{constants.index(c)}'))
+
+    # 创建lambdify函数
+    all_symbols = symbols + [sp.Symbol(f'const_{i}') for i in range(len(constants))]
+    f = sp.lambdify(all_symbols, numerical_expr, 'numpy')
+
+    def objective(const_values):
+        """目标函数：计算均方误差"""
+        try:
+            if x_values.ndim > 1:
+                x_args = [x_values[:, i] for i in range(n_dims)]
+            else:
+                x_args = [x_values]
+
+            # 将常数作为额外参数传入
+            args = x_args + list(const_values)
+            y_pred = f(*args)
+
+            # 计算MSE
+            mse = np.mean((y_pred - y_values) ** 2)
+            return mse
+        except:
+            # 如果计算失败，返回很大的值
+            return 1e10
+
+    # 初始常数值（设为1）
+    initial_guess = np.ones(len(constants))
+
+    try:
+        # 使用BFGS优化
+        result = minimize(
+            objective,
+            initial_guess,
+            method='BFGS',
+            options={'maxiter': 100, 'disp': False}
+        )
+
+        if result.success:
+            # 将优化后的常数替换回表达式
+            optimized_expr = expr
+            for i, c in enumerate(constants):
+                optimized_expr = optimized_expr.subs(c, result.x[i])
+
+            return optimized_expr, result.fun, True
+        else:
+            return expr, float('inf'), False
+
+    except Exception as e:
+        return expr, float('inf'), False
+
+
+def evaluate_expression_with_constants(tree_str: str, x_values: np.ndarray, y_values: np.ndarray,
+                                      error_callback=None) -> Tuple[bool, sp.Expr, float]:
+    """
+    评估包含常数的表达式
+
+    1. 将前序遍历转换为表达式
+    2. 用1替换常数进行语法检查
+    3. 如果语法正确，进行BFGS优化
+
+    Returns:
+        (是否成功, 优化后的表达式, 最终损失)
+    """
+    try:
+        # 1. 转换前序遍历为表达式
+        expr = tree_to_expr(tree_str)
+
+        # 2. 用1替换常数进行初步评估
+        test_expr = expr
+        for c in extract_constants(expr):
+            test_expr = test_expr.subs(c, 1)
+
+        # 3. 评估语法是否正确
+        success, _ = evaluate_expression_safe(test_expr, x_values, error_callback)
+        if not success:
+            return False, expr, float('inf')
+
+        # 4. 如果语法正确，进行常数优化
+        optimized_expr, loss, opt_success = optimize_constants(expr, x_values, y_values)
+
+        return True, optimized_expr, loss
+
+    except Exception as e:
+        if error_callback:
+            error_callback(f"表达式评估失败: {str(e)}")
+        return False, None, float('inf')
