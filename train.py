@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--max_dim", type=int, default=3, help="最大输入维度")
     parser.add_argument("--n_points", type=int, default=100, help="数据点数量")
     parser.add_argument("--max_depth", type=int, default=6, help="表达式最大深度")
-    parser.add_argument("--max_expr_length", type=int, default=6, help="表达式最大token长度")
+    parser.add_argument("--max_expr_length", type=int, default=12, help="表达式最大token长度")
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
 
@@ -71,15 +71,15 @@ def main():
     # SetTransformer条件编码器参数
     parser.add_argument("--condition_max_input_dim", type=int, default=6, help="SetTransformer支持的最大输入维度")
     parser.add_argument("--condition_dim_hidden", type=int, default=128, help="SetTransformer隐藏层维度")
-    parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 (调整为8以匹配标准Transformer配置)")
+    parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 ")
     parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")
-    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 (减少到2层避免过深)")
+    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 ")
     parser.add_argument("--condition_num_seeds", type=int, default=1, help="SetTransformer种子数")
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
     parser.add_argument("--condition_input_normalization", type=bool, default=True, help="是否对输入进行标准化")
 
     # 保持向后兼容性，但现在不再使用的参数
-    parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度 (已废弃，保留以兼容)")
+    parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")
 
     args = parser.parse_args()
 

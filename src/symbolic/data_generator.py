@@ -264,7 +264,7 @@ def generate_flow_samples(
     np.random.seed(seed_val)
 
     # 检查是否存在缓存文件
-    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth.txt"
+    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth_{max_expr_length}len.txt"
 
     # 检查批次文件状态
     num_batches = (num_samples + batch_size - 1) // batch_size
