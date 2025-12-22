@@ -6,10 +6,7 @@ EditFlow连续流训练器 - 实现基于连续时间流匹配的编辑流模型
 import torch
 import numpy as np
 import time
-import argparse
 import os
-import json
-from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from accelerate import Accelerator
@@ -24,8 +21,12 @@ from .flow import (
 )
 from ..modeling.condition_encoder import ConditionEncoder
 from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
-from ..utils.gpu_monitor import get_gpu_memory_info, get_gpu_memory_usage_string
+from ..utils.gpu_monitor import get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
+from ..utils.log_utils import (
+    log_training_start, log_training_step, log_tensor_info,
+    log_gpu_memory_usage, log_training_error
+)
 
 class EditFlowManager:
     """EditFlow模型管理器 - 支持训练和推理功能
@@ -57,7 +58,6 @@ class EditFlowManager:
             print(f"样本数: {getattr(self.args, 'num_samples', 'N/A')}")
             print(f"最大维度: {getattr(self.args, 'max_dim', 'N/A')}")
             print(f"表达式最大长度: {getattr(self.args, 'max_expr_length', 'N/A')}")
-            print(f"调试模式: {'开启' if getattr(self.args, 'debug', False) else '关闭'}")
             print(f"批次大小: {getattr(self.args, 'batch_size', 'N/A')}")
             print(f"训练轮数: {getattr(self.args, 'num_epochs', 'N/A')}")
             print(f"学习率: {getattr(self.args, 'learning_rate', 'N/A')}")
@@ -79,6 +79,10 @@ class EditFlowManager:
             from ..utils.gpu_monitor import display_gpu_info
             display_gpu_info()
 
+        # 记录训练开始日志
+        log_training_start(self.args)
+        log_gpu_memory_usage("初始化完成")
+
         # 时间调度器
         self.scheduler = KappaScheduler(scheduler_type='cubic')
 
@@ -95,7 +99,6 @@ class EditFlowManager:
 
         # 1. 数据生成阶段：只使用主进程（单进程）
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth.txt"
-        temp_dir = "data/temp"
 
         # 只有主进程负责数据生成，避免NCCL通信问题
         if self.accelerator.is_local_main_process:
@@ -276,9 +279,7 @@ class EditFlowManager:
 
         original_batch_size = z0_token_ids.size(0)
 
-        # 获取debug参数
-        debug_mode = getattr(self.args, 'debug', False)
-
+        
         # 为每个样本采样多个时间步
         t = torch.rand(original_batch_size, num_timesteps, 1, device=self.device)  # [B, K, 1]
 
@@ -309,27 +310,28 @@ class EditFlowManager:
         z1_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
-        # 调试：检查概率分布（仅在debug模式且为第一个batch时）
-        if debug_info and debug_info.get('is_first_batch', False) and debug_mode and self.accelerator.is_local_main_process:
-            print(f"[DEBUG] {debug_info.get('context', '')} 多时间步采样: num_timesteps={num_timesteps}")
-            print(f"[DEBUG] {debug_info.get('context', '')} 原始批次大小: {original_batch_size}, 扩展后批次大小: {batch_size}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z0_probs 形状: {z0_probs.shape}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_probs 形状: {z1_probs.shape}")
-            print(f"[DEBUG] {debug_info.get('context', '')} vocab_size: {config.vocab_size}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z0_token_ids 统计: min={z0_token_ids.min().item()}, max={z0_token_ids.max().item()}")
-            print(f"[DEBUG] {debug_info.get('context', '')} z1_token_ids 统计: min={z1_token_ids.min().item()}, max={z1_token_ids.max().item()}")
+        # 记录多时间步采样信息（仅在第一个batch时）
+        if debug_info and debug_info.get('is_first_batch', False) and self.accelerator.is_local_main_process:
+            context = debug_info.get('context', '')
+            log_training_step("MULTI_TIMESTEP_SAMPLE",
+                            f"num_timesteps={num_timesteps} | original_batch={original_batch_size} | expanded_batch={batch_size}",
+                            context, debug_level=1)
+            log_tensor_info("z0_probs", z0_probs, level=2, context=context)
+            log_tensor_info("z1_probs", z1_probs, level=2, context=context)
 
-            # 检查前几个样本的token ID和时间步
+            # 记录token ID和时间步信息
             for i in range(min(3, z0_token_ids.size(0))):
                 sample_idx = i // num_timesteps  # 原始样本索引
                 t_idx = i % num_timesteps       # 时间步索引
-                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} z0_token_ids: {z0_token_ids[i].tolist()}")
-                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} z1_token_ids: {z1_token_ids[i].tolist()}")
-                print(f"[DEBUG] 样本{sample_idx} 时间步{t_idx} t: {t[i].item():.4f}")
-            print(f"[DEBUG] 时间步统计: min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}")
+                log_training_step("TOKEN_SAMPLE_CHECK",
+                                f"样本{sample_idx} 时间步{t_idx} z0={z0_token_ids[i].tolist()} z1={z1_token_ids[i].tolist()} t={t[i].item():.4f}",
+                                context, debug_level=3)
+            log_training_step("TIMESTEP_STATS",
+                            f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}",
+                            context, debug_level=2)
 
 
-        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler, debug=debug_mode)
+        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
             z_t, dataset.special_tokens_manager
@@ -353,7 +355,7 @@ class EditFlowManager:
             'vocab_size': config.vocab_size,
                     }
 
-    def compute_loss(self, forward_results, criterion, dataset, debug=False):
+    def compute_loss(self, forward_results, criterion, dataset):
         pred_rates = forward_results['pred_rates']
         pred_ins_probs = forward_results['pred_ins_probs']
         pred_sub_probs = forward_results['pred_sub_probs']
@@ -382,71 +384,11 @@ class EditFlowManager:
 
         u_cat = torch.cat([lambda_ins * extended_ins_probs, lambda_sub * extended_sub_probs, lambda_del], dim=-1)
 
-        # 调试：在fill_gap_tokens_with_repeats之前
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG STEP 1] {time.strftime('%H:%M:%S')} 开始 fill_gap_tokens_with_repeats...")
-            print(f"[DEBUG STEP 1] u_cat shape: {u_cat.shape}")
-            print(f"[DEBUG STEP 1] z_gap_mask shape: {z_gap_mask.shape}")
-            print(f"[DEBUG STEP 1] z_pad_mask shape: {z_pad_mask.shape}")
-            print(f"[DEBUG STEP 1] t shape: {t.shape}, t范围: [{t.min().item():.4f}, {t.max().item():.4f}]")
-            # 强制CUDA同步
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask, debug=debug)
-
-        # 调试：在fill_gap_tokens_with_repeats之后
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG STEP 2] {time.strftime('%H:%M:%S')} fill_gap_tokens_with_repeats 完成")
-            print(f"[DEBUG STEP 2] u_z shape: {u_z.shape}")
-            print(f"[DEBUG STEP 2] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
-            # 强制CUDA同步
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
 
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
 
-        # 调试：在make_ut_mask_from_z之后
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG STEP 3] make_ut_mask_from_z 完成")
-            print(f"[DEBUG STEP 3] u_mask shape: {u_mask.shape}")
-            print(f"[DEBUG STEP 3] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
-            print(f"[DEBUG STEP 3] u_mask 非零元素数: {u_mask.sum().item()}")
-
-            # GPU内存使用情况
-            if torch.cuda.is_available():
-                print(f"[DEBUG GPU] GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.memory_reserved()/1024**3:.2f}GB")
-
-        # 调试：打印u矩阵
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG COMPUTE_LOSS] 多时间步采样: num_timesteps={num_timesteps}")
-            print(f"[DEBUG COMPUTE_LOSS] 扩展后批次大小: {pred_rates.size(0)}")
-            print(f"[DEBUG COMPUTE_LOSS] pred_rates shape: {pred_rates.shape}")
-            print(f"[DEBUG COMPUTE_LOSS] pred_rates stats: min={pred_rates.min().item():.6f}, max={pred_rates.max().item():.6f}, mean={pred_rates.mean().item():.6f}")
-            print(f"[DEBUG COMPUTE_LOSS] u_cat shape: {u_cat.shape}")
-            print(f"[DEBUG COMPUTE_LOSS] u_cat stats: min={u_cat.min().item():.6f}, max={u_cat.max().item():.6f}, mean={u_cat.mean().item():.6f}")
-            print(f"[DEBUG COMPUTE_LOSS] u_z shape: {u_z.shape}")
-            print(f"[DEBUG COMPUTE_LOSS] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
-            print(f"[DEBUG COMPUTE_LOSS] u_mask shape: {u_mask.shape}")
-            print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
-            print(f"[DEBUG COMPUTE_LOSS] t shape: {t.shape}, t范围: [{t.min().item():.4f}, {t.max().item():.4f}]")
-
-        # 调试：进入criterion之前
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG STEP 4] {time.strftime('%H:%M:%S')} 开始 criterion 计算...")
-            # 强制CUDA同步
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-        loss = criterion(u_z, u_mask, t, effective_vocab_size, debug=debug, accelerator=self.accelerator)
-
-        # 调试：criterion完成之后
-        if debug and self.accelerator.is_local_main_process:
-            print(f"[DEBUG STEP 5] {time.strftime('%H:%M:%S')} criterion 计算完成")
-            print(f"[DEBUG STEP 5] loss value: {loss.item():.6f}")
-            # 强制CUDA同步
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+        loss = criterion(u_z, u_mask, t, effective_vocab_size, accelerator=self.accelerator)
 
         return loss
 
@@ -475,20 +417,18 @@ class EditFlowManager:
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
             residuals = batch['residuals'].to(self.device)
-            dim_mask = batch['dim_mask'].to(self.device)
             z0_token_ids = batch['z0_token_ids'].to(self.device)
             z1_token_ids = batch['z1_token_ids'].to(self.device)
 
-            # 调试输出：解码z0和z1的token序列（仅在debug模式且第一个batch时）
-            debug_mode = getattr(self.args, 'debug', False)
-            if batch_idx == 0 and debug_mode and self.accelerator.is_local_main_process:
-                print(f"\n[DEBUG] 维度 {dimension} - 第一个batch的token解码信息:")
+            # 记录token解码信息（仅在第一个batch时）
+            if batch_idx == 0 and self.accelerator.is_local_main_process:
+                log_training_step("TOKEN_DECODE", f"维度 {dimension} - 第一个batch的token解码信息", debug_level=2)
 
                 # 解码z0_token_ids
                 vocab = dataset.special_tokens_manager.tokenizer.get_vocab()
                 id_to_token = {v: k for k, v in vocab.items()}
 
-                print("[DEBUG] z0_token_ids解码结果 (前3个样本):")
+                z0_expressions = []
                 for i in range(min(3, z0_token_ids.size(0))):
                     z0_tokens = []
                     for token_id in z0_token_ids[i].tolist():
@@ -496,9 +436,9 @@ class EditFlowManager:
                             token = id_to_token[token_id]
                             z0_tokens.append(token)
                     z0_expression = ','.join(z0_tokens) if z0_tokens else "<empty>"
-                    print(f"  样本{i}: {z0_expression}")
+                    z0_expressions.append(f"样本{i}: {z0_expression}")
 
-                print("[DEBUG] z1_token_ids解码结果 (前3个样本):")
+                z1_expressions = []
                 for i in range(min(3, z1_token_ids.size(0))):
                     z1_tokens = []
                     for token_id in z1_token_ids[i].tolist():
@@ -506,7 +446,10 @@ class EditFlowManager:
                             token = id_to_token[token_id]
                             z1_tokens.append(token)
                     z1_expression = ','.join(z1_tokens) if z1_tokens else "<empty>"
-                    print(f"  样本{i}: {z1_expression}")
+                    z1_expressions.append(f"样本{i}: {z1_expression}")
+
+                log_training_step("TOKEN_DECODE_Z0", "\n".join(z0_expressions), f"维度{dimension}", debug_level=3)
+                log_training_step("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", debug_level=3)
 
             condition_embeddings = condition_encoder(x_values, residuals)
 
@@ -521,7 +464,7 @@ class EditFlowManager:
             forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
 
             # 分布式健康检查：确保前向传播结果在不同进程间合理
-            if debug_mode and self.accelerator.distributed_type != "NO":
+            if self.accelerator.distributed_type != "NO":
                 pred_rates = forward_results['pred_rates']
 
                 # 检查是否有任何进程的模型输出包含NaN
@@ -531,20 +474,18 @@ class EditFlowManager:
 
                 if global_has_nan.item() > 0:
                     if self.accelerator.is_local_main_process:
-                        print(f"[DEBUG HEALTH] ⚠️ 检测到前向传播NaN，所有进程将跳过此批次")
+                        log_training_error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN，跳过批次", f"batch_idx:{batch_idx}")
                     # 继续执行到criterion中的分布式NaN检测，那里会统一跳过
 
             # 尝试计算损失，如果包含NaN则跳过该批次
             try:
-                loss = self.compute_loss(forward_results, criterion, dataset, debug=debug_mode) / gradient_accumulation_steps
+                loss = self.compute_loss(forward_results, criterion, dataset) / gradient_accumulation_steps
             except ValueError as e:
                 if "批次包含异常值" in str(e):
-                    if debug_mode and self.accelerator.is_local_main_process:
-                        print(f"[DEBUG SKIP] 跳过批次 {batch_idx} (包含NaN/Inf): {e}")
+                    log_training_error("BATCH_SKIP", f"跳过批次 {batch_idx} (包含NaN/Inf): {e}", f"维度{dimension}")
 
                     # 分布式同步：确保所有进程都到达这个点
-                    if debug_mode:
-                        print(f"[DEBUG SYNC] 所有进程同步跳过批次 {batch_idx}...")
+                    log_training_step("SYNC_SKIP", f"所有进程同步跳过批次 {batch_idx}", f"维度{dimension}", debug_level=2)
 
                     # 等待所有进程都准备好跳过
                     self.accelerator.wait_for_everyone()
@@ -633,7 +574,6 @@ class EditFlowManager:
             for batch in test_dataloader:
                 x_values = batch['x_values'].to(self.device)
                 residuals = batch['residuals'].to(self.device)
-                dim_mask = batch['dim_mask'].to(self.device)
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
 
@@ -642,7 +582,7 @@ class EditFlowManager:
 
                 # 尝试计算损失，如果包含NaN则跳过该批次
                 try:
-                    loss = self.compute_loss(forward_results, criterion, test_dataset, debug=False)
+                    loss = self.compute_loss(forward_results, criterion, test_dataset)
                     if not torch.isnan(loss):
                         total_loss += loss.item()
                         num_batches += 1
@@ -775,29 +715,25 @@ class EditFlowManager:
 
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, debug_mode=False, n_steps=100, input_dim=None, max_expr_length=None):
+    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None):
         """符号回归 - 接收数据点对，输出表达式
 
         Args:
             model_path: 模型检查点路径
             x_data: 输入x数据
             y_data: 目标y数据
-            debug_mode: 是否显示详细调试信息
             n_steps: 推理步数
             input_dim: 输入维度，如果为None则自动推断
             max_expr_length: 表达式最大token长度，如果为None则使用args中的值
         """
-        if self.accelerator.is_local_main_process:
-            print("开始符号回归推理...")
-            print(f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}")
+        log_training_step("SYMBOLIC_REGRESSION_START", f"开始符号回归推理 | 输入数据: x形状={x_data.shape}, y形状={y_data.shape}", "inference", debug_level=1)
 
         # 加载模型
         checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
-        if self.accelerator.is_local_main_process:
-            if checkpoint_path:
-                print(f"使用检查点: {checkpoint_path}")
-            else:
-                print("未找到检查点，将使用基础模型进行推理")
+        if checkpoint_path:
+            log_training_step("MODEL_LOAD", f"使用检查点: {checkpoint_path}", "inference", debug_level=1)
+        else:
+            log_training_step("MODEL_LOAD", "未找到检查点，将使用基础模型进行推理", "inference", debug_level=1)
 
         model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
@@ -863,56 +799,43 @@ class EditFlowManager:
         # 确保所有需要的符号都在tokenizer中
         special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
 
-        if debug_mode and self.accelerator.is_local_main_process:
-            print(f"调试模式: {'开启' if debug_mode else '关闭'}")
-            print(f"推理步数: {n_steps}")
-            print(f"输入数据形状: x_values={x_values.shape}, y_values={y_values.shape}")
-            print(f"条件嵌入形状: {condition.shape}")
-            print(f"初始表达式: {','.join(current_tokens)}")
+        log_training_step("INFERENCE_SETUP", f"推理步数: {n_steps} | 输入数据形状: x_values={x_values.shape}, y_values={y_values.shape} | 条件嵌入形状: {condition.shape} | 初始表达式: {','.join(current_tokens)}", "inference", debug_level=1)
 
         for step in range(n_steps):
-            if not debug_mode and self.accelerator.is_local_main_process:
+            if self.accelerator.is_local_main_process:
                 print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
 
-            if debug_mode and self.accelerator.is_local_main_process:
-                print(f"\n[DEBUG] === 推理步骤 {step + 1}/{n_steps} ===")
-                print(f"[DEBUG] 当前表达式: {','.join(current_tokens) if current_tokens else '<空白>'}")
+            log_training_step("INFERENCE_STEP", f"推理步骤 {step + 1}/{n_steps} | 当前表达式: {','.join(current_tokens) if current_tokens else '<空白>'}", "inference", debug_level=2)
 
             tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
 
-            # 详细调试：验证输入ID的正确性
-            if debug_mode and self.accelerator.is_local_main_process:
-                print(f"\n[DEBUG] === 输入ID验证 ===")
-                print(f"[DEBUG] 当前表达式tokens: {current_tokens}")
-                print(f"[DEBUG] tokenized_expr IDs: {tokenized_expr}")
+            # 验证输入ID的正确性
+            log_training_step("TOKEN_ID_VERIFY", f"当前表达式tokens: {current_tokens} | tokenized_expr IDs: {tokenized_expr}", "inference", debug_level=3)
 
-                # 验证每个token ID的有效性
-                vocab = special_tokens_manager.tokenizer.get_vocab()
-                valid_ids = []
-                invalid_ids = []
-                for i, token_id in enumerate(tokenized_expr):
-                    token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
-                    if token_id < len(vocab) and token_name in vocab:
-                        valid_ids.append((i, token_id, token_name, vocab[token_name]))
-                    else:
-                        invalid_ids.append((i, token_id, token_name))
-
-                print(f"[DEBUG] 有效token IDs: {valid_ids}")
-                if invalid_ids:
-                    print(f"[DEBUG] ❌ 无效token IDs: {invalid_ids}")
+            # 验证每个token ID的有效性
+            vocab = special_tokens_manager.tokenizer.get_vocab()
+            valid_ids = []
+            invalid_ids = []
+            for i, token_id in enumerate(tokenized_expr):
+                token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
+                if token_id < len(vocab) and token_name in vocab:
+                    valid_ids.append((i, token_id, token_name, vocab[token_name]))
                 else:
-                    print(f"[DEBUG] ✅ 所有token ID都有效！")
+                    invalid_ids.append((i, token_id, token_name))
 
-                # 检查是否有重复或UNK token
-                unk_token_id = vocab.get('<unk>', None)
-                if unk_token_id in tokenized_expr:
-                    print(f"[DEBUG] ⚠️ 警告：发现UNK token (ID={unk_token_id})")
+            log_training_step("TOKEN_VALIDATION", f"有效token IDs: {len(valid_ids)} | 无效token IDs: {len(invalid_ids)}", "inference", debug_level=3)
+            if invalid_ids:
+                log_training_step("TOKEN_INVALID", f"发现无效token IDs: {invalid_ids}", "inference", debug_level=2)
+
+            # 检查是否有重复或UNK token
+            unk_token_id = vocab.get('<unk>', None)
+            if unk_token_id in tokenized_expr:
+                log_training_step("TOKEN_UNK_WARNING", f"发现UNK token (ID={unk_token_id})", "inference", debug_level=2)
 
             max_len = getattr(self.args, 'max_expr_length', 128)
             if len(tokenized_expr) > max_len - 1:
                 tokenized_expr = tokenized_expr[:max_len-1]
-                if debug_mode and self.accelerator.is_local_main_process:
-                    print(f"[DEBUG] 表达式过长，截断至 {max_len-1} 个token")
+                log_training_step("EXPRESSION_TRUNCATE", f"表达式过长，截断至 {max_len-1} 个token", "inference", debug_level=2)
 
             # 使用统一的特殊token管理
             bos_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
@@ -927,30 +850,23 @@ class EditFlowManager:
 
             t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
 
-            if debug_mode and self.accelerator.is_local_main_process:
-                print(f"[DEBUG] 时间步t: {t[0,0]:.4f}")
-                print(f"[DEBUG] 最终input_ids长度: {len(tokenized_expr)}")
-                print(f"[DEBUG] 有效token数量: {attention_mask[0].sum().item()}")
+            log_training_step("MODEL_INPUT", f"时间步t: {t[0,0]:.4f} | input_ids长度: {len(tokenized_expr)} | 有效token数量: {attention_mask[0].sum().item()}", "inference", debug_level=2)
 
-                # 验证最终输入给模型的input_ids
-                print(f"\n[DEBUG] === 模型输入验证 ===")
-                print(f"[DEBUG] 最终input_ids: {input_ids[0].tolist()}")
+            # 解码完整的input_ids序列
+            decoded_tokens = []
+            for token_id in input_ids[0].tolist():
+                token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
+                decoded_tokens.append(token_name)
+            log_training_step("TOKEN_DECODE_FULL", f"解码的token序列: {decoded_tokens}", "inference", debug_level=3)
 
-                # 解码完整的input_ids序列
-                decoded_tokens = []
-                for token_id in input_ids[0].tolist():
-                    token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
-                    decoded_tokens.append(token_name)
-                print(f"[DEBUG] 解码的token序列: {decoded_tokens}")
+            # 检查input_ids的统计信息
+            input_ids_np = input_ids[0].cpu().numpy()
 
-                # 检查input_ids的统计信息
-                input_ids_np = input_ids[0].cpu().numpy()
-
-                # 确认没有无效的token ID
-                if input_ids_np.max() >= len(vocab):
-                    print(f"[DEBUG] ❌ 错误：存在超出词表范围的token ID！")
-                else:
-                    print(f"[DEBUG] ✅ 所有token ID都在有效范围内！")
+            # 确认没有无效的token ID
+            if input_ids_np.max() >= len(vocab):
+                log_training_step("TOKEN_INVALID_ERROR", f"发现无效的token ID: {input_ids_np.max()}, vocab大小: {len(vocab)}", "inference", debug_level=1)
+            else:
+                log_training_step("TOKEN_VALID_CHECK", "所有token ID都有效", "inference", debug_level=3)
 
             with torch.no_grad():
                 rates, insert_probs, substitute_probs = model(
@@ -958,24 +874,19 @@ class EditFlowManager:
                     time_steps=t, condition=condition
                 )
 
-                # 调试：检查模型输出的原始值
-                if debug_mode and self.accelerator.is_local_main_process and step == 0:
-                    print(f"\n[DEBUG] === 模型原始输出分析 ===")
-                    print(f"[DEBUG] rates形状: {rates.shape}")
-                    print(f"[DEBUG] rates前5个位置的原始值:")
-                    for i in range(min(5, rates.size(1))):
-                        print(f"[DEBUG]   位置{i}: INS={rates[0, i, 0]:.6f}, SUB={rates[0, i, 1]:.6f}, DEL={rates[0, i, 2]:.6f}")
+                # 记录模型输出的原始值（仅第一步）
+                if step == 0:
+                    log_training_step("MODEL_OUTPUT_ANALYSIS", f"模型输出形状: {rates.shape} | 位置数: {rates.size(1)}", "inference", debug_level=2)
 
                     # 检查是否所有位置都完全相同
                     rates_flat = rates[0, :, :].cpu().numpy()
                     unique_rows = np.unique(rates_flat, axis=0)
                     if unique_rows.shape[0] < rates_flat.shape[0]:
-                        print(f"[DEBUG] ⚠️  确实存在位置间输出重复！")
+                        log_training_step("MODEL_OUTPUT_UNIQUE", f"发现重复的输出行，唯一行数: {unique_rows.shape[0]}/{rates_flat.shape[0]}", "inference", debug_level=2)
 
                     # 检查insert_probs的分布
                     top_insert_tokens = torch.topk(insert_probs[0, 1], 5)  # 检查位置1的top5
-                    print(f"[DEBUG] 位置1的insert top5 token IDs: {top_insert_tokens.indices.tolist()}")
-                    print(f"[DEBUG] 位置1的insert top5 概率: {top_insert_tokens.values.tolist()}")
+                    log_training_step("MODEL_INSERT_PROBS", f"位置1的top5插入tokens: {top_insert_tokens}", "inference", debug_level=3)
 
                 lambda_ins = rates[0, :, 0].cpu().numpy()
                 lambda_sub = rates[0, :, 1].cpu().numpy()
@@ -984,14 +895,10 @@ class EditFlowManager:
                 base_length = int(attention_mask[0].sum().item())
                 effective_length = max(base_length, min(10, input_ids.size(1)))
 
-                if debug_mode and self.accelerator.is_local_main_process:
-                    print(f"[DEBUG] 操作强度形状: lambda_ins={lambda_ins.shape}, lambda_sub={lambda_sub.shape}, lambda_del={lambda_del.shape}")
-                    print(f"[DEBUG] 基础长度: {base_length}, 有效长度: {effective_length}")
-
+                if self.accelerator.is_local_main_process:
                     # 显示前几个位置的操作强度
-                    print(f"[DEBUG] 前5个位置的操作强度:")
                     for i in range(1, min(6, effective_length)):
-                        print(f"[DEBUG]   位置{i}: INS={lambda_ins[i]:.4f}, SUB={lambda_sub[i]:.4f}, DEL={lambda_del[i]:.4f}")
+                        log_training_step("OPERATION_STRENGTH", f"位置{i}: ins={lambda_ins[i]:.4f} sub={lambda_sub[i]:.4f} del={lambda_del[i]:.4f}", "inference", debug_level=3)
 
                 best_pos = 0
                 best_action = None
@@ -1012,48 +919,47 @@ class EditFlowManager:
                         best_score = lambda_del[pos]
                         best_action = ('delete', current_token_idx)
 
-                if debug_mode and self.accelerator.is_local_main_process:
-                    print(f"[DEBUG] 最佳操作: {best_action}, 分数: {best_score:.4f}")
+                if self.accelerator.is_local_main_process:
+                    log_training_step("BEST_ACTION", f"最佳操作: {best_action} | 分数: {best_score:.4f}", "inference", debug_level=2)
 
                 if best_action and best_score > 0.01:
                     action_type, pos = best_action
 
-                    if debug_mode and self.accelerator.is_local_main_process:
-                        print(f"[DEBUG] 执行操作: {action_type.upper()} 位置{pos}")
+                    if self.accelerator.is_local_main_process:
+                        log_training_step("EXECUTE_ACTION", f"执行操作: {action_type} | 位置: {pos}", "inference", debug_level=2)
 
                     if action_type == 'insert':
                         best_token = torch.argmax(insert_probs[0, pos]).item()
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] 选择插入的token ID: {best_token}")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("INSERT_TOKEN", f"插入token: {best_token}", "inference", debug_level=3)
 
                         # 直接使用tokenizer转换token ID为token名称
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
                         current_tokens.insert(pos, best_token_name)
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] 成功插入token: '{best_token_name}'")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("INSERT_COMPLETE", f"插入完成: {best_token_name} -> 位置{pos}", "inference", debug_level=2)
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] 选择替换的token ID: {best_token}")
-                            print(f"[DEBUG] 替换前: '{current_tokens[pos]}'")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("SUBSTITUTE_TOKEN", f"替换token: {best_token}", "inference", debug_level=3)
 
                         # 直接使用tokenizer转换token ID为token名称
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
                         current_tokens[pos] = best_token_name
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] 成功替换为: '{best_token_name}'")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("SUBSTITUTE_COMPLETE", f"替换完成: {best_token_name} -> 位置{pos}", "inference", debug_level=2)
 
                     elif action_type == 'delete' and pos < len(current_tokens):
                         deleted_token = current_tokens[pos]
                         del current_tokens[pos]
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] 删除token: '{deleted_token}'")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("DELETE_COMPLETE", f"删除完成: {deleted_token} <- 位置{pos}", "inference", debug_level=2)
 
                     # 在每次修改后评估表达式
                     current_expr_str = ','.join(current_tokens)
-                    if debug_mode and self.accelerator.is_local_main_process:
-                        print(f"[DEBUG] 修改后的表达式: {current_expr_str}")
+                    if self.accelerator.is_local_main_process:
+                        log_training_step("EXPRESSION_UPDATE", f"表达式更新: {current_expr_str}", "inference", debug_level=2)
 
                     # 评估表达式并进行常数优化
                     eval_success, optimized_expr, loss = evaluate_expression_with_constants(
@@ -1061,9 +967,8 @@ class EditFlowManager:
                     )
 
                     if eval_success:
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] ✓ 表达式评估成功，优化后损失: {loss:.6f}")
-                            print(f"[DEBUG] 优化后的表达式: {optimized_expr}")
+                        if self.accelerator.is_local_main_process:
+                            log_training_step("EVAL_SUCCESS", f"评估成功: {optimized_expr} | loss: {loss:.6f}", "inference", debug_level=2)
 
                         # 更新残差为基于优化后表达式的残差
                         try:
@@ -1074,30 +979,28 @@ class EditFlowManager:
                             new_residuals = y_data - y_pred_optimized
                             # 重新计算条件
                             condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
-                            if debug_mode and self.accelerator.is_local_main_process:
-                                print(f"[DEBUG] 残差已更新，MSE: {np.mean(new_residuals**2):.6f}")
+                            if self.accelerator.is_local_main_process:
+                                log_training_step("RESIDUAL_UPDATE", f"残差更新完成 | 新残差范围: [{new_residuals.min():.6f}, {new_residuals.max():.6f}]", "inference", debug_level=3)
                         except Exception as e:
-                            if debug_mode and self.accelerator.is_local_main_process:
-                                print(f"[DEBUG] ⚠️ 更新残差失败: {e}")
+                            if self.accelerator.is_local_main_process:
+                                log_training_error("RESIDUAL_UPDATE_ERROR", f"残差更新失败: {e}", "inference")
                     else:
-                        if debug_mode and self.accelerator.is_local_main_process:
-                            print(f"[DEBUG] ❌ 表达式评估失败，保持当前状态")
+                        if self.accelerator.is_local_main_process:
+                            log_training_error("EVAL_FAILED", f"表达式评估失败: {current_expr_str}", "inference")
                 else:
-                    if debug_mode and self.accelerator.is_local_main_process:
-                        print(f"[DEBUG] 未找到有效操作 (最高分数: {best_score:.4f} <= 0.01)")
+                    if self.accelerator.is_local_main_process:
+                        log_training_step("NO_ACTION", "没有找到合适的操作，跳过此步骤", "inference", debug_level=3)
 
             if len(current_tokens) > 50:
                 old_len = len(current_tokens)
                 current_tokens = current_tokens[:50]
-                if debug_mode and self.accelerator.is_local_main_process:
-                    print(f"[DEBUG] 表达式过长，从{old_len}截断至50个token")
+                if self.accelerator.is_local_main_process:
+                    log_training_step("EXPRESSION_TRUNCATE", f"表达式过长，截断从{old_len}到50", "inference", debug_level=2)
 
         # 返回最终的表达式
         final_expression = ','.join(current_tokens) if current_tokens else ""
-        if debug_mode and self.accelerator.is_local_main_process:
-            print(f"[DEBUG] 最终表达式: {final_expression}")
-        elif self.accelerator.is_local_main_process:
-            print(f"最终表达式: {final_expression}")
+        if self.accelerator.is_local_main_process:
+            log_training_step("INFERENCE_COMPLETE", f"符号回归完成 | 最终表达式: {final_expression}", "inference", debug_level=1)
 
         return final_expression
 

@@ -9,6 +9,7 @@ except ImportError:
 
 LOG_FILE = "logs/sample_generation.log"
 PERF_LOG_FILE = "logs/performance.log"
+TRAIN_LOG_FILE = "logs/training.log"
 MAX_LOG_LINES = 100000
 _log_line_count = {}
 
@@ -49,3 +50,151 @@ def log_batch_progress(batch_idx, total_batches, samples_completed, total_sample
     pct = samples_completed / total_samples * 100 if total_samples else 0
     msg = f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} BATCH [{batch_idx+1}/{total_batches}] {samples_completed}/{total_samples} ({pct:.1f}%) mem={mem}"
     _write_log(msg, PERF_LOG_FILE)
+
+
+# ==================== 训练日志记录功能 ====================
+
+def log_training_start(args):
+    """记录训练开始"""
+    import torch
+    gpu_info = ""
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        gpu_info = f" | GPUs: {gpu_count}"
+        for i in range(min(gpu_count, 2)):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            gpu_info += f" | GPU{i}: {gpu_name} ({gpu_memory:.1f}GB)"
+
+    _write_log(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} TRAINING START | Model: {getattr(args, 'model_name', 'Unknown')}{gpu_info}", TRAIN_LOG_FILE)
+
+
+def log_training_epoch(epoch, total_epochs, loss=None, lr=None, additional_info=""):
+    """记录训练epoch信息"""
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} EPOCH [{epoch+1}/{total_epochs}]"
+    if loss is not None:
+        msg += f" loss={loss:.6f}"
+    if lr is not None:
+        msg += f" lr={lr:.2e}"
+    if additional_info:
+        msg += f" | {additional_info}"
+    _write_log(msg, TRAIN_LOG_FILE)
+
+
+def log_training_batch(batch_idx, total_batches, loss, dimension=None, step_time=None, gpu_info="", additional_info=""):
+    """记录训练batch信息"""
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} BATCH [{batch_idx}/{total_batches}] loss={loss:.6f}"
+    if dimension is not None:
+        msg += f" dim={dimension}"
+    if step_time is not None:
+        msg += f" time={step_time:.3f}s"
+    if gpu_info:
+        msg += f" gpu={gpu_info}"
+    if additional_info:
+        msg += f" | {additional_info}"
+    _write_log(msg, TRAIN_LOG_FILE)
+
+
+def log_training_step(step_type, details="", context="", debug_level=0):
+    """记录训练步骤详细信息"""
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} {step_type}"
+    if context:
+        msg += f" [{context}]"
+    if details:
+        msg += f" | {details}"
+
+    if debug_level <= 1:
+        _write_log(msg, TRAIN_LOG_FILE)
+    elif debug_level == 2:
+        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_debug.log'))
+    else:
+        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_verbose.log'))
+
+
+def log_model_info(model, additional_info=""):
+    """记录模型信息"""
+    import torch
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} MODEL_INFO | Total params: {total_params:,} | Trainable: {trainable_params:,}"
+    if additional_info:
+        msg += f" | {additional_info}"
+    _write_log(msg, TRAIN_LOG_FILE)
+
+    if hasattr(model, '__class__'):
+        model_str = str(model)
+        _write_log(f"{timestamp} MODEL_STRUCTURE | {model.__class__.__name__}\n{model_str}",
+                  TRAIN_LOG_FILE.replace('.log', '_model.log'))
+
+
+def log_tensor_info(tensor_name, tensor, level=1, context=""):
+    """记录张量信息用于调试"""
+    import torch
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} TENSOR {tensor_name}"
+    if context:
+        msg += f" [{context}]"
+
+    if isinstance(tensor, torch.Tensor):
+        msg += f" | shape={list(tensor.shape)} | dtype={tensor.dtype} | device={tensor.device}"
+        if tensor.numel() > 0:
+            msg += f" | min={tensor.min().item():.6f} | max={tensor.max().item():.6f} | mean={tensor.float().mean().item():.6f}"
+            if torch.isnan(tensor).any():
+                msg += " | HAS_NAN"
+            if torch.isinf(tensor).any():
+                msg += " | HAS_INF"
+    else:
+        msg += f" | type={type(tensor)} | value={tensor}"
+
+    if level == 1:
+        _write_log(msg, TRAIN_LOG_FILE)
+    elif level == 2:
+        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_debug.log'))
+    else:
+        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_verbose.log'))
+
+
+def log_gpu_memory_usage(context=""):
+    """记录GPU内存使用情况"""
+    import torch
+    if torch.cuda.is_available():
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        msg = f"{timestamp} GPU_MEMORY"
+        if context:
+            msg += f" [{context}]"
+
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**3
+            reserved = torch.cuda.memory_reserved(i) / 1024**3
+            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            msg += f" | GPU{i}: {allocated:.1f}GB/{total:.1f}GB ({allocated/total*100:.1f}%)"
+
+        _write_log(msg, TRAIN_LOG_FILE)
+
+
+def log_training_error(error_type, error_msg, context=""):
+    """记录训练过程中的错误"""
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    msg = f"{timestamp} ERROR {error_type}"
+    if context:
+        msg += f" [{context}]"
+    msg += f" | {error_msg}"
+    _write_log(msg, TRAIN_LOG_FILE)
+
+
+def log_training_complete(total_epochs, total_time=None, final_loss=None, additional_info=""):
+    """记录训练完成"""
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    msg = f"{timestamp} TRAINING COMPLETE | Total epochs: {total_epochs}"
+    if total_time is not None:
+        msg += f" | Total time: {total_time:.2f}s"
+    if final_loss is not None:
+        msg += f" | Final loss: {final_loss:.6f}"
+    if additional_info:
+        msg += f" | {additional_info}"
+    _write_log(msg, TRAIN_LOG_FILE)

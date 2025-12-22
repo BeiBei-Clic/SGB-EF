@@ -19,8 +19,6 @@ os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
 os.environ["NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
 
 from src.training.editflow_manager import EditFlowManager
-from src.utils.gpu_monitor import display_gpu_info
-from src.utils.special_tokens import SpecialTokensManager
 
 
 def set_seed(seed: int):
@@ -47,7 +45,6 @@ def main():
     parser.add_argument("--max_expr_length", type=int, default=6, help="表达式最大token长度")
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
-    parser.add_argument("--debug", action="store_true", default=False, help="是否输出调试信息")
 
     # 模型参数
     parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
@@ -93,7 +90,7 @@ def main():
     manager = EditFlowManager(args)
 
     try:
-        model, condition_encoder = manager.train()
+        manager.train()
 
         # 只有在主进程才打印完成信息
         if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:

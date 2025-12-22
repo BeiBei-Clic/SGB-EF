@@ -7,10 +7,14 @@ import numpy as np
 
 from src.symbolic.data_generator import generate_sample
 from src.training.editflow_manager import EditFlowManager
+from src.utils.log_utils import log_training_step, log_gpu_memory_usage, log_training_error
 
 
 def main():
-    print("=== 带调试信息的符号回归实例 ===")
+    print("=== 符号回归实例 ===")
+
+    # 记录开始日志
+    log_training_step("INFERENCE_START", "开始符号回归实例", "example")
 
     # 设置参数
     args = type('Args', (), {
@@ -39,9 +43,12 @@ def main():
 
     # 生成测试数据
     print("生成测试数据...")
+    log_training_step("DATA_GENERATION", "开始生成测试数据", "example")
     sample = generate_sample(input_dimension=3, n_points=100, max_depth=5)
     x_data = np.array(sample['x'])
     y_data = np.array(sample['y'])
+
+    log_training_step("DATA_INFO", f"真实表达式: {sample['exp_gt']} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example")
 
     print(f"\n数据信息:")
     print(f"真实表达式: {sample['exp_gt']}")
@@ -49,17 +56,18 @@ def main():
     print(f"y_data 形状: {y_data.shape}")
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_15"
+    model_path = "checkpoints/continuous_flow_final"
 
     # 执行符号回归（会自动推断input_dim并生成动态初始表达式）
+    log_training_step("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")
     predicted_expression = manager.symbolic_regression(
         model_path=model_path,
         x_data=x_data,
         y_data=y_data,
-        debug_mode=True,  # 开启调试模式
         n_steps=30  # 减少步数以便观察
     )
 
+    log_training_step("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
     print(f"\n最终结果对比:")
     print(f"真实表达式: {sample['exp_gt']}")
     print(f"预测表达式: {predicted_expression}")
