@@ -9,23 +9,7 @@
 ```bash
 # 临时设置
 export HF_ENDPOINT=https://hf-mirror.com
-
-# 永久设置（添加到 ~/.bashrc 或 ~/.zshrc）
-echo 'export HF_ENDPOINT=https://hf-mirror.com' >> ~/.bashrc
-source ~/.bashrc
 ```
-
-### 验证设置
-
-```bash
-echo $HF_ENDPOINT
-# 输出: https://hf-mirror.com
-```
-
-### 可用镜像源
-
-- **主镜像**: `https://hf-mirror.com`
-- **备用镜像**: `https://hf.1zhe.icu`
 
 ## 模型缓存
 
@@ -41,17 +25,13 @@ echo $HF_ENDPOINT
 | **Qwen/Qwen3-Embedding-0.6B** | 600M | - | 🔥 高性能<br>🔥 参数量大<br>🔥 可能更好效果 | 追求最佳效果<br>充足计算资源<br>研究实验 |
 
 ## 数据生成日志监控
-
 当数据生成卡住时，使用以下命令快速定位问题：
-查看日志最后20行
-
+查看日志最后2000行
 ```bash
 tail -n 2000 logs/sample_generation.log
 ```
 
-
 ## 分布式训练
-
 ```bash
 accelerate launch \
     --num_processes=3 \
@@ -60,9 +40,11 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_timesteps 10 \
-    --num_samples 100000\
-    --batch_size 24
+    --num_timesteps 20 \
+    --num_samples 1000000 \
+    --batch_size 48
+
+##
 ```
 
 ## 分布式训练管理
@@ -78,4 +60,32 @@ pkill -9 accelerate
 ## 监控GPU使用情况
 ```bash
 watch -n 1 -d nvidia-smi
+```
+
+## tmux 将终端任务挂到后台运行
+```bash
+# 创建一个名为my_session的tmux会话
+tmux new -s my_session
+# 在tmux会话中运行任务
+accelerate launch \
+    --num_processes=3 \
+    --num_machines=1 \
+    --mixed_precision=fp16 \
+    --dynamo_backend=no \
+    --multi_gpu \
+    train.py \
+    --num_timesteps 20 \
+    --num_samples 1000000\
+    --batch_size 48
+
+# 将会话挂到后台
+Ctrl + B, D
+# 查看当前有哪些正在运行的会话
+tmux ls
+# 进入（恢复）指定名字的会话
+tmux a -t my_session
+#在tmux内部关闭会话
+Ctrl + D
+# 在tmux外部强制关闭会话
+tmux kill-session -t my_session
 ```

@@ -5,6 +5,7 @@ EditFlow连续流匹配的核心组件
 import torch
 import json
 import os
+import time
 from typing import List, Dict, Tuple, Optional
 from ..symbolic.data_generator import generate_flow_samples
 from ..utils.special_tokens import SpecialTokensManager
@@ -69,20 +70,64 @@ def remove_gap_tokens(z_t: torch.Tensor, special_tokens_manager: SpecialTokensMa
     return x_t_padded, x_pad_mask_padded, z_gap_mask, z_pad_mask
 
 
-def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z_pad_mask: torch.Tensor) -> torch.Tensor:
+def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z_pad_mask: torch.Tensor, debug=False) -> torch.Tensor:
     """用重复值填充gap token位置"""
     batch_size, z_seq_len = z_gap_mask.shape
     _, x_seq_len, vocab_size = x_ut.shape
 
+    if debug:
+        print(f"[DEBUG FILL_GAP] 输入形状: x_ut={x_ut.shape}, z_gap_mask={z_gap_mask.shape}, z_pad_mask={z_pad_mask.shape}")
+        print(f"[DEBUG FILL_GAP] batch_size={batch_size}, z_seq_len={z_seq_len}, x_seq_len={x_seq_len}")
+        print(f"[DEBUG FILL_GAP] 内存使用: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
     # 计算每个位置对应的非gap位置
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤1: 计算non_gap_mask...")
+
     non_gap_mask = ~z_gap_mask
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤2: 计算cumsum...")
+        print(f"[DEBUG FILL_GAP] non_gap_mask 非零元素数: {non_gap_mask.sum().item()}")
+
     indices = non_gap_mask.cumsum(dim=1) - 1
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤3: clamp indices...")
+        print(f"[DEBUG FILL_GAP] indices 范围: [{indices.min().item()}, {indices.max().item()}]")
+
     indices = indices.clamp(min=0, max=x_seq_len-1)
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤4: 创建batch_indices...")
 
     # 收集对应的特征
     batch_indices = torch.arange(batch_size, device=x_ut.device).unsqueeze(1)
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤5: 高级索引操作...")
+        print(f"[DEBUG FILL_GAP] batch_indices shape: {batch_indices.shape}")
+        print(f"[DEBUG FILL_GAP] 高级索引前内存: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        # 强制同步
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     result = x_ut[batch_indices, indices]
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤6: 设置pad_mask...")
+        print(f"[DEBUG FILL_GAP] 高级索引后内存: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        print(f"[DEBUG FILL_GAP] z_pad_mask 数量: {z_pad_mask.sum().item()}")
+        # 强制同步
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     result[z_pad_mask] = 0
+
+    if debug:
+        print(f"[DEBUG FILL_GAP] 步骤7: 完成")
+        print(f"[DEBUG FILL_GAP] result shape: {result.shape}")
+        print(f"[DEBUG FILL_GAP] 最终内存: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
     return result
 
@@ -113,15 +158,83 @@ class ContinuousFlowLoss:
         return u_mask
 
     def __call__(self, u_cat: torch.Tensor, u_mask: torch.Tensor,
-                 t: torch.Tensor, vocab_size: int) -> torch.Tensor:
+                 t: torch.Tensor, vocab_size: int, debug=False, accelerator=None) -> torch.Tensor:
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 开始损失计算...")
+            print(f"[DEBUG CRITERION] u_cat shape: {u_cat.shape}")
+            print(f"[DEBUG CRITERION] u_mask shape: {u_mask.shape}")
+            print(f"[DEBUG CRITERION] t shape: {t.shape}")
+            print(f"[DEBUG CRITERION] vocab_size: {vocab_size}")
+            print(f"[DEBUG CRITERION] 内存: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+        # NaN/Inf检测
+        nan_count = torch.isnan(u_cat).sum().item()
+        inf_count = torch.isinf(u_cat).sum().item()
+
+        if debug:
+            print(f"[DEBUG CRITERION] NaN数量: {nan_count}, Inf数量: {inf_count}")
+
+        # 分布式NaN检测：如果使用accelerator，确保所有进程同步跳过
+        has_nan_or_inf = torch.tensor(1 if (nan_count > 0 or inf_count > 0) else 0,
+                                    device=u_cat.device)
+
+        if accelerator is not None and accelerator.distributed_type != "NO":
+            # 同步所有进程的NaN检测结果
+            if debug:
+                print(f"[DEBUG CRITERION] 分布式NaN检测中...")
+
+            # 使用accelerator.gather收集所有进程的NaN检测结果
+            gathered_results = accelerator.gather(has_nan_or_inf)
+            has_nan_or_inf = gathered_results.sum()
+
+            if debug:
+                print(f"[DEBUG CRITERION] 所有进程NaN检测结果: {has_nan_or_inf.item()}")
+        else:
+            has_nan_or_inf = has_nan_or_inf.item()
+
+        # 如果任何进程包含NaN或Inf，抛出异常让训练循环跳过该批次
+        if has_nan_or_inf > 0:
+            if debug:
+                print(f"[DEBUG CRITERION] 检测到异常值（分布式），所有进程将跳过批次...")
+            raise ValueError(f"批次包含异常值: 本地NaN={nan_count}, Inf={inf_count}, 分布式检测={has_nan_or_inf}")
+
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤1: 计算u_total...")
+
         u_total = u_cat.sum(dim=(1, 2))
+
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤2: 计算调度系数...")
+            print(f"[DEBUG CRITERION] t 范围: [{t.min().item():.6f}, {t.max().item():.6f}]")
+
         sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
         sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)
 
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤3: 计算log_u_cat...")
+            print(f"[DEBUG CRITERION] u_cat 范围: [{u_cat.min().item():.6f}, {u_cat.max().item():.6f}]")
+
         log_u_cat = torch.log(torch.clamp(u_cat, min=1e-12, max=1e12))
+
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤4: 计算交叉熵...")
+            print(f"[DEBUG CRITERION] u_mask 非零元素数: {u_mask.sum().item()}")
+
         cross_entropy = (log_u_cat * u_mask.float()).sum(dim=(1, 2))
 
-        return (u_total - cross_entropy * sched_coeff).mean()
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 步骤5: 计算最终损失...")
+            print(f"[DEBUG CRITERION] u_total 范围: [{u_total.min().item():.6f}, {u_total.max().item():.6f}]")
+            print(f"[DEBUG CRITERION] cross_entropy 范围: [{cross_entropy.min().item():.6f}, {cross_entropy.max().item():.6f}]")
+            print(f"[DEBUG CRITERION] sched_coeff 范围: [{sched_coeff.min().item():.6f}, {sched_coeff.max().item():.6f}]")
+
+        loss = (u_total - cross_entropy * sched_coeff).mean()
+
+        if debug:
+            print(f"[DEBUG CRITERION] {time.strftime('%H:%M:%S.%f')[:-3]} 损失计算完成: {loss.item():.6f}")
+            print(f"[DEBUG CRITERION] 最终内存: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+        return loss
 
 
 class FlowDataset(torch.utils.data.Dataset):

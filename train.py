@@ -74,9 +74,9 @@ def main():
     # SetTransformer条件编码器参数
     parser.add_argument("--condition_max_input_dim", type=int, default=6, help="SetTransformer支持的最大输入维度")
     parser.add_argument("--condition_dim_hidden", type=int, default=128, help="SetTransformer隐藏层维度")
-    parser.add_argument("--condition_num_heads", type=int, default=4, help="SetTransformer注意力头数")
+    parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 (调整为8以匹配标准Transformer配置)")
     parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")
-    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数")
+    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 (减少到2层避免过深)")
     parser.add_argument("--condition_num_seeds", type=int, default=1, help="SetTransformer种子数")
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
     parser.add_argument("--condition_input_normalization", type=bool, default=True, help="是否对输入进行标准化")

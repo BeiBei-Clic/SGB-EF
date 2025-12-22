@@ -381,8 +381,41 @@ class EditFlowManager:
         extended_sub_probs = sub_probs
 
         u_cat = torch.cat([lambda_ins * extended_ins_probs, lambda_sub * extended_sub_probs, lambda_del], dim=-1)
-        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
+
+        # 调试：在fill_gap_tokens_with_repeats之前
+        if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG STEP 1] {time.strftime('%H:%M:%S')} 开始 fill_gap_tokens_with_repeats...")
+            print(f"[DEBUG STEP 1] u_cat shape: {u_cat.shape}")
+            print(f"[DEBUG STEP 1] z_gap_mask shape: {z_gap_mask.shape}")
+            print(f"[DEBUG STEP 1] z_pad_mask shape: {z_pad_mask.shape}")
+            print(f"[DEBUG STEP 1] t shape: {t.shape}, t范围: [{t.min().item():.4f}, {t.max().item():.4f}]")
+            # 强制CUDA同步
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask, debug=debug)
+
+        # 调试：在fill_gap_tokens_with_repeats之后
+        if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG STEP 2] {time.strftime('%H:%M:%S')} fill_gap_tokens_with_repeats 完成")
+            print(f"[DEBUG STEP 2] u_z shape: {u_z.shape}")
+            print(f"[DEBUG STEP 2] u_z stats: min={u_z.min().item():.6f}, max={u_z.max().item():.6f}, mean={u_z.mean().item():.6f}")
+            # 强制CUDA同步
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
+
+        # 调试：在make_ut_mask_from_z之后
+        if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG STEP 3] make_ut_mask_from_z 完成")
+            print(f"[DEBUG STEP 3] u_mask shape: {u_mask.shape}")
+            print(f"[DEBUG STEP 3] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
+            print(f"[DEBUG STEP 3] u_mask 非零元素数: {u_mask.sum().item()}")
+
+            # GPU内存使用情况
+            if torch.cuda.is_available():
+                print(f"[DEBUG GPU] GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.memory_reserved()/1024**3:.2f}GB")
 
         # 调试：打印u矩阵
         if debug and self.accelerator.is_local_main_process:
@@ -398,7 +431,23 @@ class EditFlowManager:
             print(f"[DEBUG COMPUTE_LOSS] u_mask sum per batch: {u_mask.sum(dim=(1,2))}")
             print(f"[DEBUG COMPUTE_LOSS] t shape: {t.shape}, t范围: [{t.min().item():.4f}, {t.max().item():.4f}]")
 
-        loss = criterion(u_z, u_mask, t, effective_vocab_size)
+        # 调试：进入criterion之前
+        if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG STEP 4] {time.strftime('%H:%M:%S')} 开始 criterion 计算...")
+            # 强制CUDA同步
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        loss = criterion(u_z, u_mask, t, effective_vocab_size, debug=debug, accelerator=self.accelerator)
+
+        # 调试：criterion完成之后
+        if debug and self.accelerator.is_local_main_process:
+            print(f"[DEBUG STEP 5] {time.strftime('%H:%M:%S')} criterion 计算完成")
+            print(f"[DEBUG STEP 5] loss value: {loss.item():.6f}")
+            # 强制CUDA同步
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         return loss
 
     def train_epoch(self, model, condition_encoder, criterion, optimizer, dataloader, dataset, epoch, dimension):
@@ -470,7 +519,46 @@ class EditFlowManager:
                 }
 
             forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
-            loss = self.compute_loss(forward_results, criterion, dataset, debug=debug_mode) / gradient_accumulation_steps
+
+            # 分布式健康检查：确保前向传播结果在不同进程间合理
+            if debug_mode and self.accelerator.distributed_type != "NO":
+                pred_rates = forward_results['pred_rates']
+
+                # 检查是否有任何进程的模型输出包含NaN
+                local_has_nan = torch.isnan(pred_rates).any().float()
+                gathered_nan_results = self.accelerator.gather(local_has_nan)
+                global_has_nan = gathered_nan_results.sum()
+
+                if global_has_nan.item() > 0:
+                    if self.accelerator.is_local_main_process:
+                        print(f"[DEBUG HEALTH] ⚠️ 检测到前向传播NaN，所有进程将跳过此批次")
+                    # 继续执行到criterion中的分布式NaN检测，那里会统一跳过
+
+            # 尝试计算损失，如果包含NaN则跳过该批次
+            try:
+                loss = self.compute_loss(forward_results, criterion, dataset, debug=debug_mode) / gradient_accumulation_steps
+            except ValueError as e:
+                if "批次包含异常值" in str(e):
+                    if debug_mode and self.accelerator.is_local_main_process:
+                        print(f"[DEBUG SKIP] 跳过批次 {batch_idx} (包含NaN/Inf): {e}")
+
+                    # 分布式同步：确保所有进程都到达这个点
+                    if debug_mode:
+                        print(f"[DEBUG SYNC] 所有进程同步跳过批次 {batch_idx}...")
+
+                    # 等待所有进程都准备好跳过
+                    self.accelerator.wait_for_everyone()
+
+                    # 清理GPU内存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    # 再次同步确保所有进程都完成了清理
+                    self.accelerator.wait_for_everyone()
+
+                    continue  # 跳过此批次
+                else:
+                    raise  # 重新抛出其他类型的ValueError
 
             grad_norm = 0.0
             if not torch.isnan(loss):
@@ -551,11 +639,19 @@ class EditFlowManager:
 
                 condition_embeddings = condition_encoder(x_values, residuals)
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset, config)
-                loss = self.compute_loss(forward_results, criterion, test_dataset, debug=False)
 
-                if not torch.isnan(loss):
-                    total_loss += loss.item()
-                    num_batches += 1
+                # 尝试计算损失，如果包含NaN则跳过该批次
+                try:
+                    loss = self.compute_loss(forward_results, criterion, test_dataset, debug=False)
+                    if not torch.isnan(loss):
+                        total_loss += loss.item()
+                        num_batches += 1
+                except ValueError as e:
+                    if "批次包含异常值" in str(e):
+                        # 评估时跳过包含NaN的批次，不输出错误信息避免干扰
+                        continue
+                    else:
+                        raise
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()
