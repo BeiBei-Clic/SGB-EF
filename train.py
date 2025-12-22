@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 ")
     parser.add_argument("--condition_num_seeds", type=int, default=1, help="SetTransformer种子数")
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
-    parser.add_argument("--condition_input_normalization", type=bool, default=True, help="是否对输入进行标准化")
+    parser.add_argument("--condition_input_normalization", type=bool, default=False, help="是否对输入进行标准化")
 
     # 保持向后兼容性，但现在不再使用的参数
     parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")

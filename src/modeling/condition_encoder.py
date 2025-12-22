@@ -142,19 +142,30 @@ class SetTransformerConditionEncoder(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _normalize_input(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
-        """标准化输入数据"""
+        """标准化输入数据 - 按特征维度标准化"""
         if self.input_normalization:
-            # 对x_values进行标准化
-            x_mean = x_values.mean(dim=1, keepdim=True)
-            x_std = x_values.std(dim=1, keepdim=True)
-            x_std = torch.clamp(x_std, min=1e-8)  # 避免除零
-            x_values_norm = (x_values - x_mean) / x_std
+            # x_values: [batch_size, n_points, max_dim]
+            batch_size, n_points, max_dim = x_values.shape
 
-            # 对residuals进行标准化
-            r_mean = residuals.mean(dim=1, keepdim=True)
-            r_std = residuals.std(dim=1, keepdim=True)
+            # 重塑为 [batch_size * n_points, max_dim] 以跨所有数据点标准化
+            x_flat = x_values.view(-1, max_dim)
+            r_flat = residuals.view(-1)
+
+            # 跨所有数据点计算均值和标准差
+            x_mean = x_flat.mean(dim=0, keepdim=True)  # [1, max_dim]
+            x_std = x_flat.std(dim=0, keepdim=True)    # [1, max_dim]
+            x_std = torch.clamp(x_std, min=1e-8)
+
+            r_mean = r_flat.mean()
+            r_std = r_flat.std()
             r_std = torch.clamp(r_std, min=1e-8)
-            residuals_norm = (residuals - r_mean) / r_std
+
+            # 标准化并恢复形状
+            x_values_norm = (x_flat - x_mean) / x_std
+            residuals_norm = (r_flat - r_mean) / r_std
+
+            x_values_norm = x_values_norm.view(batch_size, n_points, max_dim)
+            residuals_norm = residuals_norm.view(batch_size, n_points)
 
             return x_values_norm, residuals_norm
         else:
@@ -227,31 +238,17 @@ class ConditionEncoder(SetTransformerConditionEncoder):
                  verbose: bool = False,
                  max_length: int = None,  # 保持参数兼容性但不再使用
                  **kwargs):
-        # 如果传入了args对象（从训练脚本来的），则从中读取参数
-        if 'args' in kwargs:
-            args = kwargs['args']
-            transformer_params = {
-                'max_input_dim': getattr(args, 'condition_max_input_dim', 6),
-                'dim_hidden': getattr(args, 'condition_dim_hidden', 128),
-                'num_heads': getattr(args, 'condition_num_heads', 4),
-                'num_inds': getattr(args, 'condition_num_inds', 32),
-                'num_layers': getattr(args, 'condition_num_layers', 3),
-                'num_seeds': getattr(args, 'condition_num_seeds', 1),
-                'dim_output': getattr(args, 'condition_dim_output', 128),
-                'input_normalization': getattr(args, 'condition_input_normalization', True),
-                'verbose': verbose
-            }
-        else:
-            # 使用直接传递的参数或默认值
-            transformer_params = {
-                'dim_hidden': kwargs.get('dim_hidden', 128),
-                'num_heads': kwargs.get('num_heads', 4),
-                'num_inds': kwargs.get('num_inds', 32),
-                'num_layers': kwargs.get('num_layers', 3),
-                'num_seeds': kwargs.get('num_seeds', 1),
-                'dim_output': kwargs.get('dim_output', 128),
-                'input_normalization': kwargs.get('input_normalization', True),
-                'verbose': verbose
-            }
+        args = kwargs['args']
+        transformer_params = {
+            'max_input_dim': getattr(args, 'condition_max_input_dim', 6),
+            'dim_hidden': getattr(args, 'condition_dim_hidden', 128),
+            'num_heads': getattr(args, 'condition_num_heads', 4),
+            'num_inds': getattr(args, 'condition_num_inds', 32),
+            'num_layers': getattr(args, 'condition_num_layers', 3),
+            'num_seeds': getattr(args, 'condition_num_seeds', 1),
+            'dim_output': getattr(args, 'condition_dim_output', 128),
+            'input_normalization': getattr(args, 'condition_input_normalization', True),
+            'verbose': verbose
+        }
 
         super().__init__(**transformer_params)

@@ -36,7 +36,7 @@ def main():
         'condition_num_layers': 3,
         'condition_num_seeds': 1,
         'condition_dim_output': 128,
-        'condition_input_normalization': True
+        'condition_input_normalization': False
     })()
 
     manager = EditFlowManager(args)
