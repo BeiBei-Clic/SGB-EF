@@ -45,6 +45,8 @@ tail -n 2000 logs/sample_generation.log
 # 查看最近的调试日志（包含每个batch的张量统计、梯度信息等）
 tail -n 2000 logs/training_debug.log
 
+tail -n 2000 logs/training.log
+
 # 实时监控调试日志
 tail -f logs/training_debug.log
 ```

@@ -78,6 +78,11 @@ def main():
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
     parser.add_argument("--condition_input_normalization", type=bool, default=False, help="是否对输入进行标准化")
 
+    # 正弦频率映射参数 (Sinusoidal Encoding)
+    parser.add_argument("--condition_use_sinusoidal_encoding", type=bool, default=True, help="是否使用正弦编码将数值映射到频率域")
+    parser.add_argument("--condition_sinusoidal_dim", type=int, default=64, help="正弦编码维度（每个数值编码后的特征数）")
+    parser.add_argument("--condition_sinusoidal_max_freq", type=float, default=10000.0, help="正弦编码最大频率（控制频率范围）")
+
     # 保持向后兼容性，但现在不再使用的参数
     parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")
 
