@@ -420,6 +420,18 @@ def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
     """
     try:
         result = evaluate_expr(expr, x_values)
+        # 检查结果是否包含nan或inf
+        if np.any(np.isnan(result)) or np.any(np.isinf(result)):
+            if error_callback:
+                error_callback("Result contains NaN or Inf values")
+            return False, None
+        # 检查结果是否包含超大数值（绝对值超过阈值）
+        MAX_ABS_VALUE = 1e4  # 最大绝对值阈值
+        max_abs = np.max(np.abs(result))
+        if max_abs > MAX_ABS_VALUE:
+            if error_callback:
+                error_callback(f"Result contains values exceeding threshold: max_abs={max_abs:.2f} > {MAX_ABS_VALUE}")
+            return False, None
         return True, result
     except Exception as e:
         if error_callback:
