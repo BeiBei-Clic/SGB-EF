@@ -44,7 +44,8 @@ def main():
     # 生成测试数据
     print("生成测试数据...")
     log_training_step("DATA_GENERATION", "开始生成测试数据", "example")
-    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5)
+    # seed=None 表示每次运行生成不同的随机数据
+    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=5)
     x_data = np.array(sample['x'])
     y_data = np.array(sample['y'])
 
@@ -56,7 +57,7 @@ def main():
     print(f"y_data 形状: {y_data.shape}")
 
     # 模型路径
-    model_path = "checkpoints/continuous_flow_final"
+    model_path = "checkpoints/checkpoint_epoch_5"
 
     # 执行符号回归（会自动推断input_dim并生成动态初始表达式）
     log_training_step("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")

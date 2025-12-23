@@ -132,8 +132,20 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
     return batch_idx, len(batch_samples), dimension_count
 
-def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4) -> Dict:
-    """生成单个样本"""
+def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4, seed: int = None) -> Dict:
+    """生成单个样本
+
+    Args:
+        input_dimension: 输入维度
+        n_points: 数据点数量
+        max_depth: 表达式最大深度
+        seed: 随机种子，None表示使用系统随机源
+    """
+    # 设置随机种子（如果提供）
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+
     # 生成更随机的样本ID，包含时间戳和随机因子
     timestamp_ms = int(time.time() * 1000000)
     random_factor = random.randint(0, 999999)

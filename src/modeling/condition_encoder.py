@@ -308,8 +308,8 @@ class SetTransformerConditionEncoder(nn.Module):
         x = x.view(batch_size, -1)  # (batch_size, num_seeds * dim_hidden)
         condition = self.output_projection(x)  # (batch_size, output_dim)
 
-        # L2标准化（确保稳定的输出）
-        condition = F.normalize(condition, p=2, dim=1, eps=1e-6)
+        # 不做任何归一化，直接返回原始的条件向量
+        # 保留完整的条件信息，让模型自己学习如何处理
 
         return condition
 

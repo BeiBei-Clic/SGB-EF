@@ -47,8 +47,7 @@ tail -n 2000 logs/training_debug.log
 
 tail -n 2000 logs/training.log
 
-# 实时监控调试日志
-tail -f logs/training_debug.log
+tail -n 2000 logs/inference.log
 ```
 
 ### 调试日志内容
@@ -90,7 +89,7 @@ accelerate launch \
     train.py \
     --num_timesteps 10 \
     --num_samples 1000000\
-    --batch_size 36
+    --batch_size 48
 
 # 将会话挂到后台
 Ctrl + B, D
@@ -102,4 +101,11 @@ tmux a -t my_session
 Ctrl + D
 # 在tmux外部强制关闭会话
 tmux kill-session -t my_session
+# 进入复制模式
+Ctrl + B, [
+# 选择要复制的内容
+# 复制到剪贴板
+Ctrl + C
+# 退出复制模式
+Ctrl + D
 ```

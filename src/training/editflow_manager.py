@@ -412,7 +412,7 @@ class EditFlowManager:
 
         # 只在主进程设置初始进度条显示
         if self.accelerator.is_local_main_process:
-            progress_bar.set_postfix({'loss': '0.0000', 'gpu_load': get_gpu_memory_usage_string(max_gpus=3)})
+            progress_bar.set_postfix({'loss': '0.0000'})
 
         for batch_idx, batch in enumerate(progress_bar):
             x_values = batch['x_values'].to(self.device)
@@ -569,13 +569,9 @@ class EditFlowManager:
 
             # 只在主进程更新进度条显示
             if self.accelerator.is_local_main_process:
-                # 获取时间步采样数量用于显示
-                num_timesteps = self.args.num_timesteps
                 postfix_dict = {
                     'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
-                    'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}',
-                    'gpu_load': get_gpu_memory_usage_string(max_gpus=3),
-                    't_steps': num_timesteps  # 显示时间步采样数量
+                    'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm.item():.3f}'
                 }
                 progress_bar.set_postfix(postfix_dict)
 
@@ -703,6 +699,8 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"模型参数数量: {model_params:,}, 条件编码器参数数量: {encoder_params:,}")
             print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
+            # 记录训练开始到 training.log
+            log_training_step("TRAINING_START", f"开始训练 | num_epochs={self.args.num_epochs} | model_params={model_params:,} | encoder_params={encoder_params:,}", debug_level=1)
 
         config = model.module.config if hasattr(model, 'module') else model.config
         eval_every = getattr(self.args, 'eval_every', 5)
@@ -717,12 +715,16 @@ class EditFlowManager:
 
             if self.accelerator.is_local_main_process:
                 print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
+                # 记录训练成果到 training.log
+                log_training_step("EPOCH_COMPLETE", f"Epoch {epoch+1}/{self.args.num_epochs} | train_loss={avg_loss:.4f} | batches={num_batches}", debug_level=1)
 
             # 修改 evaluate 调用，传入单个 dataloader
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:
                 test_loss = self.evaluate(model, condition_encoder, criterion, test_dataloader, test_dataset)
                 if self.accelerator.is_local_main_process:
                     print(f"测试集损失: {test_loss:.4f}")
+                    # 记录评估结果到 training.log
+                    log_training_step("EVALUATION", f"Epoch {epoch+1}/{self.args.num_epochs} | test_loss={test_loss:.4f}", debug_level=1)
 
             # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
@@ -731,6 +733,8 @@ class EditFlowManager:
                 )
                 if self.accelerator.is_local_main_process:
                     print(f"检查点已保存到: {checkpoint_path}")
+                    # 记录检查点保存到 training.log
+                    log_training_step("CHECKPOINT_SAVED", f"Epoch {epoch+1}/{self.args.num_epochs} | path={checkpoint_path} | train_loss={avg_loss:.4f}", debug_level=1)
 
         # 保存最终模型
         final_path = self.save_checkpoint(
@@ -738,6 +742,8 @@ class EditFlowManager:
         )
         if self.accelerator.is_local_main_process:
             print(f"最终模型已保存到: {final_path}")
+            # 记录训练完成到 training.log
+            log_training_step("TRAINING_COMPLETE", f"训练完成 | final_path={final_path} | final_train_loss={avg_loss:.4f} | total_epochs={self.args.num_epochs}", debug_level=1)
 
         # 显式清理分布式资源
         try:
@@ -801,13 +807,19 @@ class EditFlowManager:
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
         if not success:
             if self.accelerator.is_local_main_process:
-                print(f"警告：无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差")
+                log_training_error("INITIAL_EXPR_FAILED", f"无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差", "inference")
             residuals = y_values
         else:
             # 计算残差：真实值 - 预测值
             residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
 
+        # 记录初始数据状态（验证数据是否正确传递）
+        log_training_step("INITIAL_DATA", f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | y_values: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] mean={residuals.mean():.4f} std={residuals.std():.4f}", "inference", debug_level=1)
+
         condition = condition_encoder(x_values, residuals)
+
+        # 记录初始条件编码状态
+        log_training_step("INITIAL_CONDITION", f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}] mean={condition.mean():.4f} std={condition.std():.4f}", "inference", debug_level=1)
 
         # 构建初始前缀表达式（与训练格式一致）
         if input_dim == 1:
@@ -884,6 +896,9 @@ class EditFlowManager:
             attention_mask = (input_ids != pad_token).float().to(device)
 
             t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
+
+            # 记录当前条件嵌入状态（每步都记录，用于调试）
+            log_training_step("CONDITION_STATE", f"步骤{step+1} condition: 范围=[{condition.min():.4f},{condition.max():.4f}] mean={condition.mean():.4f} std={condition.std():.4f} norm={condition.norm():.4f}", "inference", debug_level=2)
 
             log_training_step("MODEL_INPUT", f"时间步t: {t[0,0]:.4f} | input_ids长度: {len(tokenized_expr)} | 有效token数量: {attention_mask[0].sum().item()}", "inference", debug_level=2)
 
@@ -997,25 +1012,47 @@ class EditFlowManager:
                         log_training_step("EXPRESSION_UPDATE", f"表达式更新: {current_expr_str}", "inference", debug_level=2)
 
                     # 评估表达式并进行常数优化
+                    log_training_step("BEFORE_EVAL", f"开始评估表达式: {current_expr_str}", "inference", debug_level=2)
                     eval_success, optimized_expr, loss = evaluate_expression_with_constants(
                         current_expr_str, x_data, y_data
                     )
+                    log_training_step("AFTER_EVAL", f"评估完成: eval_success={eval_success}, loss={loss:.6f}", "inference", debug_level=2)
 
                     if eval_success:
-                        if self.accelerator.is_local_main_process:
-                            log_training_step("EVAL_SUCCESS", f"评估成功: {optimized_expr} | loss: {loss:.6f}", "inference", debug_level=2)
-
                         # 更新残差为基于优化后表达式的残差
                         try:
                             # 计算优化后表达式的预测值
                             from ..symbolic.symbolic_utils import evaluate_expr
                             y_pred_optimized = evaluate_expr(optimized_expr, x_data)
-                            # 更新残差：真实值 - 优化后的预测值
-                            new_residuals = y_data - y_pred_optimized
+
+                            # 裁剪超大值到合理范围，防止数值溢出
+                            # 使用很大的阈值（1e6），让大部分有效值通过
+                            CLIP_THRESHOLD = 1e6
+                            y_pred_clipped = np.clip(y_pred_optimized, -CLIP_THRESHOLD, CLIP_THRESHOLD)
+
+                            # 检查是否被裁剪
+                            was_clipped = np.any(y_pred_optimized != y_pred_clipped)
+                            n_clipped = np.sum(y_pred_optimized != y_pred_clipped) if was_clipped else 0
+
+                            # 更新残差：真实值 - 裁剪后的预测值
+                            new_residuals = y_data - y_pred_clipped
+
+                            # 同样裁剪残差
+                            new_residuals = np.clip(new_residuals, -CLIP_THRESHOLD, CLIP_THRESHOLD)
+
                             # 重新计算条件
                             condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
+
+                            # 检查新条件是否有效
+                            if torch.any(torch.isnan(condition)) or torch.any(torch.isinf(condition)):
+                                if self.accelerator.is_local_main_process:
+                                    log_training_error("CONDITION_INVALID", f"新条件包含无效值，跳过更新", "inference")
+                                continue
+
                             if self.accelerator.is_local_main_process:
-                                log_training_step("RESIDUAL_UPDATE", f"残差更新完成 | 新残差范围: [{new_residuals.min():.6f}, {new_residuals.max():.6f}]", "inference", debug_level=3)
+                                clip_info = f", 裁剪了{n_clipped}个值" if was_clipped else ""
+                                log_training_step("EVAL_SUCCESS", f"评估成功: {optimized_expr} | loss: {loss:.6f}{clip_info}", "inference", debug_level=2)
+                                log_training_step("RESIDUAL_UPDATE", f"新残差: 范围=[{new_residuals.min():.6f},{new_residuals.max():.6f}] mean={new_residuals.mean():.6f} std={new_residuals.std():.6f} | 新condition: 范围=[{condition.min():.4f},{condition.max():.4f}] norm={condition.norm():.4f}", "inference", debug_level=2)
                         except Exception as e:
                             if self.accelerator.is_local_main_process:
                                 log_training_error("RESIDUAL_UPDATE_ERROR", f"残差更新失败: {e}", "inference")
