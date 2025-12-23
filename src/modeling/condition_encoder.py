@@ -103,7 +103,6 @@ class SetTransformerConditionEncoder(nn.Module):
 
         self.max_input_dim = max_input_dim
         self.dim_hidden = dim_hidden
-        self.input_normalization = input_normalization
         self.output_dim = dim_output
 
         # 预创建输入投影层，支持最大可能的输入维度 (max_input_dim x + 1 residual)
@@ -141,36 +140,6 @@ class SetTransformerConditionEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _normalize_input(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
-        """标准化输入数据 - 按特征维度标准化"""
-        if self.input_normalization:
-            # x_values: [batch_size, n_points, max_dim]
-            batch_size, n_points, max_dim = x_values.shape
-
-            # 重塑为 [batch_size * n_points, max_dim] 以跨所有数据点标准化
-            x_flat = x_values.view(-1, max_dim)
-            r_flat = residuals.view(-1)
-
-            # 跨所有数据点计算均值和标准差
-            x_mean = x_flat.mean(dim=0, keepdim=True)  # [1, max_dim]
-            x_std = x_flat.std(dim=0, keepdim=True)    # [1, max_dim]
-            x_std = torch.clamp(x_std, min=1e-8)
-
-            r_mean = r_flat.mean()
-            r_std = r_flat.std()
-            r_std = torch.clamp(r_std, min=1e-8)
-
-            # 标准化并恢复形状
-            x_values_norm = (x_flat - x_mean) / x_std
-            residuals_norm = (r_flat - r_mean) / r_std
-
-            x_values_norm = x_values_norm.view(batch_size, n_points, max_dim)
-            residuals_norm = residuals_norm.view(batch_size, n_points)
-
-            return x_values_norm, residuals_norm
-        else:
-            return x_values, residuals
-
     def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
         """
         使用SetTransformer编码残差点集 - 支持任意维度输入
@@ -187,14 +156,11 @@ class SetTransformerConditionEncoder(nn.Module):
         if input_dim > self.max_input_dim:
             raise ValueError(f"输入维度 {input_dim} 超过了支持的最大维度 {self.max_input_dim}")
 
-        # 标准化输入
-        x_values_norm, residuals_norm = self._normalize_input(x_values, residuals)
-
         # 构建输入特征: (batch_size, num_points, input_dim + 1)
         # 包含x的所有维度和residual值
         input_features = torch.cat([
-            x_values_norm,  # (batch_size, num_points, input_dim)
-            residuals_norm.unsqueeze(-1)  # (batch_size, num_points, 1)
+            x_values,  # (batch_size, num_points, input_dim)
+            residuals.unsqueeze(-1)  # (batch_size, num_points, 1)
         ], dim=-1)  # (batch_size, num_points, input_dim + 1)
 
         # 填充到最大维度以匹配预创建的投影层
@@ -247,7 +213,6 @@ class ConditionEncoder(SetTransformerConditionEncoder):
             'num_layers': getattr(args, 'condition_num_layers', 3),
             'num_seeds': getattr(args, 'condition_num_seeds', 1),
             'dim_output': getattr(args, 'condition_dim_output', 128),
-            'input_normalization': getattr(args, 'condition_input_normalization', True),
             'verbose': verbose
         }
 

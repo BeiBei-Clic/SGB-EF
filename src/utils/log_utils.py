@@ -2,14 +2,14 @@
 import os
 import datetime
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
+# 日志文件命名：根据实际用途命名
+# - sample_generation.log: 数据样本生成过程
+# - training_debug.log: 训练调试信息 (debug_level=2)
+# - training.log: 训练主日志 (debug_level<=1)
+# - inference.log: 推理详细步骤 (debug_level>=3)
 LOG_FILE = "logs/sample_generation.log"
-PERF_LOG_FILE = "logs/performance.log"
 TRAIN_LOG_FILE = "logs/training.log"
+INFERENCE_LOG_FILE = "logs/inference.log"
 MAX_LOG_LINES = 100000
 _log_line_count = {}
 
@@ -44,12 +44,6 @@ def log_sample_step(sample_id, step, info=""):
 def log_expression_eval(sample_id, expr_str, eval_time_ms, success=True, error_msg=""):
     status = "OK" if success else f"FAIL: {error_msg}"
     _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] EVAL {status} {eval_time_ms:.1f}ms")
-
-def log_batch_progress(batch_idx, total_batches, samples_completed, total_samples, avg_time_per_sample=0, success_rate=0):
-    mem = f"{psutil.Process(os.getpid()).memory_info().rss // 1024 // 1024}MB" if psutil else "N/A"
-    pct = samples_completed / total_samples * 100 if total_samples else 0
-    msg = f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} BATCH [{batch_idx+1}/{total_batches}] {samples_completed}/{total_samples} ({pct:.1f}%) mem={mem}"
-    _write_log(msg, PERF_LOG_FILE)
 
 
 # ==================== 训练日志记录功能 ====================
@@ -98,7 +92,13 @@ def log_training_batch(batch_idx, total_batches, loss, dimension=None, step_time
 
 
 def log_training_step(step_type, details="", context="", debug_level=0):
-    """记录训练步骤详细信息"""
+    """记录训练/推理步骤详细信息
+
+    日志级别说明:
+    - debug_level <= 1: training.log (训练主日志 - epoch、loss、错误等)
+    - debug_level == 2: training_debug.log (训练调试 - token解码、张量统计)
+    - debug_level >= 3: inference.log (推理详细步骤 - token验证、操作强度)
+    """
     timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
     msg = f"{timestamp} {step_type}"
     if context:
@@ -111,7 +111,8 @@ def log_training_step(step_type, details="", context="", debug_level=0):
     elif debug_level == 2:
         _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_debug.log'))
     else:
-        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_verbose.log'))
+        # debug_level >= 3 的日志主要用于推理过程
+        _write_log(msg, INFERENCE_LOG_FILE)
 
 
 def log_model_info(model, additional_info=""):
@@ -133,7 +134,13 @@ def log_model_info(model, additional_info=""):
 
 
 def log_tensor_info(tensor_name, tensor, level=1, context=""):
-    """记录张量信息用于调试"""
+    """记录张量信息用于调试/推理
+
+    日志级别说明:
+    - level == 1: training.log (训练主日志)
+    - level == 2: training_debug.log (训练调试)
+    - level >= 3: inference.log (推理过程)
+    """
     import torch
     timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
     msg = f"{timestamp} TENSOR {tensor_name}"
@@ -156,7 +163,8 @@ def log_tensor_info(tensor_name, tensor, level=1, context=""):
     elif level == 2:
         _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_debug.log'))
     else:
-        _write_log(msg, TRAIN_LOG_FILE.replace('.log', '_verbose.log'))
+        # level >= 3 的日志主要用于推理过程
+        _write_log(msg, INFERENCE_LOG_FILE)
 
 
 def log_gpu_memory_usage(context=""):

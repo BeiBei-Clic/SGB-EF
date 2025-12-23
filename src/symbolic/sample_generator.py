@@ -180,12 +180,34 @@ def generate_single_sample(
             align_time = (time.time() - align_start) * 1000
             _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] LEVENSHTEIN_ALIGNMENT step{i+1} | time={align_time:.1f}ms z0_len={len(z0_tokens)} z1_len={len(z1_tokens)}")
 
+            # 计算 residuals 并进行数值裁剪，防止爆炸
+            residuals = y_target - y_curr
+            # 记录原始 residuals 统计
+            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RESIDUALS_BEFORE_CLIP step{i+1} | min={residuals.min():.6f} max={residuals.max():.6f} mean={residuals.mean():.6f}")
+
+            # 数值裁剪：防止训练时的梯度爆炸
+            # 设置合理的阈值，超过阈值的值会被裁剪
+            CLIP_THRESHOLD = 1e6  # 100万
+            residuals_clipped = np.clip(residuals, -CLIP_THRESHOLD, CLIP_THRESHOLD)
+
+            # 检查是否有值被裁剪
+            if np.any(residuals != residuals_clipped):
+                clip_count = np.sum(residuals != residuals_clipped)
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RESIDUALS_CLIPPED step{i+1} | clipped={clip_count}/{len(residuals)} threshold={CLIP_THRESHOLD}")
+
+                # 如果裁剪过多（超过50%的点被裁剪），跳过这个样本
+                if clip_count > len(residuals) * 0.5:
+                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SKIP_OVERCLIPPED step{i+1} | 跳过样本：过多值被裁剪 ({clip_count}/{len(residuals)})")
+                    continue
+
+            residuals = residuals_clipped
+
             batch_samples.append({
                 "input_dimension": dim,
                 "x_values": x_values,  # 保持与原代码一致的字段名
                 "y_target": y_target.tolist(),
                 "y_curr": y_curr.tolist(),
-                "residuals": (y_target - y_curr).tolist(),
+                "residuals": residuals.tolist(),  # 使用裁剪后的 residuals
                 "tree_gt": target_tree,
                 "exp_gt": str(target_expr),
                 "tree_cur1": curr_tree,

@@ -31,21 +31,33 @@ export HF_ENDPOINT=https://hf-mirror.com
 tail -n 2000 logs/sample_generation.log
 ```
 
-## 分布式训练
-```bash
-accelerate launch \
-    --num_processes=3 \
-    --num_machines=1 \
-    --mixed_precision=fp16 \
-    --dynamo_backend=no \
-    --multi_gpu \
-    train.py \
-    --num_timesteps 20 \
-    --num_samples 1000000 \
-    --batch_size 48
+## 训练日志监控
 
-##
+### 日志文件说明
+| 日志文件 | 用途 |
+|---------|------|
+| `logs/training.log` | 训练主日志（epoch、loss、错误等） |
+| `logs/training_debug.log` | 训练调试日志（每个batch的详细中间变量、梯度信息） |
+| `logs/inference.log` | 推理详细步骤 |
+
+### 查看训练调试日志（定位NaN问题）
+```bash
+# 查看最近的调试日志（包含每个batch的张量统计、梯度信息等）
+tail -n 2000 logs/training_debug.log
+
+# 实时监控调试日志
+tail -f logs/training_debug.log
 ```
+
+### 调试日志内容
+`training_debug.log` 记录了每个batch的详细信息：
+- 输入张量统计（x_values, residuals, condition_embeddings）
+- 模型输出统计（pred_rates, pred_ins_probs, pred_sub_probs）
+- 损失值（LOSS_COMPUTED）
+- 梯度统计（GRAD_STATS: max, min, has_nan）
+- 梯度范数（GRAD_NORM）
+- NaN错误信息（ERROR日志）
+
 
 ## 分布式训练管理
 ```bash
@@ -74,9 +86,9 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_timesteps 20 \
+    --num_timesteps 10 \
     --num_samples 1000000\
-    --batch_size 48
+    --batch_size 36
 
 # 将会话挂到后台
 Ctrl + B, D

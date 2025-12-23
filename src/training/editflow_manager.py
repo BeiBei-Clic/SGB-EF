@@ -453,6 +453,12 @@ class EditFlowManager:
 
             condition_embeddings = condition_encoder(x_values, residuals)
 
+            # 记录条件嵌入信息（每个batch都记录，用于调试NaN来源）
+            if self.accelerator.is_local_main_process:
+                log_tensor_info("condition_embeddings", condition_embeddings, level=2, context=f"维度{dimension}_batch{batch_idx}")
+                log_tensor_info("x_values", x_values, level=2, context=f"维度{dimension}_batch{batch_idx}")
+                log_tensor_info("residuals", residuals, level=2, context=f"维度{dimension}_batch{batch_idx}")
+
             # 准备调试信息
             debug_info = None
             if batch_idx == 0:
@@ -462,6 +468,12 @@ class EditFlowManager:
                 }
 
             forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
+
+            # 记录前向传播输出（每个batch都记录，用于调试NaN来源）
+            if self.accelerator.is_local_main_process:
+                log_tensor_info("pred_rates", forward_results['pred_rates'], level=2, context=f"维度{dimension}_batch{batch_idx}")
+                log_tensor_info("pred_ins_probs", forward_results['pred_ins_probs'], level=2, context=f"维度{dimension}_batch{batch_idx}")
+                log_tensor_info("pred_sub_probs", forward_results['pred_sub_probs'], level=2, context=f"维度{dimension}_batch{batch_idx}")
 
             # 分布式健康检查：确保前向传播结果在不同进程间合理
             if self.accelerator.distributed_type != "NO":
@@ -480,6 +492,9 @@ class EditFlowManager:
             # 尝试计算损失，如果包含NaN则跳过该批次
             try:
                 loss = self.compute_loss(forward_results, criterion, dataset) / gradient_accumulation_steps
+                # 记录损失值（每个batch都记录）
+                if self.accelerator.is_local_main_process:
+                    log_training_step("LOSS_COMPUTED", f"loss={loss.item():.6f}", f"维度{dimension}_batch{batch_idx}", debug_level=2)
             except ValueError as e:
                 if "批次包含异常值" in str(e):
                     log_training_error("BATCH_SKIP", f"跳过批次 {batch_idx} (包含NaN/Inf): {e}", f"维度{dimension}")
@@ -510,6 +525,21 @@ class EditFlowManager:
                     # 统一计算梯度范数并裁剪
                     all_params = list(model.parameters()) + list(condition_encoder.parameters())
 
+                    # 记录梯度统计信息（用于调试NaN来源）
+                    if self.accelerator.is_local_main_process:
+                        grad_max = 0.0
+                        grad_min = 0.0
+                        grad_has_nan = False
+                        for param in all_params:
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any():
+                                    grad_has_nan = True
+                                    break
+                                grad_max = max(grad_max, param.grad.abs().max().item())
+                                grad_min = max(grad_min, param.grad.abs().min().item())
+                        log_training_step("GRAD_STATS", f"max={grad_max:.6f} min={grad_min:.6f} has_nan={grad_has_nan}",
+                                        f"维度{dimension}_batch{batch_idx}", debug_level=2)
+
                     # 检查是否有NaN梯度 - 在gradient unscaling之前检查
                     has_nan_grad = False
                     for param in all_params:
@@ -519,12 +549,17 @@ class EditFlowManager:
 
                     if has_nan_grad:
                         if self.accelerator.is_local_main_process:
-                            print(f"警告：检测到NaN梯度，跳过此次更新")
+                            log_training_error("GRAD_NAN", f"检测到NaN梯度，跳过此次更新", f"维度{dimension}_batch{batch_idx}")
                         optimizer.zero_grad()
                         continue
 
                     # 使用Accelerate的梯度裁剪（会自动处理混合精度）
                     grad_norm = self.accelerator.clip_grad_norm_(all_params, 1.0)  # 恢复正常的梯度裁剪阈值
+
+                    # 记录梯度范数
+                    if self.accelerator.is_local_main_process:
+                        log_training_step("GRAD_NORM", f"grad_norm={grad_norm:.4f}",
+                                        f"维度{dimension}_batch{batch_idx}", debug_level=2)
 
                     optimizer.step()
                     optimizer.zero_grad()  # 在step后清零梯度，为下一次累积做准备
