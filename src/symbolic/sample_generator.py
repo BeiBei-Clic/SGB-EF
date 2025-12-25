@@ -30,13 +30,23 @@ def generate_single_sample(
     max_dim: int = 3,
     n_points: int = 100,
     max_depth: int = 4,
-    max_expr_length: int = 6,
+    max_expr_length: int = 15,
     batch_idx: int = 0,
     current_batch_size: int = 0,
     current_sample_count: int = 0
 ) -> List[Dict]:
     """
     生成单个样本的完整数据（可能包含多个删减表达式）
+
+    Args:
+        sample_id: 样本唯一标识符
+        max_dim: 最大输入维度
+        n_points: 每个样本的数据点数量
+        max_depth: 表达式最大深度
+        max_expr_length: 表达式最大token数量（前序遍历）
+        batch_idx: 批次索引
+        current_batch_size: 当前批次大小
+        current_sample_count: 当前样本计数
 
     返回:
         List[Dict]: 生成的样本列表，每个样本对应一个删减表达式
@@ -89,8 +99,8 @@ def generate_single_sample(
             _sample_logger.sample_failed(sample_id, f"表达式token太少: {len(expr_tokens)}")
             return []
 
-        if len(expr_str) > max_expr_length:
-            _sample_logger.sample_failed(sample_id, f"表达式过长: {len(expr_str)}")
+        if len(expr_tokens) > max_expr_length:
+            _sample_logger.sample_failed(sample_id, f"表达式token数过多: {len(expr_tokens)} (上限: {max_expr_length})")
             return []
 
         if target_expr.has(sp.I) or 'I' in expr_str:

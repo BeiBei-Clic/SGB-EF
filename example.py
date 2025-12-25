@@ -104,7 +104,7 @@ def main():
     # 使用不同的种子生成不同的测试数据
     import sys
 
-    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=50)
+    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=5)
     x_data = np.array(sample['x'])
     y_data = np.array(sample['y'])
 
@@ -124,7 +124,7 @@ def main():
     sample['exp_gt'] = new_expr_gt
 
     # 模型路径
-    model_path = "checkpoints/continuous_flow_final"
+    model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（使用重新组织后的数据）
     logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")

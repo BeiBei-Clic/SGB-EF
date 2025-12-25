@@ -249,7 +249,7 @@ def generate_flow_samples(
     max_dim: int = 5,
     n_points: int = 100,
     max_depth: int = 4,
-    max_expr_length: int = 24,
+    max_expr_length: int = 15,
     batch_size: int = 50000,
     verbose: bool = True,
     num_processes: int = None,
@@ -261,7 +261,7 @@ def generate_flow_samples(
         max_dim: 最大维度
         n_points: 每个样本的数据点数
         max_depth: 表达式最大深度
-        max_expr_length: 表达式最大字符长度（默认24）
+        max_expr_length: 表达式最大token数量（前序遍历，默认15）
         batch_size: 批次大小
         verbose: 是否显示详细输出
         num_processes: 进程数，None表示使用所有可用CPU核心
