@@ -27,7 +27,7 @@ def main():
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 6, # 最大表达式长度
+        'max_expr_length': 12, # 最大表达式长度
         "num_timesteps": 1,
         # SetTransformer参数
         'condition_dim_hidden': 128,
@@ -57,7 +57,7 @@ def main():
     print(f"y_data 形状: {y_data.shape}")
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_5"
+    model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（会自动推断input_dim并生成动态初始表达式）
     log_training_step("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")

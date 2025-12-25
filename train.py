@@ -94,22 +94,11 @@ def main():
     # 创建EditFlow管理器并开始训练
     manager = EditFlowManager(args)
 
-    try:
-        manager.train()
+    manager.train()
 
-        # 只有在主进程才打印完成信息
-        if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
-            print("\nEditFlow训练完成!")
-    finally:
-        # 确保清理分布式资源
-        try:
-            if hasattr(manager, 'accelerator'):
-                manager.accelerator.free_memory()
-                if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
-                    print("✓ 分布式资源已清理")
-        except Exception as e:
-            if hasattr(manager, 'accelerator') and hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
-                print(f"⚠️ 资源清理时出现警告: {e}")
+    # 只有在主进程才打印完成信息
+    if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
+        print("\nEditFlow训练完成!")
 
 
 if __name__ == "__main__":

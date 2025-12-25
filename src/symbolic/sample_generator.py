@@ -190,15 +190,11 @@ def generate_single_sample(
             CLIP_THRESHOLD = 1e6  # 100万
             residuals_clipped = np.clip(residuals, -CLIP_THRESHOLD, CLIP_THRESHOLD)
 
-            # 检查是否有值被裁剪
+            # 检查是否有值被裁剪，如果有则跳过样本
             if np.any(residuals != residuals_clipped):
                 clip_count = np.sum(residuals != residuals_clipped)
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] RESIDUALS_CLIPPED step{i+1} | clipped={clip_count}/{len(residuals)} threshold={CLIP_THRESHOLD}")
-
-                # 如果裁剪过多（超过50%的点被裁剪），跳过这个样本
-                if clip_count > len(residuals) * 0.5:
-                    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SKIP_OVERCLIPPED step{i+1} | 跳过样本：过多值被裁剪 ({clip_count}/{len(residuals)})")
-                    continue
+                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SKIP_CLIPPED step{i+1} | clipped={clip_count}/{len(residuals)} threshold={CLIP_THRESHOLD}")
+                continue
 
             residuals = residuals_clipped
 

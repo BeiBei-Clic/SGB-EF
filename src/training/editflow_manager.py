@@ -421,7 +421,7 @@ class EditFlowManager:
             z1_token_ids = batch['z1_token_ids'].to(self.device)
 
             # 记录token解码信息（仅在第一个batch时）
-            if batch_idx == 0 and self.accelerator.is_local_main_process:
+            if self.accelerator.is_local_main_process:
                 log_training_step("TOKEN_DECODE", f"维度 {dimension} - 第一个batch的token解码信息", debug_level=2)
 
                 # 解码z0_token_ids
@@ -448,8 +448,8 @@ class EditFlowManager:
                     z1_expression = ','.join(z1_tokens) if z1_tokens else "<empty>"
                     z1_expressions.append(f"样本{i}: {z1_expression}")
 
-                log_training_step("TOKEN_DECODE_Z0", "\n".join(z0_expressions), f"维度{dimension}", debug_level=3)
-                log_training_step("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", debug_level=3)
+                log_training_step("TOKEN_DECODE_Z0", "\n".join(z0_expressions), f"维度{dimension}", debug_level=2)
+                log_training_step("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", debug_level=2)
 
             condition_embeddings = condition_encoder(x_values, residuals)
 
@@ -792,26 +792,20 @@ class EditFlowManager:
             input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
 
         # 修正：计算初始残差 (真实值 - 初始表达式的预测值)
-        # 构建初始表达式
+        # 构建初始表达式：统一用 sum(x0, x1, ..., x{n-1})，input_dim=1时就是x0
         import sympy as sp
         from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants
 
-        if input_dim == 1:
-            # 一维情况：初始表达式为 x0
-            initial_expr = sp.Symbol('x0')
-        else:
-            # 多维情况：初始表达式为 x0+x1+x2+...
-            initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
+        initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
 
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
         if not success:
-            if self.accelerator.is_local_main_process:
-                log_training_error("INITIAL_EXPR_FAILED", f"无法计算初始表达式 '{initial_expr}' 的预测值，使用零残差", "inference")
-            residuals = y_values
-        else:
-            # 计算残差：真实值 - 预测值
-            residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
+            log_training_error("INITIAL_EXPR_FAILED", f"无法计算初始表达式 '{initial_expr}' 的预测值", "inference")
+            return ""
+        
+        # 计算残差：真实值 - 预测值
+        residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
 
         # 记录初始数据状态（验证数据是否正确传递）
         log_training_step("INITIAL_DATA", f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | y_values: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] mean={residuals.mean():.4f} std={residuals.std():.4f}", "inference", debug_level=1)
@@ -822,22 +816,9 @@ class EditFlowManager:
         log_training_step("INITIAL_CONDITION", f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}] mean={condition.mean():.4f} std={condition.std():.4f}", "inference", debug_level=1)
 
         # 构建初始前缀表达式（与训练格式一致）
-        if input_dim == 1:
-            # 一维情况：初始表达式为 x0
-            current_tokens = ['x0']
-        else:
-            # 多维情况：使用嵌套的add前缀表达式，例如 add,x0,x1 表示 (x0 + x1)
-            # 对于三个变量：add,add,x0,x1,x2 表示 ((x0 + x1) + x2)
-            current_tokens = []
-            for i in range(input_dim - 1):
-                current_tokens.append('add')
-
-            # 添加所有变量
-            for i in range(input_dim):
-                current_tokens.append(f'x{i}')
-
-            # 对于3个变量：add,add,x0,x1,x2
-            # 对于2个变量：add,x0,x1
+        # 统一处理：对于n维，需要(n-1)个add + n个变量
+        # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
+        current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
 
         # 初始化token管理器，确保覆盖数据维度
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
@@ -865,19 +846,12 @@ class EditFlowManager:
             invalid_ids = []
             for i, token_id in enumerate(tokenized_expr):
                 token_name = special_tokens_manager.tokenizer.convert_ids_to_tokens([token_id])[0]
-                if token_id < len(vocab) and token_name in vocab:
-                    valid_ids.append((i, token_id, token_name, vocab[token_name]))
-                else:
-                    invalid_ids.append((i, token_id, token_name))
+                valid_ids.append((i, token_id, token_name, vocab[token_name]))
+
 
             log_training_step("TOKEN_VALIDATION", f"有效token IDs: {len(valid_ids)} | 无效token IDs: {len(invalid_ids)}", "inference", debug_level=3)
             if invalid_ids:
                 log_training_step("TOKEN_INVALID", f"发现无效token IDs: {invalid_ids}", "inference", debug_level=2)
-
-            # 检查是否有重复或UNK token
-            unk_token_id = vocab.get('<unk>', None)
-            if unk_token_id in tokenized_expr:
-                log_training_step("TOKEN_UNK_WARNING", f"发现UNK token (ID={unk_token_id})", "inference", debug_level=2)
 
             max_len = getattr(self.args, 'max_expr_length', 128)
             if len(tokenized_expr) > max_len - 1:
@@ -924,19 +898,18 @@ class EditFlowManager:
                     time_steps=t, condition=condition
                 )
 
-                # 记录模型输出的原始值（仅第一步）
-                if step == 0:
-                    log_training_step("MODEL_OUTPUT_ANALYSIS", f"模型输出形状: {rates.shape} | 位置数: {rates.size(1)}", "inference", debug_level=2)
+                # 记录模型输出的原始值
+                log_training_step("MODEL_OUTPUT_ANALYSIS", f"模型输出形状: {rates.shape} | 位置数: {rates.size(1)}", "inference", debug_level=2)
 
-                    # 检查是否所有位置都完全相同
-                    rates_flat = rates[0, :, :].cpu().numpy()
-                    unique_rows = np.unique(rates_flat, axis=0)
-                    if unique_rows.shape[0] < rates_flat.shape[0]:
-                        log_training_step("MODEL_OUTPUT_UNIQUE", f"发现重复的输出行，唯一行数: {unique_rows.shape[0]}/{rates_flat.shape[0]}", "inference", debug_level=2)
+                # 检查是否所有位置都完全相同
+                rates_flat = rates[0, :, :].cpu().numpy()
+                unique_rows = np.unique(rates_flat, axis=0)
+                if unique_rows.shape[0] < rates_flat.shape[0]:
+                    log_training_step("MODEL_OUTPUT_UNIQUE", f"发现重复的输出行，唯一行数: {unique_rows.shape[0]}/{rates_flat.shape[0]}", "inference", debug_level=2)
 
-                    # 检查insert_probs的分布
-                    top_insert_tokens = torch.topk(insert_probs[0, 1], 5)  # 检查位置1的top5
-                    log_training_step("MODEL_INSERT_PROBS", f"位置1的top5插入tokens: {top_insert_tokens}", "inference", debug_level=3)
+                # 检查insert_probs的分布
+                top_insert_tokens = torch.topk(insert_probs[0, 1], 5)  # 检查位置1的top5
+                log_training_step("MODEL_INSERT_PROBS", f"位置1的top5插入tokens: {top_insert_tokens}", "inference", debug_level=3)
 
                 lambda_ins = rates[0, :, 0].cpu().numpy()
                 lambda_sub = rates[0, :, 1].cpu().numpy()

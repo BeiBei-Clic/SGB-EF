@@ -294,7 +294,7 @@ class SetTransformerConditionEncoder(nn.Module):
         # 输入嵌入
         x = self.input_projection(input_features)  # (batch_size, num_points, dim_hidden)
         # 使用温和的激活函数，避免极端输出
-        x = torch.nn.functional.gelu(x) * 0.1  # 缩小输出范围
+        x = torch.nn.functional.gelu(x) # 缩小输出范围
 
         # 通过SetTransformer层
         x = self.first_layer(x)

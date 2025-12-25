@@ -152,7 +152,7 @@ class ContinuousFlowLoss:
 
 
         sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
-        sched_coeff = torch.clamp(sched_coeff, min=-10, max=10)
+        sched_coeff = torch.clamp(sched_coeff, min=-10, max=40)
 
 
         log_u_cat = torch.log(torch.clamp(u_cat, min=1e-12, max=1e12))

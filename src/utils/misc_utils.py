@@ -7,7 +7,7 @@ from ..modeling.editflow_transformer import EditFlowConfig
 
 def find_latest_checkpoint(args):
     """查找最新的检查点目录（Accelerate格式）"""
-    save_dir = getattr(args, 'save_dir', 'checkpoints')
+    save_dir = args.save_dir
 
     # 查找所有epoch检查点目录
     checkpoint_dirs = glob.glob(os.path.join(save_dir, "checkpoint_epoch_*"))
