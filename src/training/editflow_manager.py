@@ -819,6 +819,17 @@ class EditFlowManager:
                        f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}]",
                        "inference", level=1)
 
+        # 打印条件嵌入的前10个维度的具体值
+        condition_cpu = condition.cpu().squeeze(0)
+        condition_values = condition_cpu.detach().numpy()
+        condition_preview = condition_values[:10]
+        self.logger.log("INITIAL_CONDITION_VALUES",
+                       f"condition前10维: [{', '.join([f'{v:.6f}' for v in condition_preview])}]",
+                       "inference", level=1)
+
+        self.logger.tensor("initial_condition", condition, level=1, context="inference")
+        self.logger.tensor("initial_residuals", residuals, level=1, context="inference")
+
         # 构建初始前缀表达式（与训练格式一致）
         # 统一处理：对于n维，需要(n-1)个add + n个变量
         # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
@@ -897,8 +908,29 @@ class EditFlowManager:
                 lambda_sub = rates[0, :, 1].cpu().numpy()
                 lambda_del = rates[0, :, 2].cpu().numpy()
 
-                # 记录模型预测的操作分数
-                if self.accelerator.is_local_main_process and step % 5 == 0:
+                # 记录模型预测的操作分数 - 前几步详细记录
+                if self.accelerator.is_local_main_process:
+                    self.logger.log("MODEL_PREDICTION",
+                                   f"步骤{step+1} | t={t.item():.4f} | "
+                                   f"lambda_ins: max={lambda_ins.max():.4f}, mean={lambda_ins.mean():.4f} | "
+                                   f"lambda_sub: max={lambda_sub.max():.4f}, mean={lambda_sub.mean():.4f} | "
+                                   f"lambda_del: max={lambda_del.max():.4f}, mean={lambda_del.mean():.4f}",
+                                   "inference", level=1)
+                    self.logger.tensor(f"rates_step{step+1}", rates, level=1, context="inference")
+                    self.logger.tensor(f"condition_step{step+1}", condition, level=1, context="inference")
+
+                    # 记录top-3 insert操作
+                    if step < 2:
+                        for pos in range(min(5, len(lambda_ins))):
+                            top3_tokens = torch.topk(insert_probs[0, pos], 3)
+                            top3_names = [tokenizer.convert_ids_to_tokens([t.item()])[0] for t in top3_tokens.indices]
+                            self.logger.log(f"INSERT_POS{pos}_STEP{step+1}",
+                                           f"位置{pos} | lambda_ins={lambda_ins[pos]:.4f} | "
+                                           f"top3_tokens={top3_names} | probs={top3_tokens.values.tolist()}",
+                                           "inference", level=1)
+
+                # 记录模型预测的操作分数 - 后续步骤简化记录
+                if self.accelerator.is_local_main_process and step % 5 == 0 and step >= 3:
                     self.logger.log("MODEL_PREDICTION",
                                    f"步骤{step+1} | lambda_ins: max={lambda_ins.max():.4f}, mean={lambda_ins.mean():.4f} | "
                                    f"lambda_sub: max={lambda_sub.max():.4f}, mean={lambda_sub.mean():.4f} | "

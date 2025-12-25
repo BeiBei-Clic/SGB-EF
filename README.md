@@ -24,25 +24,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 | **nomic-ai/nomic-embed-text-v1.5** | 137M | 768维 | ✅ 轻量级<br>✅ 推理快速<br>✅ 开源Apache 2.0 | 资源受限环境<br>快速原型验证<br>生产环境部署 |
 | **Qwen/Qwen3-Embedding-0.6B** | 600M | - | 🔥 高性能<br>🔥 参数量大<br>🔥 可能更好效果 | 追求最佳效果<br>充足计算资源<br>研究实验 |
 
-## 数据生成日志监控
-当数据生成卡住时，使用以下命令快速定位问题：
-查看日志最后2000行
+### 查看日志
 ```bash
 tail -n 2000 logs/sample_generation.log
-```
 
-## 训练日志监控
-
-### 日志文件说明
-| 日志文件 | 用途 |
-|---------|------|
-| `logs/training.log` | 训练主日志（epoch、loss、错误等） |
-| `logs/training_debug.log` | 训练调试日志（每个batch的详细中间变量、梯度信息） |
-| `logs/inference.log` | 推理详细步骤 |
-
-### 查看训练调试日志（定位NaN问题）
-```bash
-# 查看最近的调试日志（包含每个batch的张量统计、梯度信息等）
 tail -n 2000 logs/training_debug.log
 
 tail -n 2000 logs/training.log

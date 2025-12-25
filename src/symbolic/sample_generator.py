@@ -43,6 +43,16 @@ def generate_single_sample(
     """
     sample_start_time = time.time()
 
+    # 记录函数入口和参数
+    import inspect
+    _sample_logger.log("FUNC_ENTRY", f"generate_single_sample 被调用", f"sample_id={sample_id}", level=1)
+    _sample_logger.log("FUNC_PARAMS",
+                      f"max_dim={max_dim}, n_points={n_points}, max_depth={max_depth}, max_expr_length={max_expr_length}",
+                      f"batch_idx={batch_idx}, current_batch_size={current_batch_size}, current_sample_count={current_sample_count}",
+                      level=1)
+    _sample_logger.log("FUNC_PARAM_COUNT", f"接收到的参数数量: {len(inspect.signature(generate_single_sample).parameters)}", level=1)
+    _sample_logger.log("FUNC_LOCALS", f"局部变量:", f"{locals()}", level=1)
+
     try:
         # 随机选择维度
         dim = random.randint(1, max_dim)
@@ -169,23 +179,17 @@ def generate_single_sample(
             align_time = (time.time() - align_start) * 1000
             _sample_logger.levenshtein_alignment(sample_id, i+1, len(z0_tokens), len(z1_tokens), align_time)
 
-            # 计算 residuals 并进行数值裁剪，防止爆炸
+            # 计算 residuals 并检查数值范围
             residuals = y_target - y_curr
             # 记录原始 residuals 统计
             _sample_logger.residuals_before_clip(sample_id, i+1, residuals.min(), residuals.max(), residuals.mean())
 
-            # 数值裁剪：防止训练时的梯度爆炸
-            # 设置合理的阈值，超过阈值的值会被裁剪
-            CLIP_THRESHOLD = 1e6  # 100万
-            residuals_clipped = np.clip(residuals, -CLIP_THRESHOLD, CLIP_THRESHOLD)
-
-            # 检查是否有值被裁剪，如果有则跳过样本
-            if np.any(residuals != residuals_clipped):
-                clip_count = np.sum(residuals != residuals_clipped)
-                _sample_logger.skip_clipped(sample_id, i+1, clip_count, len(residuals), CLIP_THRESHOLD)
+            # 检查 residuals 是否超过阈值,如果超过则跳过样本
+            THRESHOLD = 100.0  # 阈值设为100,确保数值稳定
+            max_residual = np.max(np.abs(residuals))
+            if max_residual > THRESHOLD:
+                _sample_logger.skip_clipped(sample_id, i+1, max_residual, len(residuals), THRESHOLD)
                 continue
-
-            residuals = residuals_clipped
 
             batch_samples.append({
                 "input_dimension": dim,

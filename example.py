@@ -4,10 +4,62 @@
 """
 
 import numpy as np
+import re
+import sympy as sp
 
 from src.symbolic.data_generator import generate_sample
 from src.training.editflow_manager import EditFlowManager
 from src.utils.logger import Logger
+
+
+def reorganize_data_by_used_variables(expression_str, x_data, y_data):
+    """根据表达式实际使用的变量重新组织数据
+
+    Args:
+        expression_str: 真实表达式字符串
+        x_data: 原始输入数据 (n_samples, n_dims)
+        y_data: 目标值 (n_samples,)
+
+    Returns:
+        new_expression: 重新映射后的表达式
+        new_x_data: 重新组织后的输入数据
+        new_used_vars: 新表达式中使用的变量名
+    """
+    # 查找所有使用的变量
+    pattern = r'x(\d+)'
+    matches = re.findall(pattern, str(expression_str))
+
+    if not matches:
+        return expression_str, x_data, []
+
+    # 获取使用的变量索引（排序）
+    var_indices = sorted(set(int(m) for m in matches))
+    old_used_vars = [f'x{i}' for i in var_indices]
+
+    print(f"原始表达式使用的变量: {old_used_vars}")
+
+    # 创建变量映射：原始变量 -> 新变量
+    # 例如：如果原始使用 x1, x2，则映射为 x1->x0, x2->x1
+    var_mapping = {}
+    for new_idx, old_idx in enumerate(var_indices):
+        var_mapping[f'x{old_idx}'] = f'x{new_idx}'
+
+    print(f"变量映射: {var_mapping}")
+
+    # 重新组织x_data：只保留使用的列，并按原始顺序排列
+    new_x_data = x_data[:, var_indices]
+
+    # 更新表达式字符串
+    new_expression = str(expression_str)
+    for old_var, new_var in var_mapping.items():
+        new_expression = new_expression.replace(old_var, new_var)
+
+    # 获取新表达式使用的变量
+    new_matches = re.findall(pattern, new_expression)
+    new_var_indices = sorted(set(int(m) for m in new_matches))
+    new_used_vars = [f'x{i}' for i in new_var_indices]
+
+    return new_expression, new_x_data, new_used_vars
 
 
 def main():
@@ -48,33 +100,44 @@ def main():
     # 生成测试数据
     print("生成测试数据...")
     logger.log("DATA_GENERATION", "开始生成测试数据", "example")
-    # seed=None 表示每次运行生成不同的随机数据
-    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=2)
+
+    # 使用不同的种子生成不同的测试数据
+    import sys
+
+    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=5)
     x_data = np.array(sample['x'])
     y_data = np.array(sample['y'])
 
     logger.log("DATA_INFO", f"真实表达式: {sample['exp_gt']} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example")
 
-    print(f"\n数据信息:")
+    print(f"\n原始数据信息:")
     print(f"真实表达式: {sample['exp_gt']}")
     print(f"x_data 形状: {x_data.shape}")
     print(f"y_data 形状: {y_data.shape}")
 
-    # 模型路径
-    model_path = None
+    # 根据表达式实际使用的变量重新组织数据
+    new_expr_gt, x_data_reorganized, new_used_vars = reorganize_data_by_used_variables(
+        sample['exp_gt'], x_data, y_data
+    )
 
-    # 执行符号回归（会自动推断input_dim并生成动态初始表达式）
+    # 更新sample以使用新的表达式
+    sample['exp_gt'] = new_expr_gt
+
+    # 模型路径
+    model_path = "checkpoints/continuous_flow_final"
+
+    # 执行符号回归（使用重新组织后的数据）
     logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")
     predicted_expression = manager.symbolic_regression(
         model_path=model_path,
-        x_data=x_data,
+        x_data=x_data_reorganized,  # 使用重新组织后的数据
         y_data=y_data,
         n_steps=30  # 减少步数以便观察
     )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
     print(f"\n最终结果对比:")
-    print(f"真实表达式: {sample['exp_gt']}")
+    print(f"真实表达式: {new_expr_gt}")  # 使用更新后的表达式
     print(f"预测表达式: {predicted_expression}")
 
 

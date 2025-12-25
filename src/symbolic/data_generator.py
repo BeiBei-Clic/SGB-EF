@@ -71,6 +71,13 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
         sample_id = f"{process_prefix}_sample{sample_count}_{os.getpid()}_{unique_factor}"
 
         try:
+            # 记录调用前的详细信息
+            import traceback
+            _sample_logger.log("DEBUG_CALL", f"准备调用 generate_single_sample", f"sample_id={sample_id}", level=1)
+            _sample_logger.log("DEBUG_PARAMS", f"max_dim={max_dim}, n_points={n_points}, max_depth={max_depth}", f"max_expr_length={max_expr_length}, batch_idx={batch_idx}, current_batch_size={current_batch_size}, sample_count={sample_count}", level=1)
+            _sample_logger.log("DEBUG_ARG_COUNT", f"传递参数数量=8 (不含func和timeout)", level=1)
+            _sample_logger.log("DEBUG_STACK", f"调用栈:", "\n".join(traceback.format_stack()[-5:]), level=1)
+
             # 使用带超时保护的样本生成函数
             generated_samples = with_timeout(
                 generate_single_sample,
@@ -80,11 +87,12 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                 n_points,
                 max_depth,
                 max_expr_length,
-                MAX_RETRIES,
                 batch_idx,
                 current_batch_size,
                 sample_count
             )
+
+            _sample_logger.log("DEBUG_SUCCESS", f"调用成功, 返回 {len(generated_samples) if generated_samples else 0} 个样本", level=1)
 
             # 如果成功生成样本，添加到批次中
             if generated_samples:
@@ -111,8 +119,11 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
         except Exception as e:
             # 其他异常处理（不增加sample_count）
+            import traceback
+            _sample_logger.log("DEBUG_EXCEPTION", f"捕获异常: {type(e).__name__}", f"错误信息: {str(e)}", level=1)
+            _sample_logger.log("DEBUG_TRACEBACK", f"完整堆栈跟踪:", f"\n{''.join(traceback.format_exc())}", level=1)
             _sample_logger.sample_error(sample_id, type(e).__name__, str(e))
-            continue
+            raise  # 直接抛出异常,不再继续
 
     # 批次完成，无需关闭进度条
 
