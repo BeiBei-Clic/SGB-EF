@@ -9,6 +9,10 @@ import sympy as sp
 from typing import List, Tuple, Union
 from scipy.optimize import minimize
 from src.symbolic.corruption import corrupt_expression, replace_variables
+from src.utils.logger import Logger
+
+# 创建全局 Logger 实例
+_logger = Logger(enabled=True)
 
 
 # 运算符定义
@@ -78,12 +82,7 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
         message = f"[GENERATE_RANDOM_EXPR] {step}"
         if details:
             message += f" | {details}"
-        try:
-            from src.utils.log_utils import _write_log
-            if _write_log:
-                _write_log(f"{timestamp} {message}")
-        except:
-            pass
+        _logger.write(f"{timestamp} {message}")
 
     log_debug("开始", f"input_dimension={input_dimension}, max_depth={max_depth}")
 

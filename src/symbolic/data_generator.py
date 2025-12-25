@@ -13,14 +13,15 @@ import multiprocessing
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from src.utils.timeout_utils import TimeoutError, with_timeout
-from src.utils.log_utils import (
-    _write_log, log_sample_step
-)
+from src.utils.logger import Logger
 from src.symbolic.symbolic_utils import generate_random_expr, evaluate_expression_safe, expr_to_tree
 from src.symbolic.corruption import corrupt_expression
-from src.symbolic.sample_generator import generate_single_sample, set_log_writer
+from src.symbolic.sample_generator import generate_single_sample, set_logger
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# 创建全局 Logger 实例用于样本生成日志
+_sample_logger = Logger(enabled=True)
 
 # 常量定义
 MAX_RETRIES = 5  # 表达式生成和计算的最大重试次数
@@ -100,18 +101,17 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                     dimension_count[dim] = dimension_count.get(dim, 0) + 1
             else:
                 # 样本生成失败，记录并继续（不增加sample_count）
-                _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] FAILED: No samples generated")
+                _sample_logger.sample_failed(sample_id, "No samples generated")
                 continue
 
         except TimeoutError:
             # 超时处理（不增加sample_count）
-            log_sample_step(sample_id, "样本生成超时", f"超过{SAMPLE_TIMEOUT}秒")
-            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] TIMEOUT: Sample generation exceeded {SAMPLE_TIMEOUT}s")
+            _sample_logger.sample_timeout(sample_id, SAMPLE_TIMEOUT)
             continue
 
         except Exception as e:
             # 其他异常处理（不增加sample_count）
-            _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {process_prefix} [{sample_id}] ERROR: {type(e).__name__}: {e}")
+            _sample_logger.sample_error(sample_id, type(e).__name__, str(e))
             continue
 
     # 批次完成，无需关闭进度条
@@ -151,10 +151,7 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     random_factor = random.randint(0, 999999)
     sample_id = f"sample_{input_dimension}dim_{timestamp_ms}_{random_factor}"
 
-    log_sample_step(sample_id, f"开始生成 {input_dimension}维样本")
-
     # 统一生成数据点，确保每个数据点是[x0, x1, x2, ...]的形式
-    log_sample_step(sample_id, "生成数据点")
     x_values_raw = np.random.uniform(-5.0, 5.0, (n_points, input_dimension))
     x_values = [list(point) for point in x_values_raw]  # 转换为[[x0, x1, x2], [x3, x4, x5], ...]的形式
 
@@ -162,21 +159,16 @@ def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 
     x_array = np.array(x_values)
 
     # 生成目标表达式
-    log_sample_step(sample_id, "生成目标表达式", f"最大深度{max_depth}")
     target_expr = generate_random_expr(input_dimension, max_depth)
 
     # 计算目标值
-    log_sample_step(sample_id, "计算目标表达式值")
     success, y_values = evaluate_expression_safe(target_expr, x_array)
     if not success:
         # 如果计算失败，抛出异常让调用者处理
         raise ValueError(f"表达式计算失败: {target_expr}")
 
     # 生成当前表达式
-    log_sample_step(sample_id, "生成当前表达式(破坏)")
     curr_expr = corrupt_expression(target_expr)
-
-    _write_log(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{sample_id}] SUCCESS")
 
     return {
         "input_dimension": input_dimension,
@@ -264,8 +256,8 @@ def generate_flow_samples(
         num_processes: 进程数，None表示使用所有可用CPU核心
     """
 
-    # 设置样本生成器的日志写入函数
-    set_log_writer(_write_log)
+    # 设置样本生成器的 Logger 实例
+    set_logger(_sample_logger)
 
     # 使用高精度时间戳和系统信息生成主随机种子
     main_time_ms = int(time.time() * 1000000)  # 微秒级时间戳

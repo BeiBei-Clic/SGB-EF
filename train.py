@@ -6,7 +6,6 @@ EditFlow连续流符号回归预训练主脚本
 
 import argparse
 import os
-import random
 import numpy as np
 import torch
 
@@ -19,16 +18,6 @@ os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
 os.environ["NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
 
 from src.training.editflow_manager import EditFlowManager
-
-
-def set_seed(seed: int):
-    """设置随机种子"""
-    random.seed(seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
 
 def main():
@@ -79,7 +68,7 @@ def main():
     parser.add_argument("--condition_input_normalization", type=bool, default=False, help="是否对输入进行标准化")
 
     # 正弦频率映射参数 (Sinusoidal Encoding)
-    parser.add_argument("--condition_use_sinusoidal_encoding", type=bool, default=True, help="是否使用正弦编码将数值映射到频率域")
+    parser.add_argument("--condition_use_sinusoidal_encoding", type=bool, default=False, help="是否使用正弦编码将数值映射到频率域")
     parser.add_argument("--condition_sinusoidal_dim", type=int, default=64, help="正弦编码维度（每个数值编码后的特征数）")
     parser.add_argument("--condition_sinusoidal_max_freq", type=float, default=10000.0, help="正弦编码最大频率（控制频率范围）")
 
@@ -89,7 +78,8 @@ def main():
     args = parser.parse_args()
 
     # 设置随机种子
-    set_seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     # 创建EditFlow管理器并开始训练
     manager = EditFlowManager(args)
