@@ -85,12 +85,12 @@ def main():
         'max_expr_length': 12, # 最大表达式长度
         "num_timesteps": 1,
         # SetTransformer参数
-        'condition_dim_hidden': 128,
+        'condition_dim_hidden': 768,  # 匹配 BERT 的 hidden_size
         'condition_num_heads': 4,
         'condition_num_inds': 32,
         'condition_num_layers': 3,
-        'condition_num_seeds': 1,
-        'condition_dim_output': 128,
+        'condition_num_seeds': 32,  # 输出序列长度
+        'condition_dim_output': 128,  # 已弃用
         'condition_input_normalization': False,
         'condition_use_sinusoidal_encoding': False,  # 禁用正弦编码,直接使用原始残差值
     })()
@@ -104,7 +104,7 @@ def main():
     # 使用不同的种子生成不同的测试数据
     import sys
 
-    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=5)
+    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=50)
     x_data = np.array(sample['x'])
     y_data = np.array(sample['y'])
 

@@ -26,13 +26,13 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 ### 查看日志
 ```bash
-tail -n 2000 logs/sample_generation.log
+tail -n 500 logs/sample_generation.log
 
-tail -n 2000 logs/training_debug.log
+tail -n 500 logs/training_debug.log
 
-tail -n 2000 logs/training.log
+tail -n 500 logs/training.log
 
-tail -n 2000 logs/inference.log
+tail -n 500 logs/inference.log
 ```
 
 ### 调试日志内容
@@ -73,7 +73,7 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_timesteps 10 \
-    --num_samples 1000000\
+    --num_samples 10000\
     --batch_size 48
 
 # 将会话挂到后台

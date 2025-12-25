@@ -159,8 +159,8 @@ class SetTransformerConditionEncoder(nn.Module):
                  num_heads: int = 4,
                  num_inds: int = 32,
                  num_layers: int = 3,
-                 num_seeds: int = 1,
-                 dim_output: int = 128,
+                 num_seeds: int = 32,  # 修改：从 1 改为 32，输出多个特征向量
+                 dim_output: int = 128,  # 保留参数以兼容旧代码，但不再使用
                  ln: bool = True,
                  input_normalization: bool = True,
                  use_sinusoidal_encoding: bool = True,  # 是否使用正弦编码
@@ -176,11 +176,13 @@ class SetTransformerConditionEncoder(nn.Module):
             print(f"  注意力头数: {num_heads}")
             print(f"  诱导点数: {num_inds}")
             print(f"  层数: {num_layers}")
-            print(f"  输出维度: {dim_output}")
+            print(f"  输出序列长度: {num_seeds}")
+            print(f"  输出向量维度: {dim_hidden}")
 
         self.max_input_dim = max_input_dim
         self.dim_hidden = dim_hidden
-        self.output_dim = dim_output
+        self.num_seeds = num_seeds  # 保存输出序列长度
+        # self.output_dim = dim_output  # 不再需要，输出是序列而非单个向量
         self.use_sinusoidal_encoding = use_sinusoidal_encoding
 
         # 正弦编码器（将数值映射到频率域）
@@ -211,17 +213,17 @@ class SetTransformerConditionEncoder(nn.Module):
             for _ in range(num_layers - 1)
         ])
 
-        # 聚合层
+        # 聚合层 - 输出序列而非单个向量
         self.pooling = PMA(dim_hidden, num_heads, num_seeds, ln=ln)
 
-        # 输出投影层
-        self.output_projection = nn.Sequential(
-            nn.Linear(dim_hidden * num_seeds, dim_hidden),  # 注意这里：输入是 dim_hidden * num_seeds
-            nn.LayerNorm(dim_hidden),  # 添加LayerNorm防止梯度爆炸
-            nn.ReLU(),
-            nn.Dropout(0.1),  # 添加Dropout
-            nn.Linear(dim_hidden, dim_output)
-        )
+        # 不再需要 output_projection，因为我们直接输出序列
+        # self.output_projection = nn.Sequential(
+        #     nn.Linear(dim_hidden * num_seeds, dim_hidden),
+        #     nn.LayerNorm(dim_hidden),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(dim_hidden, dim_output)
+        # )
 
     def _init_weights(self):
         """初始化权重以避免梯度爆炸"""
@@ -239,7 +241,7 @@ class SetTransformerConditionEncoder(nn.Module):
             x_values: (batch_size, num_points, input_dim) x值列表，input_dim可以是1,2,3,4...任意维度
             residuals: (batch_size, num_points) 残差值
         Returns:
-            condition: (batch_size, output_dim) 条件向量
+            condition: (batch_size, num_seeds, dim_hidden) 条件序列，不再是单个向量
         """
         batch_size, num_points = residuals.shape
         input_dim = x_values.shape[2]  # 可以是1,2,3,4...任意维度
@@ -301,17 +303,15 @@ class SetTransformerConditionEncoder(nn.Module):
         for layer in self.middle_layers:
             x = layer(x)
 
-        # 聚合
+        # 聚合 - 输出序列而非单个向量
         x = self.pooling(x)  # (batch_size, num_seeds, dim_hidden)
 
-        # 展平并投影到输出维度
-        x = x.view(batch_size, -1)  # (batch_size, num_seeds * dim_hidden)
-        condition = self.output_projection(x)  # (batch_size, output_dim)
+        # 不再展平和投影，直接返回序列
+        # 这样每个 seed 都代表不同的特征簇，可以用于真正的交叉注意力
+        # x = x.view(batch_size, -1)  # 删除这行
+        # condition = self.output_projection(x)  # 删除这行
 
-        # 不做任何归一化，直接返回原始的条件向量
-        # 保留完整的条件信息，让模型自己学习如何处理
-
-        return condition
+        return x  # (batch_size, num_seeds, dim_hidden)
 
 
 # 保持向后兼容性，使用新的SetTransformer编码器

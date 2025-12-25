@@ -59,16 +59,16 @@ def main():
 
     # SetTransformer条件编码器参数
     parser.add_argument("--condition_max_input_dim", type=int, default=6, help="SetTransformer支持的最大输入维度")
-    parser.add_argument("--condition_dim_hidden", type=int, default=128, help="SetTransformer隐藏层维度")
+    parser.add_argument("--condition_dim_hidden", type=int, default=768, help="SetTransformer隐藏层维度（应匹配BERT的hidden_size）")
     parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 ")
     parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")
     parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 ")
-    parser.add_argument("--condition_num_seeds", type=int, default=1, help="SetTransformer种子数")
-    parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度")
-    parser.add_argument("--condition_input_normalization", type=bool, default=False, help="是否对输入进行标准化")
+    parser.add_argument("--condition_num_seeds", type=int, default=32, help="SetTransformer种子数（输出序列长度）")
+    parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度（已弃用，保留以兼容）")
+    parser.add_argument("--condition_input_normalization", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否对输入进行标准化")
 
     # 正弦频率映射参数 (Sinusoidal Encoding)
-    parser.add_argument("--condition_use_sinusoidal_encoding", type=bool, default=False, help="是否使用正弦编码将数值映射到频率域")
+    parser.add_argument("--condition_use_sinusoidal_encoding", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否使用正弦编码将数值映射到频率域")
     parser.add_argument("--condition_sinusoidal_dim", type=int, default=64, help="正弦编码维度（每个数值编码后的特征数）")
     parser.add_argument("--condition_sinusoidal_max_freq", type=float, default=10000.0, help="正弦编码最大频率（控制频率范围）")
 

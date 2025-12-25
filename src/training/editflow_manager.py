@@ -232,9 +232,15 @@ class EditFlowManager:
 
         if self.accelerator.is_local_main_process:
             print("初始化EditFlow模型...")
+
+        # 获取条件编码器的隐藏层维度
+        # 现在条件编码器输出 (batch_size, num_seeds, dim_hidden) 格式
+        # 所以 condition_dim 应该等于 dim_hidden
+        condition_hidden_dim = getattr(self.args, 'condition_dim_hidden', 128)
+
         config = EditFlowConfig(
             max_seq_len=self.args.max_expr_length,
-            condition_dim=condition_encoder.output_dim,
+            condition_dim=condition_hidden_dim,  # 使用隐藏层维度，而非 output_dim
             base_model_name=model_name,
             vocab_size=len(tokenizer.get_vocab()),
         )
@@ -282,13 +288,21 @@ class EditFlowManager:
 
         original_batch_size = z0_token_ids.size(0)
 
-        
+
         # 为每个样本采样多个时间步
         t = torch.rand(original_batch_size, num_timesteps, 1, device=self.device)  # [B, K, 1]
 
         # 扩展条件嵌入到多时间步
-        # condition_embeddings: [B, D] -> [B, K, D]
-        condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1)
+        # condition_embeddings: [B, num_seeds, D] -> [B, K, num_seeds, D] -> [B*K, num_seeds, D]
+        if condition_embeddings.dim() == 3:
+            # 新格式：序列形式
+            num_seeds = condition_embeddings.shape[1]
+            condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1, -1)
+            condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, num_seeds, -1)
+        else:
+            # 旧格式：[B, D] -> [B, K, D]
+            condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1)
+            condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, -1)
 
         # 扩展token序列到多时间步
         # z0_token_ids: [B, L] -> [B*K, L]
@@ -299,7 +313,6 @@ class EditFlowManager:
         z0_token_ids = z0_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
         z1_token_ids = z1_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
         t = t.reshape(original_batch_size * num_timesteps, -1)
-        condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, -1)
 
         batch_size = z0_token_ids.size(0)  # 更新batch_size为扩展后的大小
 
@@ -822,9 +835,13 @@ class EditFlowManager:
         # 打印条件嵌入的前10个维度的具体值
         condition_cpu = condition.cpu().squeeze(0)
         condition_values = condition_cpu.detach().numpy()
-        condition_preview = condition_values[:10]
+        # 处理序列格式 (num_seeds, dim_hidden) 或向量格式 (dim_hidden,)
+        if condition_values.ndim == 2:
+            condition_preview = condition_values.flatten()[:10]  # 展平后取前10个
+        else:
+            condition_preview = condition_values[:10]
         self.logger.log("INITIAL_CONDITION_VALUES",
-                       f"condition前10维: [{', '.join([f'{v:.6f}' for v in condition_preview])}]",
+                       f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
                        "inference", level=1)
 
         self.logger.tensor("initial_condition", condition, level=1, context="inference")
@@ -866,14 +883,23 @@ class EditFlowManager:
                 y_pred_clipped = np.clip(y_pred_current, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
                 new_residuals = np.clip(y_data - y_pred_clipped, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
 
+                # 记录预测质量
+                mse = np.mean((y_data - y_pred_current) ** 2)
+                mae = np.mean(np.abs(y_data - y_pred_current))
+
                 # 3. 重新计算条件嵌入
                 condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
 
-                # 4. 记录条件变化到日志
+                # 4. 记录条件变化到日志 (更详细)
+                self.logger.log("RESIDUAL_UPDATE",
+                               f"步骤{step+1} | expr={current_expr_str} | "
+                               f"residuals: mean={new_residuals.mean():.6f},std={new_residuals.std():.6f},min={new_residuals.min():.6f},max={new_residuals.max():.6f} | "
+                               f"prediction: MSE={mse:.6f},MAE={mae:.6f}",
+                               "inference", level=3)
+
                 self.logger.log("CONDITION_UPDATE",
-                               f"步骤{step+1} | residuals范围=[{new_residuals.min():.4f},{new_residuals.max():.4f}] | "
-                               f"condition范围=[{condition.min():.4f},{condition.max():.4f}]",
-                               "inference", level=2)
+                               f"步骤{step+1} | expr={current_expr_str} | condition: mean={condition.mean():.6f},std={condition.std():.6f},min={condition.min():.6f},max={condition.max():.6f}",
+                               "inference", level=3)
             else:
                 self.logger.log("EVAL_FAILED",
                                f"步骤{step+1} | 无法评估表达式: {current_expr_str}",
@@ -908,34 +934,39 @@ class EditFlowManager:
                 lambda_sub = rates[0, :, 1].cpu().numpy()
                 lambda_del = rates[0, :, 2].cpu().numpy()
 
-                # 记录模型预测的操作分数 - 前几步详细记录
+                # 记录模型预测的操作分数 - 每步都记录详细统计
                 if self.accelerator.is_local_main_process:
+                    self.logger.log("RANGES_STATS",
+                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | t={t.item():.4f} | "
+                                   f"insert_max={lambda_ins.max():.6f},insert_mean={lambda_ins.mean():.6f},insert_min={lambda_ins.min():.6f} | "
+                                   f"sub_max={lambda_sub.max():.6f},sub_mean={lambda_sub.mean():.6f},sub_min={lambda_sub.min():.6f} | "
+                                   f"del_max={lambda_del.max():.6f},del_mean={lambda_del.mean():.6f},del_min={lambda_del.min():.6f}",
+                                   "inference", level=3)
+
+                    # 记录条件嵌入统计
+                    self.logger.log("CONDITION_STATS",
+                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | cond_mean={condition.mean():.6f},cond_std={condition.std():.6f},"
+                                   f"cond_min={condition.min():.6f},cond_max={condition.max():.6f}",
+                                   "inference", level=3)
+
                     self.logger.log("MODEL_PREDICTION",
-                                   f"步骤{step+1} | t={t.item():.4f} | "
+                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | t={t.item():.4f} | "
                                    f"lambda_ins: max={lambda_ins.max():.4f}, mean={lambda_ins.mean():.4f} | "
                                    f"lambda_sub: max={lambda_sub.max():.4f}, mean={lambda_sub.mean():.4f} | "
                                    f"lambda_del: max={lambda_del.max():.4f}, mean={lambda_del.mean():.4f}",
-                                   "inference", level=1)
-                    self.logger.tensor(f"rates_step{step+1}", rates, level=1, context="inference")
-                    self.logger.tensor(f"condition_step{step+1}", condition, level=1, context="inference")
+                                   "inference", level=3)
+                    self.logger.tensor(f"rates_step{step+1}", rates, level=3, context="inference")
+                    self.logger.tensor(f"condition_step{step+1}", condition, level=3, context="inference")
 
-                    # 记录top-3 insert操作
-                    if step < 2:
+                    # 记录top-3 insert操作 (前5步)
+                    if step < 5:
                         for pos in range(min(5, len(lambda_ins))):
                             top3_tokens = torch.topk(insert_probs[0, pos], 3)
                             top3_names = [tokenizer.convert_ids_to_tokens([t.item()])[0] for t in top3_tokens.indices]
                             self.logger.log(f"INSERT_POS{pos}_STEP{step+1}",
-                                           f"位置{pos} | lambda_ins={lambda_ins[pos]:.4f} | "
+                                           f"位置{pos} | lambda_ins={lambda_ins[pos]:.6f} | "
                                            f"top3_tokens={top3_names} | probs={top3_tokens.values.tolist()}",
-                                           "inference", level=1)
-
-                # 记录模型预测的操作分数 - 后续步骤简化记录
-                if self.accelerator.is_local_main_process and step % 5 == 0 and step >= 3:
-                    self.logger.log("MODEL_PREDICTION",
-                                   f"步骤{step+1} | lambda_ins: max={lambda_ins.max():.4f}, mean={lambda_ins.mean():.4f} | "
-                                   f"lambda_sub: max={lambda_sub.max():.4f}, mean={lambda_sub.mean():.4f} | "
-                                   f"lambda_del: max={lambda_del.max():.4f}, mean={lambda_del.mean():.4f}",
-                                   "inference", level=2)
+                                           "inference", level=3)
 
                 base_length = int(attention_mask[0].sum().item())
                 effective_length = max(base_length, min(10, input_ids.size(1)))
@@ -959,6 +990,13 @@ class EditFlowManager:
                         best_score = lambda_del[pos]
                         best_action = ('delete', current_token_idx)
 
+                # 记录最佳动作选择过程
+                if self.accelerator.is_local_main_process:
+                    self.logger.log("ACTION_SELECTION",
+                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | best_action={best_action} | best_score={best_score:.6f} | "
+                                   f"threshold={self.MIN_ACTION_SCORE} | will_execute={best_action is not None and best_score > self.MIN_ACTION_SCORE}",
+                                   "inference", level=3)
+
                 if best_action and best_score > self.MIN_ACTION_SCORE:
                     action_type, pos = best_action
 
@@ -966,14 +1004,28 @@ class EditFlowManager:
                         best_token = torch.argmax(insert_probs[0, pos]).item()
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
                         current_tokens.insert(pos, best_token_name)
+                        if self.accelerator.is_local_main_process:
+                            self.logger.log("ACTION_EXECUTE",
+                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | INSERT pos={pos} | token={best_token_name} | score={best_score:.6f}",
+                                           "inference", level=3)
 
                     elif action_type == 'substitute' and pos < len(current_tokens):
                         best_token = torch.argmax(substitute_probs[0, pos]).item()
                         best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
+                        old_token = current_tokens[pos]
                         current_tokens[pos] = best_token_name
+                        if self.accelerator.is_local_main_process:
+                            self.logger.log("ACTION_EXECUTE",
+                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | SUBSTITUTE pos={pos} | {old_token}->{best_token_name} | score={best_score:.6f}",
+                                           "inference", level=3)
 
                     elif action_type == 'delete' and pos < len(current_tokens):
+                        deleted_token = current_tokens[pos]
                         del current_tokens[pos]
+                        if self.accelerator.is_local_main_process:
+                            self.logger.log("ACTION_EXECUTE",
+                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | DELETE pos={pos} | token={deleted_token} | score={best_score:.6f}",
+                                           "inference", level=3)
 
                     # 评估表达式并进行常数优化
                     current_expr_str = ','.join(current_tokens)
@@ -989,6 +1041,13 @@ class EditFlowManager:
                             # 裁剪超大值防止数值溢出
                             y_pred_clipped = np.clip(y_pred_optimized, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
                             new_residuals = np.clip(y_data - y_pred_clipped, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
+
+                            # 记录常数优化后的 MSE 和残差变化
+                            mse = np.mean((y_data - y_pred_optimized) ** 2)
+                            self.logger.log("CONSTANT_OPT_RESULT",
+                                           f"步骤{step+1} | expr={optimized_expr} | MSE={mse:.6f} | "
+                                           f"残差: mean={new_residuals.mean():.6f},std={new_residuals.std():.6f},min={new_residuals.min():.6f},max={new_residuals.max():.6f}",
+                                           "inference", level=3)
 
                             # 重新计算条件
                             condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
