@@ -19,7 +19,8 @@ from .flow import (
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
 )
 from ..modeling.condition_encoder import ConditionEncoder
-from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
+# 使用新的LLaMA EditFlow模型替代BERT
+from ..modeling.llama_editflow import EditFlowTransformer, LlamaEditFlowConfig
 from ..utils.gpu_monitor import get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
@@ -71,7 +72,7 @@ class EditFlowManager:
             print(f"学习率: {getattr(self.args, 'learning_rate', 'N/A')}")
             print(f"测试集比例: {getattr(self.args, 'test_split', 'N/A')}")
             print(f"评估频率: 每{getattr(self.args, 'eval_every', 'N/A')}轮")
-            print(f"基础模型: {getattr(self.args, 'base_model_name', 'N/A')}")
+            print(f"LLaMA模型配置: hidden_dim={getattr(self.args, 'hidden_dim', 256)}, n_layers={getattr(self.args, 'n_layers', 6)}, n_heads={getattr(self.args, 'n_heads', 8)}")
             print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
             print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
             print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
@@ -206,13 +207,14 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print("初始化tokenizer和模型...")
 
-        # 初始化tokenizer
+        # 初始化tokenizer（仍然使用预训练模型的tokenizer，但仅用于分词）
+        # 注意：LLaMA EditFlow使用自定义架构，不加载预训练权重
         model_name = getattr(self.args, 'base_model_name', "google-bert/bert-base-uncased")
         cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
         if self.accelerator.is_local_main_process:
-            print(f"正在加载tokenizer: {model_name}")
+            print(f"正在加载tokenizer: {model_name} (仅用于分词，不使用预训练权重)")
             print(f"模型缓存目录: {cache_dir}")
         tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         if self.accelerator.is_local_main_process:
@@ -232,18 +234,23 @@ class EditFlowManager:
         ).to(self.device)
 
         if self.accelerator.is_local_main_process:
-            print("初始化EditFlow模型...")
+            print("初始化LLaMA EditFlow模型（自定义架构，不加载预训练权重）...")
 
         # 获取条件编码器的隐藏层维度
         # 现在条件编码器输出 (batch_size, num_seeds, dim_hidden) 格式
         # 所以 condition_dim 应该等于 dim_hidden
         condition_hidden_dim = getattr(self.args, 'condition_dim_hidden', 128)
 
-        config = EditFlowConfig(
+        # 使用LLaMA EditFlow配置（替代BERT）
+        config = LlamaEditFlowConfig(
+            vocab_size=len(tokenizer.get_vocab()),  # 符号回归专用小词表
+            hidden_dim=getattr(self.args, 'hidden_dim', 256),  # LLaMA隐藏层维度
+            n_layers=getattr(self.args, 'n_layers', 6),  # Transformer层数
+            n_heads=getattr(self.args, 'n_heads', 8),  # 注意力头数
+            condition_dim=condition_hidden_dim,
+            dropout=getattr(self.args, 'dropout', 0.1),
             max_seq_len=self.args.max_expr_length,
-            condition_dim=condition_hidden_dim,  # 使用隐藏层维度，而非 output_dim
-            base_model_name=model_name,
-            vocab_size=len(tokenizer.get_vocab()),
+            use_condition_injection=getattr(self.args, 'use_condition_injection', True),
         )
         model = EditFlowTransformer(config, verbose=self.accelerator.is_local_main_process).to(self.device)
 
@@ -278,7 +285,7 @@ class EditFlowManager:
 
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if self.accelerator.is_local_main_process:
-            print(f"EditFlow模型参数数量: {total_params:,}")
+            print(f"✓ LLaMA EditFlow模型参数数量: {total_params:,}")
 
         return model, condition_encoder, criterion, optimizer, tokenizer
 
