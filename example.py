@@ -84,6 +84,12 @@ def main():
         'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
         'max_expr_length': 12, # 最大表达式长度
         "num_timesteps": 1,
+        # LLaMA模型架构参数
+        'hidden_dim': 256,  # LLaMA隐藏层维度
+        'n_layers': 6,  # LLaMA Transformer层数
+        'n_heads': 8,  # LLaMA注意力头数
+        'dropout': 0.1,  # Dropout比率
+        'use_condition_injection': True,  # 是否使用交叉注意力条件注入
         # SetTransformer参数
         'condition_dim_hidden': 768,  # 匹配 BERT 的 hidden_size
         'condition_num_heads': 4,

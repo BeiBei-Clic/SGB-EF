@@ -38,7 +38,7 @@ class EditFlowManager:
     """
 
     # 类常量：训练和推理配置参数
-    GRADIENT_CLIP_NORM = 1.0
+    GRADIENT_CLIP_NORM = 5.0  # 提高到5.0以适应6750万参数的大模型
     NUMERICAL_CLIP_THRESHOLD = 1e6
     MAX_EXPRESSION_LENGTH = 50
     LEARNING_RATE_SCALE = 0.1  # 降低学习率以防止梯度爆炸

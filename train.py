@@ -40,6 +40,13 @@ def main():
     parser.add_argument("--condition_model_name", type=str, default="settransformer", help="条件嵌入模型名称 (现在使用SetTransformer架构)")
     parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
+    # LLaMA模型架构参数
+    parser.add_argument("--hidden_dim", type=int, default=512, help="LLaMA隐藏层维度")
+    parser.add_argument("--n_layers", type=int, default=8, help="LLaMA Transformer层数")
+    parser.add_argument("--n_heads", type=int, default=16, help="LLaMA注意力头数")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout比率")
+    parser.add_argument("--use_condition_injection", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否使用交叉注意力条件注入")
+
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")

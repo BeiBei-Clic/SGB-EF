@@ -368,11 +368,13 @@ class EditFlowTransformer(LlamaEditFlowBackbone):
         # 保存config以便外部访问
         self.config = config
 
-        # 从config中提取参数
+        # 从config中提取参数（同时支持新旧两种命名方式）
         vocab_size = getattr(config, 'vocab_size', 100)
         hidden_dim = getattr(config, 'hidden_dim', 256)
-        n_layers = getattr(config, 'num_layers', 6)
-        n_heads = getattr(config, 'num_heads', 8)
+        # 支持两种命名：num_layers (旧) 和 n_layers (新LlamaEditFlowConfig)
+        n_layers = getattr(config, 'num_layers', None) or getattr(config, 'n_layers', 6)
+        # 支持两种命名：num_heads (旧) 和 n_heads (新LlamaEditFlowConfig)
+        n_heads = getattr(config, 'num_heads', None) or getattr(config, 'n_heads', 8)
         condition_dim = getattr(config, 'condition_dim', 128)
         dropout = getattr(config, 'dropout', 0.1)
         max_seq_len = getattr(config, 'max_seq_len', 24)

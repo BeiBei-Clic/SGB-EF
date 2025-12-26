@@ -73,7 +73,7 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_timesteps 10 \
-    --num_samples 10000\
+    --num_samples 100000\
     --batch_size 48
 
 # 将会话挂到后台
