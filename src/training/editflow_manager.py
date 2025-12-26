@@ -23,6 +23,7 @@ from ..modeling.editflow_transformer import EditFlowTransformer, EditFlowConfig
 from ..utils.gpu_monitor import get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
+from .beam_search import BeamSearchSymbolicRegression, BeamCandidate
 
 
 class EditFlowManager:
@@ -768,8 +769,8 @@ class EditFlowManager:
 
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None):
-        """符号回归 - 接收数据点对，输出表达式
+    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, beam_size=5):
+        """符号回归 - 使用束搜索接收数据点对，输出表达式
 
         Args:
             model_path: 模型检查点路径
@@ -778,10 +779,11 @@ class EditFlowManager:
             n_steps: 推理步数
             input_dim: 输入维度，如果为None则自动推断
             max_expr_length: 表达式最大token长度，如果为None则使用args中的值
+            beam_size: 束搜索宽度，保留的候选数量
         """
         # 记录开始
         self.logger.log("SYMBOLIC_REGRESSION_START",
-                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape}",
+                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | beam_size={beam_size}",
                        "inference", level=1)
 
         # 加载模型
@@ -791,7 +793,7 @@ class EditFlowManager:
         else:
             self.logger.log("MODEL_LOAD", "未找到检查点，将使用基础模型进行推理", "inference", level=1)
 
-        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+        model, condition_encoder, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 设置设备和模式
         device = self.device
@@ -856,215 +858,48 @@ class EditFlowManager:
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=actual_max_dim)
         special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
-        vocab = special_tokens_manager.tokenizer.get_vocab()
 
-        for step in range(n_steps):
-            # 记录推理步骤
-            if self.accelerator.is_local_main_process:
-                print(f"推理步骤 {step + 1}/{n_steps}, 当前表达式: {','.join(current_tokens) if current_tokens else '<blank>'}")
+        # 创建束搜索推理器
+        self.logger.log("BEAM_SEARCH_INIT", f"初始化束搜索推理器 | beam_size={beam_size}, n_steps={n_steps}", "inference", level=1)
 
-            # === 关键修复：每步重新计算条件嵌入 ===
-            # 1. 评估当前表达式
-            current_expr_str = ','.join(current_tokens)
+        beam_searcher = BeamSearchSymbolicRegression(
+            model=model,
+            condition_encoder=condition_encoder,
+            tokenizer=tokenizer,
+            special_tokens_manager=special_tokens_manager,
+            device=device,
+            args=self.args,
+            logger=self.logger,
+            min_action_score=self.MIN_ACTION_SCORE,
+            max_expression_length=self.MAX_EXPRESSION_LENGTH,
+            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
+        )
+        # 传递accelerator用于日志判断
+        beam_searcher.accelerator = self.accelerator
 
-            # 将字符串表达式转换为sympy表达式对象
-            try:
-                current_expr = tree_to_expr(current_expr_str)
-            except Exception as e:
-                self.logger.log("EXPR_PARSE_FAILED",
-                               f"步骤{step+1} | 无法解析表达式 '{current_expr_str}': {e}",
-                               "inference", level=2)
-                continue
+        # 执行束搜索
+        initial_residuals_np = residuals.cpu().squeeze(0).numpy()
+        best_candidate = beam_searcher.beam_search(
+            initial_tokens=current_tokens,
+            initial_condition=condition,
+            initial_residuals=initial_residuals_np,
+            x_data=x_data,
+            y_data=y_data,
+            x_values=x_values,
+            n_steps=n_steps,
+            beam_size=beam_size,
+            top_k_actions=10  # 每步考虑top-10操作
+        )
 
-            eval_success, y_pred_current = evaluate_expression_safe(current_expr, x_data)
+        # 返回最佳候选的表达式
+        final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
 
-            if eval_success:
-                # 2. 计算新的残差
-                y_pred_clipped = np.clip(y_pred_current, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
-                new_residuals = np.clip(y_data - y_pred_clipped, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
+        if best_candidate and self.accelerator.is_local_main_process:
+            self.logger.log("BEAM_SEARCH_RESULT",
+                           f"最终得分: {best_candidate.score:.4f} | "
+                           f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
+                           "inference", level=1)
 
-                # 记录预测质量
-                mse = np.mean((y_data - y_pred_current) ** 2)
-                mae = np.mean(np.abs(y_data - y_pred_current))
-
-                # 3. 重新计算条件嵌入
-                condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
-
-                # 4. 记录条件变化到日志 (更详细)
-                self.logger.log("RESIDUAL_UPDATE",
-                               f"步骤{step+1} | expr={current_expr_str} | "
-                               f"residuals: mean={new_residuals.mean():.6f},std={new_residuals.std():.6f},min={new_residuals.min():.6f},max={new_residuals.max():.6f} | "
-                               f"prediction: MSE={mse:.6f},MAE={mae:.6f}",
-                               "inference", level=3)
-
-                self.logger.log("CONDITION_UPDATE",
-                               f"步骤{step+1} | expr={current_expr_str} | condition: mean={condition.mean():.6f},std={condition.std():.6f},min={condition.min():.6f},max={condition.max():.6f}",
-                               "inference", level=3)
-            else:
-                self.logger.log("EVAL_FAILED",
-                               f"步骤{step+1} | 无法评估表达式: {current_expr_str}",
-                               "inference", level=2)
-            # === 修复结束 ===
-
-            tokenized_expr = special_tokens_manager.tokenize_expression(','.join(current_tokens))
-
-            max_len = getattr(self.args, 'max_expr_length', 128)
-            if len(tokenized_expr) > max_len - 1:
-                tokenized_expr = tokenized_expr[:max_len-1]
-
-            # 构建模型输入
-            bos_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
-            pad_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
-
-            tokenized_expr = [bos_token] + tokenized_expr
-            tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
-
-            input_ids = torch.LongTensor([tokenized_expr]).to(device)
-            attention_mask = (input_ids != pad_token).float().to(device)
-
-            t = torch.tensor([[0.1 + 0.9 * step / n_steps]], dtype=torch.float32, device=device)
-
-            with torch.no_grad():
-                rates, insert_probs, substitute_probs = model(
-                    input_ids=input_ids, attention_mask=attention_mask,
-                    time_steps=t, condition=condition
-                )
-
-                lambda_ins = rates[0, :, 0].cpu().numpy()
-                lambda_sub = rates[0, :, 1].cpu().numpy()
-                lambda_del = rates[0, :, 2].cpu().numpy()
-
-                # 记录模型预测的操作分数 - 每步都记录详细统计
-                if self.accelerator.is_local_main_process:
-                    self.logger.log("RANGES_STATS",
-                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | t={t.item():.4f} | "
-                                   f"insert_max={lambda_ins.max():.6f},insert_mean={lambda_ins.mean():.6f},insert_min={lambda_ins.min():.6f} | "
-                                   f"sub_max={lambda_sub.max():.6f},sub_mean={lambda_sub.mean():.6f},sub_min={lambda_sub.min():.6f} | "
-                                   f"del_max={lambda_del.max():.6f},del_mean={lambda_del.mean():.6f},del_min={lambda_del.min():.6f}",
-                                   "inference", level=3)
-
-                    # 记录条件嵌入统计
-                    self.logger.log("CONDITION_STATS",
-                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | cond_mean={condition.mean():.6f},cond_std={condition.std():.6f},"
-                                   f"cond_min={condition.min():.6f},cond_max={condition.max():.6f}",
-                                   "inference", level=3)
-
-                    self.logger.log("MODEL_PREDICTION",
-                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | t={t.item():.4f} | "
-                                   f"lambda_ins: max={lambda_ins.max():.4f}, mean={lambda_ins.mean():.4f} | "
-                                   f"lambda_sub: max={lambda_sub.max():.4f}, mean={lambda_sub.mean():.4f} | "
-                                   f"lambda_del: max={lambda_del.max():.4f}, mean={lambda_del.mean():.4f}",
-                                   "inference", level=3)
-                    self.logger.tensor(f"rates_step{step+1}", rates, level=3, context="inference")
-                    self.logger.tensor(f"condition_step{step+1}", condition, level=3, context="inference")
-
-                    # 记录top-3 insert操作 (前5步)
-                    if step < 5:
-                        for pos in range(min(5, len(lambda_ins))):
-                            top3_tokens = torch.topk(insert_probs[0, pos], 3)
-                            top3_names = [tokenizer.convert_ids_to_tokens([t.item()])[0] for t in top3_tokens.indices]
-                            self.logger.log(f"INSERT_POS{pos}_STEP{step+1}",
-                                           f"位置{pos} | lambda_ins={lambda_ins[pos]:.6f} | "
-                                           f"top3_tokens={top3_names} | probs={top3_tokens.values.tolist()}",
-                                           "inference", level=3)
-
-                base_length = int(attention_mask[0].sum().item())
-                effective_length = max(base_length, min(10, input_ids.size(1)))
-
-                best_pos = 0
-                best_action = None
-                best_score = -1
-
-                # 寻找最佳操作
-                for pos in range(1, effective_length):
-                    if lambda_ins[pos] > best_score:
-                        best_score = lambda_ins[pos]
-                        best_action = ('insert', pos-1)
-
-                    current_token_idx = pos - 1
-                    if current_token_idx < len(current_tokens) and lambda_sub[pos] > best_score:
-                        best_score = lambda_sub[pos]
-                        best_action = ('substitute', current_token_idx)
-
-                    if current_token_idx < len(current_tokens) and lambda_del[pos] > best_score:
-                        best_score = lambda_del[pos]
-                        best_action = ('delete', current_token_idx)
-
-                # 记录最佳动作选择过程
-                if self.accelerator.is_local_main_process:
-                    self.logger.log("ACTION_SELECTION",
-                                   f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | best_action={best_action} | best_score={best_score:.6f} | "
-                                   f"threshold={self.MIN_ACTION_SCORE} | will_execute={best_action is not None and best_score > self.MIN_ACTION_SCORE}",
-                                   "inference", level=3)
-
-                if best_action and best_score > self.MIN_ACTION_SCORE:
-                    action_type, pos = best_action
-
-                    if action_type == 'insert':
-                        best_token = torch.argmax(insert_probs[0, pos]).item()
-                        best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
-                        current_tokens.insert(pos, best_token_name)
-                        if self.accelerator.is_local_main_process:
-                            self.logger.log("ACTION_EXECUTE",
-                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | INSERT pos={pos} | token={best_token_name} | score={best_score:.6f}",
-                                           "inference", level=3)
-
-                    elif action_type == 'substitute' and pos < len(current_tokens):
-                        best_token = torch.argmax(substitute_probs[0, pos]).item()
-                        best_token_name = tokenizer.convert_ids_to_tokens([best_token])[0]
-                        old_token = current_tokens[pos]
-                        current_tokens[pos] = best_token_name
-                        if self.accelerator.is_local_main_process:
-                            self.logger.log("ACTION_EXECUTE",
-                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | SUBSTITUTE pos={pos} | {old_token}->{best_token_name} | score={best_score:.6f}",
-                                           "inference", level=3)
-
-                    elif action_type == 'delete' and pos < len(current_tokens):
-                        deleted_token = current_tokens[pos]
-                        del current_tokens[pos]
-                        if self.accelerator.is_local_main_process:
-                            self.logger.log("ACTION_EXECUTE",
-                                           f"步骤{step+1} | expr={','.join(current_tokens) if current_tokens else '<blank>'} | DELETE pos={pos} | token={deleted_token} | score={best_score:.6f}",
-                                           "inference", level=3)
-
-                    # 评估表达式并进行常数优化
-                    current_expr_str = ','.join(current_tokens)
-                    eval_success, optimized_expr, loss = evaluate_expression_with_constants(
-                        current_expr_str, x_data, y_data
-                    )
-
-                    if eval_success:
-                        try:
-                            from ..symbolic.symbolic_utils import evaluate_expr
-                            y_pred_optimized = evaluate_expr(optimized_expr, x_data)
-
-                            # 裁剪超大值防止数值溢出
-                            y_pred_clipped = np.clip(y_pred_optimized, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
-                            new_residuals = np.clip(y_data - y_pred_clipped, -self.NUMERICAL_CLIP_THRESHOLD, self.NUMERICAL_CLIP_THRESHOLD)
-
-                            # 记录常数优化后的 MSE 和残差变化
-                            mse = np.mean((y_data - y_pred_optimized) ** 2)
-                            self.logger.log("CONSTANT_OPT_RESULT",
-                                           f"步骤{step+1} | expr={optimized_expr} | MSE={mse:.6f} | "
-                                           f"残差: mean={new_residuals.mean():.6f},std={new_residuals.std():.6f},min={new_residuals.min():.6f},max={new_residuals.max():.6f}",
-                                           "inference", level=3)
-
-                            # 重新计算条件
-                            condition = condition_encoder(x_values, torch.FloatTensor(new_residuals).unsqueeze(0).to(device))
-
-                            # 检查新条件是否有效
-                            if not torch.any(torch.isnan(condition)) and not torch.any(torch.isinf(condition)):
-                                self.logger.log("EVAL_SUCCESS", f"{optimized_expr} | loss: {loss:.6f}", f"步骤{step+1}", level=2)
-                        except Exception as e:
-                            self.logger.error("RESIDUAL_UPDATE_ERROR", f"残差更新失败: {e}", f"步骤{step+1}")
-
-            # 表达式长度限制
-            if len(current_tokens) > self.MAX_EXPRESSION_LENGTH:
-                current_tokens = current_tokens[:self.MAX_EXPRESSION_LENGTH]
-
-        # 返回最终的表达式
-        final_expression = ','.join(current_tokens) if current_tokens else ""
         self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=1)
-
         return final_expression
 

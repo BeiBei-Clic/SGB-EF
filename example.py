@@ -127,18 +127,52 @@ def main():
     model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（使用重新组织后的数据）
-    logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30", "example")
+    # 使用束搜索来扩大搜索范围，提高发现更好表达式的概率
+    logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30 | 束大小: 5", "example")
+
     predicted_expression = manager.symbolic_regression(
         model_path=model_path,
         x_data=x_data_reorganized,  # 使用重新组织后的数据
         y_data=y_data,
-        n_steps=30  # 减少步数以便观察
+        n_steps=30,      # 推理步数
+        beam_size=5      # 束搜索宽度，每步保留5个最佳候选
     )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
     print(f"\n最终结果对比:")
     print(f"真实表达式: {new_expr_gt}")  # 使用更新后的表达式
     print(f"预测表达式: {predicted_expression}")
+
+    # 验证表达式质量
+    if predicted_expression:
+        from src.symbolic.symbolic_utils import evaluate_expression_safe, tree_to_expr
+        try:
+            # 将token字符串转换为sympy表达式
+            pred_expr = tree_to_expr(predicted_expression)
+            success, y_pred = evaluate_expression_safe(pred_expr, x_data_reorganized)
+
+            if success:
+                mse = np.mean((y_data - y_pred) ** 2)
+                mae = np.mean(np.abs(y_data - y_pred))
+                print(f"\n预测质量:")
+                print(f"  MSE: {mse:.6f}")
+                print(f"  MAE: {mae:.6f}")
+
+                # 也计算真实表达式的质量作为对比
+                gt_expr = tree_to_expr(new_expr_gt)
+                gt_success, y_gt = evaluate_expression_safe(gt_expr, x_data_reorganized)
+                if gt_success:
+                    gt_mse = np.mean((y_data - y_gt) ** 2)
+                    gt_mae = np.mean(np.abs(y_data - y_gt))
+                    print(f"\n真实表达式质量:")
+                    print(f"  MSE: {gt_mse:.6f}")
+                    print(f"  MAE: {gt_mae:.6f}")
+            else:
+                print(f"\n验证失败: 无法计算预测表达式")
+        except Exception as e:
+            print(f"\n验证失败: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
