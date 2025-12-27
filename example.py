@@ -50,8 +50,11 @@ def reorganize_data_by_used_variables(expression_str, x_data, y_data):
     new_x_data = x_data[:, var_indices]
 
     # 更新表达式字符串
+    # 按照变量名长度从长到短排序，避免短变量名污染长变量名
+    # 例如：先替换 x10，再替换 x1，避免 x10 被错误替换为 x00
     new_expression = str(expression_str)
-    for old_var, new_var in var_mapping.items():
+    sorted_vars = sorted(var_mapping.items(), key=lambda x: len(x[0]), reverse=True)
+    for old_var, new_var in sorted_vars:
         new_expression = new_expression.replace(old_var, new_var)
 
     # 获取新表达式使用的变量
@@ -98,7 +101,6 @@ def main():
         'condition_num_seeds': 32,  # 输出序列长度
         'condition_dim_output': 128,  # 已弃用
         'condition_input_normalization': False,
-        'condition_use_sinusoidal_encoding': False,  # 禁用正弦编码,直接使用原始残差值
     })()
 
     manager = EditFlowManager(args)

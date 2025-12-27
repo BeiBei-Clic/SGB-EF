@@ -166,8 +166,9 @@ class BeamSearchSymbolicRegression:
                 self._sequence_format_logged = True
 
             # 生成insert操作提案
-            for pos in range(1, effective_length):
-                if lambda_ins[pos] > self.min_action_score:
+            seq_len = min(effective_length, lambda_ins.shape[0])
+            for pos in range(1, seq_len):
+                if pos < lambda_ins.shape[0] and lambda_ins[pos] > self.min_action_score:
                     insert_pos = pos - 1
                     top_k_tokens = top_k if top_k else insert_probs.shape[2]
                     top_tokens = torch.topk(insert_probs[0, pos], min(top_k_tokens, insert_probs.shape[2]))
@@ -193,9 +194,10 @@ class BeamSearchSymbolicRegression:
                         ))
 
             # 生成substitute操作提案
-            for pos in range(1, effective_length):
+            seq_len = min(effective_length, lambda_sub.shape[0])
+            for pos in range(1, seq_len):
                 current_token_idx = pos - 1
-                if current_token_idx < len(current_tokens) and lambda_sub[pos] > self.min_action_score:
+                if pos < lambda_sub.shape[0] and current_token_idx < len(current_tokens) and lambda_sub[pos] > self.min_action_score:
                     top_k_tokens = top_k if top_k else substitute_probs.shape[2]
                     top_tokens = torch.topk(substitute_probs[0, pos], min(top_k_tokens, substitute_probs.shape[2]))
 
@@ -219,9 +221,10 @@ class BeamSearchSymbolicRegression:
                         ))
 
             # 生成delete操作提案
-            for pos in range(1, effective_length):
+            seq_len = min(effective_length, lambda_del.shape[0])
+            for pos in range(1, seq_len):
                 current_token_idx = pos - 1
-                if current_token_idx < len(current_tokens) and lambda_del[pos] > self.min_action_score:
+                if pos < lambda_del.shape[0] and current_token_idx < len(current_tokens) and lambda_del[pos] > self.min_action_score:
                     if len(current_tokens) > 1:  # 保持至少一个token
                         new_tokens = current_tokens.copy()
                         del new_tokens[current_token_idx]

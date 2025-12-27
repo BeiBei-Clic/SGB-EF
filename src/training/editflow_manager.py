@@ -414,7 +414,7 @@ class EditFlowManager:
         ins_probs = lambda_ins * pred_ins_probs
         sub_probs = lambda_sub * pred_sub_probs
 
-        u_cat = torch.cat([lambda_ins * ins_probs, lambda_sub * sub_probs, lambda_del], dim=-1)
+        u_cat = torch.cat([ins_probs, sub_probs, lambda_del], dim=-1)
 
         u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
 
@@ -778,15 +778,6 @@ class EditFlowManager:
             print(f"最终模型已保存到: {final_path}")
             # 记录训练完成到 training.log
             self.logger.log("TRAINING_COMPLETE", f"训练完成 | final_path={final_path} | final_train_loss={avg_loss:.4f} | total_epochs={self.args.num_epochs}", level=1)
-
-        # 显式清理分布式资源
-        try:
-            self.accelerator.free_memory()
-            if self.accelerator.is_local_main_process:
-                print("✓ 分布式资源已清理")
-        except Exception as e:
-            if self.accelerator.is_local_main_process:
-                print(f"⚠️ 资源清理时出现警告: {e}")
 
         return model, condition_encoder
 
