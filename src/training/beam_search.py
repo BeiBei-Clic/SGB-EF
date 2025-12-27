@@ -147,9 +147,11 @@ class BeamSearchSymbolicRegression:
                 condition=condition
             )
 
-            lambda_ins = rates[0, :, 0].cpu().numpy()
-            lambda_sub = rates[0, :, 1].cpu().numpy()
-            lambda_del = rates[0, :, 2].cpu().numpy()
+            # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
+            # 因此索引 0=插入, 1=删除, 2=替换
+            lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入速率
+            lambda_del = rates[0, :, 1].cpu().numpy()  # 删除速率（修复：原来是 lambda_sub）
+            lambda_sub = rates[0, :, 2].cpu().numpy()  # 替换速率（修复：原来是 lambda_del）
 
             # 调试：验证序列格式
             base_length = int(attention_mask[0].sum().item())
@@ -227,7 +229,7 @@ class BeamSearchSymbolicRegression:
                             action_type='insert',
                             position=insert_pos,
                             token=token_name,
-                            score=lambda_ins[pos] * prob.item(),
+                            score=lambda_ins[input_ids_pos] * prob.item(),
                             new_tokens=new_tokens
                         ))
 

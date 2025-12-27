@@ -417,9 +417,11 @@ class EditFlowManager:
         # 获取时间步采样数量
         num_timesteps = self.args.num_timesteps
 
-        lambda_ins = pred_rates[:, :, 0:1]
-        lambda_sub = pred_rates[:, :, 1:2]
-        lambda_del = pred_rates[:, :, 2:3]
+        # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
+        # 因此索引 0=插入, 1=删除, 2=替换
+        lambda_ins = pred_rates[:, :, 0:1]  # 插入速率
+        lambda_del = pred_rates[:, :, 1:2]  # 删除速率（修复：原来是 lambda_sub）
+        lambda_sub = pred_rates[:, :, 2:3]  # 替换速率（修复：原来是 lambda_del）
 
         ins_probs = lambda_ins * pred_ins_probs
         sub_probs = lambda_sub * pred_sub_probs
@@ -605,8 +607,10 @@ class EditFlowManager:
                         self.logger.log("GRAD_NORM", f"grad_norm={grad_norm:.4f}",
                                         f"维度{dimension}_batch{batch_idx}", level=2)
 
-                    # ✅ optimizer.step() 和 zero_grad() 由 accumulate 上下文自动处理
-                    # 不需要手动调用
+                    # ✅ 关键修复：手动调用 optimizer.step() 和 zero_grad()
+                    # accelerator.accumulate() 只管理梯度累积和同步，不会自动更新参数
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                 total_loss += loss.item()
                 num_batches += 1
