@@ -85,8 +85,8 @@ def main():
         'max_expr_length': 12, # 最大表达式长度
         "num_timesteps": 1,
         # LLaMA模型架构参数
-        'hidden_dim': 256,  # LLaMA隐藏层维度
-        'n_layers': 6,  # LLaMA Transformer层数
+        'hidden_dim': 512,  # LLaMA隐藏层维度 (匹配checkpoint)
+        'n_layers': 8,  # LLaMA Transformer层数 (匹配checkpoint)
         'n_heads': 8,  # LLaMA注意力头数
         'dropout': 0.1,  # Dropout比率
         'use_condition_injection': True,  # 是否使用交叉注意力条件注入
@@ -130,7 +130,7 @@ def main():
     sample['exp_gt'] = new_expr_gt
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_10"
+    model_path = "checkpoints/checkpoint_epoch_15"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用束搜索来扩大搜索范围，提高发现更好表达式的概率
@@ -149,30 +149,32 @@ def main():
     print(f"真实表达式: {new_expr_gt}")  # 使用更新后的表达式
     print(f"预测表达式: {predicted_expression}")
 
-    # 验证表达式质量
+    # 验证表达式质量（支持常数优化）
     if predicted_expression:
-        from src.symbolic.symbolic_utils import evaluate_expression_safe, tree_to_expr
+        from src.symbolic.symbolic_utils import evaluate_expression_with_constants
         try:
-            # 将token字符串转换为sympy表达式
-            pred_expr = tree_to_expr(predicted_expression)
-            success, y_pred = evaluate_expression_safe(pred_expr, x_data_reorganized)
+            # 使用常数优化评估预测表达式
+            pred_success, pred_optimized_expr, pred_mse = evaluate_expression_with_constants(
+                tree_str=predicted_expression,
+                x_values=x_data_reorganized,
+                y_values=y_data
+            )
 
-            if success:
-                mse = np.mean((y_data - y_pred) ** 2)
-                mae = np.mean(np.abs(y_data - y_pred))
+            if pred_success and pred_optimized_expr is not None:
                 print(f"\n预测质量:")
-                print(f"  MSE: {mse:.6f}")
-                print(f"  MAE: {mae:.6f}")
+                print(f"  MSE: {pred_mse:.6f}")
+                print(f"  优化后的表达式: {pred_optimized_expr}")
 
                 # 也计算真实表达式的质量作为对比
-                gt_expr = tree_to_expr(new_expr_gt)
-                gt_success, y_gt = evaluate_expression_safe(gt_expr, x_data_reorganized)
-                if gt_success:
-                    gt_mse = np.mean((y_data - y_gt) ** 2)
-                    gt_mae = np.mean(np.abs(y_data - y_gt))
+                gt_success, gt_optimized_expr, gt_mse = evaluate_expression_with_constants(
+                    tree_str=new_expr_gt,
+                    x_values=x_data_reorganized,
+                    y_values=y_data
+                )
+                if gt_success and gt_optimized_expr is not None:
                     print(f"\n真实表达式质量:")
                     print(f"  MSE: {gt_mse:.6f}")
-                    print(f"  MAE: {gt_mae:.6f}")
+                    print(f"  优化后的表达式: {gt_optimized_expr}")
             else:
                 print(f"\n验证失败: 无法计算预测表达式")
         except Exception as e:

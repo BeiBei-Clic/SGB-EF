@@ -43,21 +43,30 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
 
 
 def remove_gap_tokens(z_t: torch.Tensor, special_tokens_manager: SpecialTokensManager) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """移除gap token并返回处理后的序列"""
+    """移除gap token并返回处理后的序列
+
+    重要：此函数只移除 gap_token，保留 BOS token 和所有其他 tokens
+    确保返回的序列格式为 [BOS] + [non_gap_tokens] + [PAD...]
+    """
     pad_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
     gap_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
+    bos_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
     batch_size, z_seq_len = z_t.shape
     device = z_t.device
 
     z_gap_mask = (z_t == gap_token_id)
     z_pad_mask = (z_t == pad_token_id)
 
-    # 使用掩码操作移除gap tokens
+    # 使用掩码操作移除gap tokens（只移除gap，保留BOS和其他tokens）
     x_t_list = []
     for i in range(batch_size):
         non_gap_mask = ~z_gap_mask[i]
         x_row = z_t[i][non_gap_mask]
         x_t_list.append(x_row)
+
+        # 验证：确保BOS token被保留（如果输入中存在）
+        if len(x_row) > 0 and z_t[i, 0] == bos_token_id:
+            assert x_row[0] == bos_token_id, f"BOS token必须被保留在位置0"
 
     max_len = max(len(x) for x in x_t_list)
     x_t_padded = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
@@ -307,6 +316,7 @@ def custom_collate_fn(batch):
     x_values_padded = []
     residuals_padded = []
     dim_masks = []
+    point_masks = []
 
     for i, item in enumerate(batch):
         x_val = item['x_values'].clone()  # [n_points, current_dim]
@@ -340,14 +350,20 @@ def custom_collate_fn(batch):
         dim_mask = torch.zeros(max_dim, dtype=torch.float32)
         dim_mask[:current_dim] = 1.0
 
+        # 创建点mask：1表示真实点，0表示填充点
+        point_mask = torch.zeros(max_n_points, dtype=torch.float32)
+        point_mask[:current_n_points] = 1.0
+
         x_values_padded.append(x_val)          # [max_n_points, max_dim]
         residuals_padded.append(resid)         # [max_n_points]
         dim_masks.append(dim_mask)             # [max_dim]
+        point_masks.append(point_mask)         # [max_n_points]
 
     result = {
         'x_values': torch.stack(x_values_padded),     # [batch_size, max_n_points, max_dim]
         'residuals': torch.stack(residuals_padded),   # [batch_size, max_n_points]
         'dim_mask': torch.stack(dim_masks),           # [batch_size, max_dim]
+        'point_mask': torch.stack(point_masks),       # [batch_size, max_n_points]
         'z0_token_ids': torch.stack([item['z0_token_ids'] for item in batch]),
         'z1_token_ids': torch.stack([item['z1_token_ids'] for item in batch]),
         'gap_token': batch[0]['gap_token'],

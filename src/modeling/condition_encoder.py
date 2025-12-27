@@ -97,7 +97,13 @@ class MAB(nn.Module):
             self.ln1 = nn.LayerNorm(dim_V)
         self.fc_o = nn.Linear(dim_V, dim_V)
 
-    def forward(self, Q, K):
+    def forward(self, Q, K, attention_mask):
+        """
+        Args:
+            Q: (batch_size, n_q, dim_Q)
+            K: (batch_size, n_k, dim_K)
+            attention_mask: (batch_size, n_k) - 1表示有效位置，0表示填充位置
+        """
         Q = self.fc_q(Q)
         K, V = self.fc_k(K), self.fc_v(K)
 
@@ -106,7 +112,25 @@ class MAB(nn.Module):
         K_ = torch.cat(K.split(dim_split, 2), 0)
         V_ = torch.cat(V.split(dim_split, 2), 0)
 
-        A = torch.softmax(Q_.bmm(K_.transpose(1,2))/math.sqrt(self.dim_V), 2)
+        # 计算attention scores
+        A = Q_.bmm(K_.transpose(1,2))/math.sqrt(self.dim_V)
+
+        # 应用attention mask
+        batch_size, n_k = attention_mask.shape
+        n_q = Q.size(1)
+
+        # 扩展mask: (batch_size, n_k) -> (batch_size, 1, n_k) -> (batch_size, n_q, n_k)
+        mask_expanded = attention_mask.unsqueeze(1).expand(-1, n_q, -1)
+
+        # 重复每个头: (batch_size, n_q, n_k) -> (batch_size * num_heads, n_q, n_k)
+        mask_expanded = mask_expanded.repeat(self.num_heads, 1, 1)
+
+        # 将0位置设为极小值
+        # 使用-1e4以兼容fp16（fp16范围约-65504到+65504）
+        # 使用float类型确保在autocast下正确转换
+        A = A.masked_fill(mask_expanded == 0, -1e4)
+
+        A = torch.softmax(A, 2)
         O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
         O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
         O = O + F.relu(self.fc_o(O))
@@ -120,8 +144,8 @@ class SAB(nn.Module):
         super(SAB, self).__init__()
         self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
-        return self.mab(X, X)
+    def forward(self, X, attention_mask):
+        return self.mab(X, X, attention_mask)
 
 
 class ISAB(nn.Module):
@@ -133,9 +157,15 @@ class ISAB(nn.Module):
         self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
         self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
-        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X)
-        return self.mab1(X, H)
+    def forward(self, X, attention_mask):
+        # mab0:诱导向量I作为Q，X作为K/V，需要对X应用mask
+        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X, attention_mask)
+        # mab1:X作为Q，H作为K/V，H是诱导向量不需要mask（全是有效）
+        # 创建全1mask用于mab1（因为H没有padding）
+        batch_size = X.size(0)
+        num_inds = H.size(1)
+        mask_for_H = torch.ones(batch_size, num_inds, device=X.device, dtype=X.dtype)
+        return self.mab1(X, H, mask_for_H)
 
 
 class PMA(nn.Module):
@@ -146,8 +176,9 @@ class PMA(nn.Module):
         nn.init.xavier_uniform_(self.S)
         self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
 
-    def forward(self, X):
-        return self.mab(self.S.repeat(X.size(0), 1, 1), X)
+    def forward(self, X, attention_mask):
+        # seed向量S作为Q，X作为K/V，需要对X应用mask
+        return self.mab(self.S.repeat(X.size(0), 1, 1), X, attention_mask)
 
 
 class SetTransformerConditionEncoder(nn.Module):
@@ -234,12 +265,13 @@ class SetTransformerConditionEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x_values: torch.Tensor, residuals: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_values: torch.Tensor, residuals: torch.Tensor, point_mask: torch.Tensor) -> torch.Tensor:
         """
         使用SetTransformer编码残差点集 - 支持任意维度输入
         Args:
             x_values: (batch_size, num_points, input_dim) x值列表，input_dim可以是1,2,3,4...任意维度
             residuals: (batch_size, num_points) 残差值
+            point_mask: (batch_size, num_points) 点掩码，1表示真实点，0表示填充点
         Returns:
             condition: (batch_size, num_seeds, dim_hidden) 条件序列，不再是单个向量
         """
@@ -298,13 +330,13 @@ class SetTransformerConditionEncoder(nn.Module):
         # 使用温和的激活函数，避免极端输出
         x = torch.nn.functional.gelu(x) # 缩小输出范围
 
-        # 通过SetTransformer层
-        x = self.first_layer(x)
+        # 通过SetTransformer层，传递point_mask
+        x = self.first_layer(x, point_mask)
         for layer in self.middle_layers:
-            x = layer(x)
+            x = layer(x, point_mask)
 
         # 聚合 - 输出序列而非单个向量
-        x = self.pooling(x)  # (batch_size, num_seeds, dim_hidden)
+        x = self.pooling(x, point_mask)  # (batch_size, num_seeds, dim_hidden)
 
         # 不再展平和投影，直接返回序列
         # 这样每个 seed 都代表不同的特征簇，可以用于真正的交叉注意力

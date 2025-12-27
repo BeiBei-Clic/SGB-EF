@@ -361,6 +361,18 @@ class EditFlowManager:
             z_t, dataset.special_tokens_manager
         )
 
+        # 调试：验证训练时的序列格式（仅验证第一个批次）
+        if not hasattr(self, '_train_sequence_format_logged'):
+            bos_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
+            sample_idx = 0
+            if x_t[sample_idx, 0] == bos_token:
+                if self.accelerator.is_local_main_process:
+                    self.logger.log("TRAIN_SEQUENCE_FORMAT",
+                                   f"训练序列格式验证 | x_t[{sample_idx}, 0:5]={x_t[sample_idx, :5].tolist()} | "
+                                   f"BOS token在位置0={x_t[sample_idx, 0]}",
+                                   "train", level=2)
+                self._train_sequence_format_logged = True
+
         attention_mask = (~x_pad_mask).float()
         pred_rates, pred_ins_probs, pred_sub_probs = model(
             input_ids=x_t, time_steps=t, condition=condition_embeddings, attention_mask=attention_mask
@@ -471,7 +483,8 @@ class EditFlowManager:
                 self.logger.log("TOKEN_DECODE_Z0", "\n".join(z0_expressions), f"维度{dimension}", level=2)
                 self.logger.log("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", level=2)
 
-            condition_embeddings = condition_encoder(x_values, residuals)
+            point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
+            condition_embeddings = condition_encoder(x_values, residuals, point_mask)
 
             # 记录条件嵌入信息（每个batch都记录，用于调试NaN来源）
             if self.accelerator.is_local_main_process:
@@ -627,8 +640,9 @@ class EditFlowManager:
                 residuals = batch['residuals'].to(self.device)
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
+                point_mask = batch['point_mask'].to(self.device)
 
-                condition_embeddings = condition_encoder(x_values, residuals)
+                condition_embeddings = condition_encoder(x_values, residuals, point_mask)
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset, config)
 
                 # 尝试计算损失，如果包含NaN则跳过该批次
@@ -829,7 +843,9 @@ class EditFlowManager:
 
         # 计算残差：真实值 - 预测值
         residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
-        condition = condition_encoder(x_values, residuals)
+        # 创建全1mask（推理时使用的是原始数据，没有padding）
+        point_mask = torch.ones_like(residuals)
+        condition = condition_encoder(x_values, residuals, point_mask)
 
         # 记录初始数据
         self.logger.log("INITIAL_DATA",

@@ -118,7 +118,7 @@ class BeamSearchSymbolicRegression:
         """
         proposals = []
 
-        # 构建模型输入
+        # 构建模型输入 - 确保与训练时的序列格式完全一致
         tokenized_expr = self.special_tokens_manager.tokenize_expression(','.join(current_tokens))
         max_len = getattr(self.args, 'max_expr_length', 128)
 
@@ -128,8 +128,12 @@ class BeamSearchSymbolicRegression:
         bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
         pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
 
+        # 关键：必须添加 BOS token，与训练时的格式一致 [BOS] + tokens + [PAD]
         tokenized_expr = [bos_token] + tokenized_expr
         tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
+
+        # 验证 BOS token 在正确位置
+        assert tokenized_expr[0] == bos_token, f"BOS token 必须在位置0，但得到 {tokenized_expr[0]}"
 
         input_ids = torch.LongTensor([tokenized_expr]).to(self.device)
         attention_mask = (input_ids != pad_token).float().to(self.device)
@@ -147,8 +151,19 @@ class BeamSearchSymbolicRegression:
             lambda_sub = rates[0, :, 1].cpu().numpy()
             lambda_del = rates[0, :, 2].cpu().numpy()
 
+            # 调试：验证序列格式
             base_length = int(attention_mask[0].sum().item())
             effective_length = max(base_length, min(10, input_ids.size(1)))
+
+            # 调试：打印序列格式信息（仅在第一次调用时）
+            if not hasattr(self, '_sequence_format_logged'):
+                if self.logger and self._is_main_process():
+                    self.logger.log("SEQUENCE_FORMAT",
+                                   f"推理序列格式验证 | input_ids[0:5]={input_ids[0, :5].tolist()} | "
+                                   f"base_length={base_length} | effective_length={effective_length} | "
+                                   f"current_tokens={current_tokens[:3]}",
+                                   "beam_search", level=2)
+                self._sequence_format_logged = True
 
             # 生成insert操作提案
             for pos in range(1, effective_length):
@@ -226,7 +241,7 @@ class BeamSearchSymbolicRegression:
                           tokens: List[str],
                           x_data: np.ndarray,
                           y_data: np.ndarray) -> Tuple[bool, float, np.ndarray]:
-        """评估候选表达式
+        """评估候选表达式（支持常数优化）
 
         Args:
             tokens: token列表
@@ -237,17 +252,30 @@ class BeamSearchSymbolicRegression:
             (成功标志, MSE分数, 残差)
         """
         try:
-            from ..symbolic.symbolic_utils import evaluate_expression_safe, tree_to_expr
+            from ..symbolic.symbolic_utils import (
+                evaluate_expression_with_constants,
+                evaluate_expression_safe,
+                tree_to_expr
+            )
 
             expr_str = ','.join(tokens)
-            expr = tree_to_expr(expr_str)
 
-            success, y_pred = evaluate_expression_safe(expr, x_data)
-            if success:
-                y_pred_clipped = np.clip(y_pred, -self.numerical_clip_threshold, self.numerical_clip_threshold)
-                residuals = np.clip(y_data - y_pred_clipped, -self.numerical_clip_threshold, self.numerical_clip_threshold)
-                mse = np.mean((y_data - y_pred) ** 2)
-                return True, -mse, residuals  # 负MSE作为分数（越高越好）
+            # 使用常数优化评估表达式（修复常数token不可导问题）
+            success, optimized_expr, mse = evaluate_expression_with_constants(
+                tree_str=expr_str,
+                x_values=x_data,
+                y_values=y_data
+            )
+
+            if success and optimized_expr is not None:
+                # 用优化后的表达式重新计算预测值，获取residuals
+                success2, y_pred = evaluate_expression_safe(optimized_expr, x_data)
+                if success2:
+                    y_pred_clipped = np.clip(y_pred, -self.numerical_clip_threshold, self.numerical_clip_threshold)
+                    residuals = np.clip(y_data - y_pred_clipped, -self.numerical_clip_threshold, self.numerical_clip_threshold)
+                    return True, -mse, residuals  # 负MSE作为分数（越高越好）
+                else:
+                    return False, float('-inf'), None
             else:
                 return False, float('-inf'), None
         except Exception as e:
@@ -355,9 +383,13 @@ class BeamSearchSymbolicRegression:
 
                     # 更新条件嵌入
                     if success and new_residuals is not None:
+                        new_residuals_tensor = torch.FloatTensor(new_residuals).unsqueeze(0).to(self.device)
+                        # 创建全1mask（因为这些都是真实点，没有padding）
+                        new_point_mask = torch.ones_like(new_residuals_tensor)
                         new_condition = self.condition_encoder(
                             x_values,
-                            torch.FloatTensor(new_residuals).unsqueeze(0).to(self.device)
+                            new_residuals_tensor,
+                            new_point_mask
                         )
                     else:
                         new_condition = candidate.condition
