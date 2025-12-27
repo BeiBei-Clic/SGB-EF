@@ -136,6 +136,7 @@ class LlamaEditFlowBackbone(nn.Module):
             initializer_range=0.02,
             use_cache=False,  # 非自回归不需要缓存
             hidden_act="silu",  # SwiGLU使用SiLU
+            is_causal=False,  # 启用双向注意力（EditFlow需要非自回归的双向注意力）
         )
 
         self.vocab_size = vocab_size
