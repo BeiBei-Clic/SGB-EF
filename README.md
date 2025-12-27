@@ -68,10 +68,11 @@ tmux new -s my_session
 accelerate launch \
     --num_processes=3 \
     --num_machines=1 \
-    --mixed_precision=fp16 \
+    --mixed_precision=bf16 \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
+    --num_epochs 5 \
     --num_timesteps 10 \
     --num_samples 1000000\
     --batch_size 48

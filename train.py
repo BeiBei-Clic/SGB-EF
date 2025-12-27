@@ -86,7 +86,12 @@ def main():
     # 创建EditFlow管理器并开始训练
     manager = EditFlowManager(args)
 
-    manager.train()
+    try:
+        manager.train()
+    finally:
+        # 确保所有进程同步退出，避免资源泄漏警告
+        if hasattr(manager, 'accelerator'):
+            manager.accelerator.wait_for_everyone()
 
     # 只有在主进程才打印完成信息
     if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:

@@ -226,6 +226,21 @@ class LlamaEditFlowBackbone(nn.Module):
             nn.Linear(hidden_dim // 2, vocab_size)
         )
 
+        # 改进输出层初始化：使用较大的std避免logits过小
+        self._init_vocab_weights()
+
+    def _init_vocab_weights(self):
+        """改进词汇表输出层的初始化，避免softmax数值下溢"""
+        def init_fn(module):
+            if isinstance(module, nn.Linear):
+                # 使用较大的标准差初始化最后一层
+                nn.init.normal_(module.weight, mean=0.0, std=0.1)  # 比默认0.02大
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        self.ins_vocab_head.apply(init_fn)
+        self.sub_vocab_head.apply(init_fn)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -318,9 +333,11 @@ class LlamaEditFlowBackbone(nn.Module):
         # 应用注意力掩码
         if attention_mask is not None:
             invalid_mask = ~attention_mask.bool().unsqueeze(-1)
-            # 使用FP16兼容的负无穷值
-            ins_logits = ins_logits.masked_fill(invalid_mask, -1e4)
-            sub_logits = sub_logits.masked_fill(invalid_mask, -1e4)
+            # 使用dtype的真正负无穷值，确保softmax后概率接近0
+            float_type = ins_logits.dtype
+            min_val = torch.finfo(float_type).min / 2  # 留出余量避免数值问题
+            ins_logits = ins_logits.masked_fill(invalid_mask, min_val)
+            sub_logits = sub_logits.masked_fill(invalid_mask, min_val)
             ins_rate = ins_rate * attention_mask.unsqueeze(-1)
             del_rate = del_rate * attention_mask.unsqueeze(-1)
             sub_rate = sub_rate * attention_mask.unsqueeze(-1)

@@ -207,18 +207,27 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print("初始化tokenizer和模型...")
 
-        # 初始化tokenizer（仍然使用预训练模型的tokenizer，但仅用于分词）
-        # 注意：LLaMA EditFlow使用自定义架构，不加载预训练权重
-        model_name = getattr(self.args, 'base_model_name', "google-bert/bert-base-uncased")
-        cache_dir = getattr(self.args, 'cache_dir', "models/huggingface_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        # 使用符号回归专属的小词汇表分词器
+        # 不再依赖BERT的大词汇表，使用自定义的紧凑词汇表
+        from ..utils.special_tokens import SymbolicRegressionTokenizer, SymbolicVocab
+
+        tokenizer = SymbolicRegressionTokenizer(
+            max_dim=self.args.max_dim,
+            unk_token='<unk>',
+            pad_token='<pad>',
+            bos_token='<s>',
+            eos_token='</s>',
+            mask_token='<mask>'
+        )
 
         if self.accelerator.is_local_main_process:
-            print(f"正在加载tokenizer: {model_name} (仅用于分词，不使用预训练权重)")
-            print(f"模型缓存目录: {cache_dir}")
-        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-        if self.accelerator.is_local_main_process:
-            print(f"✓ Tokenizer加载完成，原始词表大小: {tokenizer.vocab_size}")
+            print(f"✓ 符号回归Tokenizer初始化完成")
+            print(f"  词汇表大小: {tokenizer.vocab_size} (符号回归专属小词汇表)")
+            print(f"  最大维度: {self.args.max_dim}")
+            print(f"  运算符: {len(SymbolicVocab.OPERATORS)}个 - {', '.join(SymbolicVocab.OPERATORS)}")
+            print(f"  函数: {len(SymbolicVocab.FUNCTIONS)}个 - {', '.join(SymbolicVocab.FUNCTIONS)}")
+            print(f"  特殊token: {len(SymbolicVocab.SPECIAL_TOKENS)}个")
+            print(f"  变量token: x0 ~ x{self.args.max_dim-1} (共{self.args.max_dim}个)")
 
         # 初始化特殊符号管理器并添加缺失的符号
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.args.max_dim)
@@ -554,58 +563,55 @@ class EditFlowManager:
                     # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
                     self.accelerator.backward(loss)
 
-                    # ✅ 移除手动判断累积步数的逻辑
-                    # accelerator.accumulate 会在适当的时机自动同步梯度并执行优化器步骤
-                    # 我们只需要在每次更新前进行梯度裁剪
-                    if self.accelerator.gradient_sync:  # 只在梯度同步时（即最后一次累积步）执行
-                        # 统一计算梯度范数并裁剪
-                        all_params = list(model.parameters()) + list(condition_encoder.parameters())
+                    # 记录梯度统计信息（用于调试NaN来源）
+                    # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
+                    all_params = list(model.parameters()) + list(condition_encoder.parameters())
 
-                        # 记录梯度统计信息（用于调试NaN来源）
-                        if self.accelerator.is_local_main_process:
-                            grad_max = 0.0
-                            grad_min = 0.0
-                            grad_has_nan = False
-                            for param in all_params:
-                                if param.grad is not None:
-                                    if torch.isnan(param.grad).any():
-                                        grad_has_nan = True
-                                        break
-                                    grad_max = max(grad_max, param.grad.abs().max().item())
-                                    grad_min = max(grad_min, param.grad.abs().min().item())
-                            self.logger.log("GRAD_STATS", f"max={grad_max:.6f} min={grad_min:.6f} has_nan={grad_has_nan}",
-                                            f"维度{dimension}_batch{batch_idx}", level=2)
-
-                        # 检查是否有NaN梯度 - 在gradient unscaling之前检查
-                        has_nan_grad = False
+                    if self.accelerator.is_local_main_process:
+                        grad_max = 0.0
+                        grad_min = 0.0
+                        grad_has_nan = False
                         for param in all_params:
-                            if param.grad is not None and torch.isnan(param.grad).any():
-                                has_nan_grad = True
-                                break
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any():
+                                    grad_has_nan = True
+                                    break
+                                grad_max = max(grad_max, param.grad.abs().max().item())
+                                grad_min = max(grad_min, param.grad.abs().min().item())
+                        self.logger.log("GRAD_STATS", f"max={grad_max:.6f} min={grad_min:.6f} has_nan={grad_has_nan}",
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
-                        if has_nan_grad:
-                            if self.accelerator.is_local_main_process:
-                                self.logger.error("GRAD_NAN", f"检测到NaN梯度，跳过此次更新", f"维度{dimension}_batch{batch_idx}")
-                            # 在 accumulate 上下文中不需要手动 zero_grad
-                            continue
+                    # 检查是否有NaN梯度
+                    has_nan_grad = False
+                    for param in all_params:
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            has_nan_grad = True
+                            break
 
-                        # 使用Accelerate的梯度裁剪（会自动处理混合精度）
-                        grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
-
-                        # 记录梯度范数
+                    if has_nan_grad:
                         if self.accelerator.is_local_main_process:
-                            self.logger.log("GRAD_NORM", f"grad_norm={grad_norm:.4f}",
-                                            f"维度{dimension}_batch{batch_idx}", level=2)
+                            self.logger.error("GRAD_NAN", f"检测到NaN梯度，跳过此次更新", f"维度{dimension}_batch{batch_idx}")
+                        # 在 accumulate 上下文中不需要手动 zero_grad，但需要跳过优化器步骤
+                        # 使用 continue 会导致 accumulate 上下文跳过 optimizer.step()
+                        continue
 
-                        # ✅ optimizer.step() 和 zero_grad() 由 accumulate 上下文自动处理
-                        # 不需要手动调用
+                    # 使用Accelerate的梯度裁剪（会自动处理混合精度）
+                    # accumulate 会在适当的时机自动调用这个裁剪
+                    grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
+
+                    # 记录梯度范数
+                    if self.accelerator.is_local_main_process:
+                        self.logger.log("GRAD_NORM", f"grad_norm={grad_norm:.4f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
+
+                    # ✅ optimizer.step() 和 zero_grad() 由 accumulate 上下文自动处理
+                    # 不需要手动调用
 
                 total_loss += loss.item()
                 num_batches += 1
 
-                # 只在主进程更新进度条显示
-                if self.accelerator.is_local_main_process and self.accelerator.gradient_sync:
-                    # 只在梯度同步时更新显示
+                # 更新进度条显示（每个batch都更新）
+                if self.accelerator.is_local_main_process:
                     postfix_dict = {
                         'loss': f'{loss.item():.4f}',
                         'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm:.3f}'
