@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
 
     # SetTransformer条件编码器参数
-    parser.add_argument("--condition_max_input_dim", type=int, default=6, help="SetTransformer支持的最大输入维度")
+    parser.add_argument("--condition_max_input_dim", type=int, default=3, help="SetTransformer支持的最大输入维度")
     parser.add_argument("--condition_dim_hidden", type=int, default=768, help="SetTransformer隐藏层维度（应匹配BERT的hidden_size）")
     parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 ")
     parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")

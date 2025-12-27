@@ -111,7 +111,7 @@ class SetTransformerConditionEncoder(nn.Module):
     """使用SetTransformer架构编码残差点集为条件向量"""
 
     def __init__(self,
-                 max_input_dim: int = 6,  # 支持的最大输入维度
+                 max_input_dim: int = 3,  # 支持的最大输入维度
                  dim_hidden: int = 128,
                  num_heads: int = 4,
                  num_inds: int = 32,
@@ -192,20 +192,22 @@ class SetTransformerConditionEncoder(nn.Module):
         if input_dim > self.max_input_dim:
             raise ValueError(f"输入维度 {input_dim} 超过了支持的最大维度 {self.max_input_dim}")
 
-        # 构建输入特征: (batch_size, num_points, input_dim + 1)
-        input_features = torch.cat([
-            x_values,  # (batch_size, num_points, input_dim)
-            residuals.unsqueeze(-1)  # (batch_size, num_points, 1)
-        ], dim=-1)  # (batch_size, num_points, input_dim + 1)
+        # 修复：构建固定对齐的输入特征
+        # 目标格式：[x0, x1, ..., xN, 0, ..., 0, residual]
+        #           ↑ 0..input_dim-1  ↑ input_dim..max_input_dim-1  ↑ max_input_dim
+        # 保证residual始终在最后一列（索引max_input_dim），避免语义混乱
+        input_features = torch.zeros(
+            batch_size, num_points, self.max_input_dim + 1,
+            device=x_values.device, dtype=x_values.dtype
+        )
 
-        # 填充到最大维度以匹配预创建的投影层
-        expected_dim = self.max_input_dim + 1
-        actual_dim = input_features.shape[-1]
-        if actual_dim < expected_dim:
-            padding_size = expected_dim - actual_dim
-            padding = torch.zeros(batch_size, num_points, padding_size,
-                                 device=x_values.device, dtype=x_values.dtype)
-            input_features = torch.cat([input_features, padding], dim=-1)
+        # 填充x值到前面的列
+        input_features[:, :, :input_dim] = x_values  # (batch_size, num_points, input_dim)
+
+        # 填充residual到最后一列（固定位置）
+        input_features[:, :, -1] = residuals  # (batch_size, num_points)
+
+        # 中间的列保持为0（自动padding）
 
         # 输入嵌入
         x = self.input_projection(input_features)  # (batch_size, num_points, dim_hidden)
@@ -239,7 +241,7 @@ class ConditionEncoder(SetTransformerConditionEncoder):
                  **kwargs):
         args = kwargs['args']
         transformer_params = {
-            'max_input_dim': getattr(args, 'condition_max_input_dim', 6),
+            'max_input_dim': getattr(args, 'condition_max_input_dim', 3),
             'dim_hidden': getattr(args, 'condition_dim_hidden', 128),
             'num_heads': getattr(args, 'condition_num_heads', 4),
             'num_inds': getattr(args, 'condition_num_inds', 32),

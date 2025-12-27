@@ -40,12 +40,18 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 class CrossAttentionConditionInjection(nn.Module):
     """
-    交叉注意力条件注入 - 让每个Query Token从条件序列中动态选择信息
+    交叉注意力条件注入 - 条件信息注入的唯一方式
+
+    设计说明:
+    - 不再使用Prefix Padding，避免与LLaMA自注意力的冗余
+    - Query 来自 LLaMA 的隐藏状态序列
+    - Key/Value 来自条件编码器输出的特征向量
+    - 每个 Query 可以从条件序列中动态选择需要的信息
 
     数学原理:
-    - Query 来自 LLaMA 的隐藏状态序列
-    - Key/Value 来自条件编码器输出的多个特征向量
-    - 每个 Query 可以从条件序列中关注不同的特征
+    - Query: LLaMA处理后的每个位置表示
+    - Key/Value: SetTransformer提取的条件特征
+    - 输出: 加权后的条件信息，通过残差连接注入
     """
     def __init__(self, hidden_dim, num_heads=8):
         super().__init__()
@@ -106,8 +112,13 @@ class LlamaEditFlowBackbone(nn.Module):
     - RoPE旋转位置编码
     - SwiGLU激活函数
     - 时间步注入
-    - 交叉注意力条件注入
+    - 交叉注意力条件注入（Cross-Attention，非Prefix）
     - 五头输出（插入率、删除率、替换率、插入词汇分布、替换词汇分布）
+
+    条件注入策略:
+    条件信息仅通过CrossAttention机制注入，不使用Prefix Padding。
+    这样可以避免双重条件注入的冗余，简化模型架构，减少参数量。
+    LLaMA的强大自注意力机制已经足够处理输入序列内部的复杂关系。
     """
 
     def __init__(
@@ -131,7 +142,7 @@ class LlamaEditFlowBackbone(nn.Module):
             intermediate_size=hidden_dim * 4,  # SwiGLU的中间维度
             num_hidden_layers=n_layers,
             num_attention_heads=n_heads,
-            max_position_embeddings=max_seq_len + 32,  # 预留空间给条件token
+            max_position_embeddings=max_seq_len,  # 条件通过交叉注意力注入，无需预留空间
             rms_norm_eps=1e-6,
             initializer_range=0.02,
             use_cache=False,  # 非自回归不需要缓存
@@ -165,6 +176,7 @@ class LlamaEditFlowBackbone(nn.Module):
         )
 
         # 4. 条件投影 (SetTransformer输出 -> hidden_dim)
+        # 注意：条件仅通过交叉注意力注入，不再作为前缀token
         if condition_dim != hidden_dim:
             self.cond_proj = nn.Linear(condition_dim, hidden_dim)
         else:
@@ -269,35 +281,24 @@ class LlamaEditFlowBackbone(nn.Module):
         # 注意：LLaMA默认使用因果掩码，但EditFlow需要双向注意力
         # 因此我们需要创建全1的attention_mask来禁用因果掩码
         if attention_mask is not None:
-            # 扩展attention_mask以包含条件token
-            num_cond_tokens = condition_proj.shape[1]
-            cond_mask = torch.ones(batch_size, num_cond_tokens,
-                                  device=attention_mask.device,
-                                  dtype=attention_mask.dtype)
-            full_attention_mask = torch.cat([cond_mask, attention_mask], dim=1)
-
             # 将0/1掩码转换为LLaMA需要的格式
             # LLaMA使用bool掩码，True表示可以attend
-            full_attention_mask = full_attention_mask.bool()
+            attention_mask = attention_mask.bool()
         else:
-            num_cond_tokens = condition_proj.shape[1]
-            full_attention_mask = torch.ones(batch_size, seq_len + num_cond_tokens,
-                                           device=input_ids.device, dtype=torch.bool)
+            attention_mask = torch.ones(batch_size, seq_len,
+                                       device=input_ids.device, dtype=torch.bool)
 
-        # 将条件token作为前缀添加到输入
-        combined_embeds = torch.cat([condition_proj, inputs_embeds], dim=1)
-
-        # E. LLaMA前向传播
+        # E. LLaMA前向传播（直接使用inputs_embeds，不拼接条件token）
         outputs = self.backbone(
-            inputs_embeds=combined_embeds,
-            attention_mask=full_attention_mask,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             output_hidden_states=True
         )
 
-        # F. 获取隐藏状态（跳过条件token部分）
-        hidden_states = outputs.last_hidden_state[:, num_cond_tokens:, :]  # (batch_size, seq_len, hidden_dim)
+        # F. 获取隐藏状态
+        hidden_states = outputs.last_hidden_state  # (batch_size, seq_len, hidden_dim)
 
-        # G. 条件注入（可选）
+        # G. 条件注入（通过交叉注意力）
         if self.use_condition_injection:
             hidden_states = self.condition_layer_norm(
                 hidden_states + self.condition_injection(hidden_states, condition_proj)
