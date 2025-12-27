@@ -48,8 +48,9 @@ class EditFlowManager:
         self.args = args
 
         # 初始化 Accelerate - 自动处理分布式训练设置
+        # 注意：mixed_precision 由 accelerate launch 命令行参数控制
+        # 不要在代码中硬编码，否则会覆盖命令行的 --mixed_precision=bf16 设置
         self.accelerator = Accelerator(
-            mixed_precision='fp16' if getattr(args, 'use_fp16', True) else 'no',
             gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
             log_with=getattr(args, 'log_with', None)
         )

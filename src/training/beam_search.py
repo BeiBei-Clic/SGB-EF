@@ -166,12 +166,50 @@ class BeamSearchSymbolicRegression:
                 self._sequence_format_logged = True
 
             # 生成insert操作提案
+            # 关键修复：训练-推理索引对齐
+            # 训练时(fill_gap_tokens_with_repeats)：
+            #   - z_t = [<s>, <gap>, add, ...]
+            #   - <gap>位置使用前一个非gap位置的预测
+            #   - 在最开头的<gap>使用位置0(<s>)的预测
+            # 推理时应该保持一致：
+            #   - 在最开头插入时，使用BOS的预测
+            #   - 在其他位置插入时，使用前一个token的预测
             seq_len = min(effective_length, lambda_ins.shape[0])
-            for pos in range(1, seq_len):
-                if pos < lambda_ins.shape[0] and lambda_ins[pos] > self.min_action_score:
-                    insert_pos = pos - 1
+
+            # 特殊情况：在最开头插入时，使用BOS的预测（位置0）
+            if 0 < lambda_ins.shape[0] and lambda_ins[0] > self.min_action_score:
+                insert_pos = 0  # 在current_tokens最前面插入
+                top_k_tokens = top_k if top_k else insert_probs.shape[2]
+                # 使用位置0（BOS）的预测
+                top_tokens = torch.topk(insert_probs[0, 0], min(top_k_tokens, insert_probs.shape[2]))
+
+                for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
+                    token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
+
+                    if valid_variables is not None:
+                        if token_name.startswith('x') and token_name not in valid_variables:
+                            continue
+
+                    new_tokens = current_tokens.copy()
+                    new_tokens.insert(insert_pos, token_name)
+
+                    proposals.append(ActionProposal(
+                        action_type='insert',
+                        position=insert_pos,
+                        token=token_name,
+                        score=lambda_ins[0] * prob.item(),
+                        new_tokens=new_tokens
+                    ))
+
+            # 遍历每个token位置（在current_tokens中的索引）
+            # 在位置p之后插入，使用input_ids[p+1]的预测（因为input_ids[0]是BOS）
+            for current_token_pos in range(len(current_tokens)):
+                input_ids_pos = current_token_pos + 1  # +1因为input_ids[0]是BOS
+                if input_ids_pos < lambda_ins.shape[0] and lambda_ins[input_ids_pos] > self.min_action_score:
+                    insert_pos = current_token_pos  # 在current_tokens[current_token_pos]之后插入
                     top_k_tokens = top_k if top_k else insert_probs.shape[2]
-                    top_tokens = torch.topk(insert_probs[0, pos], min(top_k_tokens, insert_probs.shape[2]))
+                    # 使用input_ids[input_ids_pos]的预测
+                    top_tokens = torch.topk(insert_probs[0, input_ids_pos], min(top_k_tokens, insert_probs.shape[2]))
 
                     for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
                         token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
