@@ -580,5 +580,98 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] TIMEOUT: Sample generation exceeded {timeout_seconds}s"
         self._write(msg, self.SAMPLE_LOG)
 
+    # ==================== 束搜索推理日志 ====================
+
+    def log_beam_search_separator(self, title="", level=2):
+        """记录分隔线
+
+        Args:
+            title: 标题
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        separator = "=" * 80
+        if title:
+            msg = separator
+            self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
+            self.log("BEAM_SEARCH", title, "beam_search", level=level)
+        else:
+            msg = separator
+            self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
+
+    def log_beam_search_insert_probs(self, position, lambda_rate, tokens, probs, level=2):
+        """记录插入操作的预测概率
+
+        Args:
+            position: 位置索引
+            lambda_rate: 插入速率
+            tokens: token列表
+            probs: 概率列表
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        tokens_str = str(tokens)
+        probs_str = [f"{p:.6f}" for p in probs]
+        self.log("INSERT_PROBS_DEBUG",
+                f"位置{position}: lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
+                "beam_search", level=level)
+
+    def log_beam_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=2):
+        """记录替换操作的预测概率
+
+        Args:
+            position: 位置索引
+            current_token: 当前token
+            lambda_rate: 替换速率
+            tokens: token列表
+            probs: 概率列表
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        tokens_str = str(tokens)
+        probs_str = [f"{p:.6f}" for p in probs]
+        self.log("SUBSTITUTE_PROBS_DEBUG",
+                f"位置{position}(当前={current_token}): lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
+                "beam_search", level=level)
+
+    def log_beam_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=2):
+        """记录删除操作的预测概率
+
+        Args:
+            position: 位置索引
+            current_token: 当前token
+            lambda_rate: 删除速率
+            above_threshold: 是否超过阈值
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        self.log("DELETE_PROBS_DEBUG",
+                f"位置{position}(当前={current_token}): lambda_del={lambda_rate:.4f} | above_threshold={above_threshold}",
+                "beam_search", level=level)
+
+    def log_beam_search_token_type_stats(self, token_categories, level=2):
+        """记录词汇类型的预测统计
+
+        Args:
+            token_categories: 字典，键为类型名，值为[(token, prob), ...]列表
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        for category_name, token_probs in token_categories.items():
+            if token_probs:
+                # 只显示前5个
+                top_tokens = [(t, f"{p:.6f}") for t, p in token_probs[:5]]
+                self.log("TOKEN_TYPE_STATS", f"{category_name}: {top_tokens}", "beam_search", level=level)
+
 
 __all__ = ['Logger']

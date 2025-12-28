@@ -190,16 +190,16 @@ class BeamSearchSymbolicRegression:
                                    "beam_search", level=2)
                 self._sequence_format_logged = True
 
-            # 调试：打印top-5插入概率和token（仅在第一次调用时）
+            # 调试：打印top-10插入概率和token（仅在第一次调用时）
             if not hasattr(self, '_insert_probs_logged'):
                 if self.logger and self._is_main_process():
+                    self.logger.log_beam_search_separator("插入操作详细预测信息（前3个位置）", level=2)
                     for i in range(min(3, effective_length)):
-                        top5 = torch.topk(insert_probs[0, i], 5)
-                        tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top5.indices]
-                        probs = top5.values.tolist()
-                        self.logger.log("INSERT_PROBS_DEBUG",
-                                       f"位置{i}: lambda={lambda_ins[i]:.4f} | top5_tokens={tokens} | top5_probs={probs}",
-                                       "beam_search", level=2)
+                        top10 = torch.topk(insert_probs[0, i], 10)
+                        tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
+                        probs = top10.values.tolist()
+                        self.logger.log_beam_search_insert_probs(i, lambda_ins[i], tokens, probs, level=2)
+                    self.logger.log_beam_search_separator(level=2)
                 self._insert_probs_logged = True
 
             # 生成insert操作提案
@@ -272,6 +272,22 @@ class BeamSearchSymbolicRegression:
 
             # 生成substitute操作提案
             seq_len = min(effective_length, lambda_sub.shape[0])
+
+            # 调试：打印top-10替换概率和token（仅在第一次调用时）
+            if not hasattr(self, '_substitute_probs_logged'):
+                if self.logger and self._is_main_process():
+                    self.logger.log_beam_search_separator("替换操作详细预测信息（前3个token位置）", level=2)
+                    for idx in range(min(3, len(current_tokens))):
+                        pos = idx + 1  # +1因为input_ids[0]是BOS
+                        if pos < substitute_probs.shape[1]:
+                            top10 = torch.topk(substitute_probs[0, pos], 10)
+                            tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
+                            probs = top10.values.tolist()
+                            current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
+                            self.logger.log_beam_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=2)
+                    self.logger.log_beam_search_separator(level=2)
+                self._substitute_probs_logged = True
+
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
                 if pos < lambda_sub.shape[0] and current_token_idx < len(current_tokens) and lambda_sub[pos] > self.min_action_score:
@@ -299,6 +315,20 @@ class BeamSearchSymbolicRegression:
 
             # 生成delete操作提案
             seq_len = min(effective_length, lambda_del.shape[0])
+
+            # 调试：打印删除速率信息（仅在第一次调用时）
+            if not hasattr(self, '_delete_probs_logged'):
+                if self.logger and self._is_main_process():
+                    self.logger.log_beam_search_separator("删除操作详细预测信息（所有token位置）", level=2)
+                    for idx in range(len(current_tokens)):
+                        pos = idx + 1  # +1因为input_ids[0]是BOS
+                        if pos < lambda_del.shape[0]:
+                            current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
+                            self.logger.log_beam_search_delete_probs(idx, current_token, lambda_del[pos],
+                                                                    lambda_del[pos] > self.min_action_score, level=2)
+                    self.logger.log_beam_search_separator(level=2)
+                self._delete_probs_logged = True
+
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
                 if pos < lambda_del.shape[0] and current_token_idx < len(current_tokens) and lambda_del[pos] > self.min_action_score:
@@ -323,6 +353,52 @@ class BeamSearchSymbolicRegression:
         insert_count = sum(1 for p in proposals if p.action_type == 'insert')
         delete_count = sum(1 for p in proposals if p.action_type == 'delete')
         substitute_count = sum(1 for p in proposals if p.action_type == 'substitute')
+
+        # 新增：统计不同词汇类型的预测概率（仅在第一次调用时）
+        if not hasattr(self, '_token_type_stats_logged'):
+            if self.logger and self._is_main_process():
+                # 获取词汇表
+                vocab = self.tokenizer.get_vocab()
+
+                # 定义词汇类型分类
+                operators = ['add', 'sub', 'mul', 'div', 'pow']
+                functions = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
+                variables = [f'x{i}' for i in range(10)]  # 假设最多10个变量
+                constants = ['constant']
+
+                # 统计插入操作中不同类型的平均概率
+                self.logger.log_beam_search_separator("词汇类型预测统计（基于位置0的插入预测）", level=2)
+
+                if 0 < insert_probs.shape[1]:
+                    # 获取位置0的top-20预测
+                    top20 = torch.topk(insert_probs[0, 0], min(20, insert_probs.shape[2]))
+
+                    # 分类统计
+                    token_categories = {
+                        '运算符': [],
+                        '函数': [],
+                        '变量': [],
+                        '常数': [],
+                        '其他': []
+                    }
+
+                    for token_idx, prob in zip(top20.indices, top20.values):
+                        token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
+                        if token_name in operators:
+                            token_categories['运算符'].append((token_name, prob.item()))
+                        elif token_name in functions:
+                            token_categories['函数'].append((token_name, prob.item()))
+                        elif token_name in variables:
+                            token_categories['变量'].append((token_name, prob.item()))
+                        elif token_name in constants:
+                            token_categories['常数'].append((token_name, prob.item()))
+                        else:
+                            token_categories['其他'].append((token_name, prob.item()))
+
+                    # 输出统计结果
+                    self.logger.log_beam_search_token_type_stats(token_categories, level=2)
+                    self.logger.log_beam_search_separator(level=2)
+            self._token_type_stats_logged = True
 
         if self.logger and self._is_main_process():
             self.logger.log("ACTION_PROPOSALS_GENERATED",
