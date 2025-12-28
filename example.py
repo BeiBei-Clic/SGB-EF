@@ -132,18 +132,17 @@ def main():
     sample['exp_gt'] = new_expr_gt
 
     # 模型路径
-    model_path = "checkpoints/continuous_flow_final"
+    model_path = "checkpoints/checkpoint_epoch_5"
 
     # 执行符号回归（使用重新组织后的数据）
-    # 使用束搜索来扩大搜索范围，提高发现更好表达式的概率
-    logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 30 | 束大小: 5", "example")
+    # 使用简单推理（贪婪搜索）单纯依赖模型的编辑动作
+    logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 10 | 方法: 贪婪搜索", "example")
 
     predicted_expression = manager.symbolic_regression(
         model_path=model_path,
         x_data=x_data_reorganized,  # 使用重新组织后的数据
         y_data=y_data,
-        n_steps=10,      # 推理步数
-        beam_size=2      # 束搜索宽度，每步保留5个最佳候选
+        n_steps=20      # 推理步数
     )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")

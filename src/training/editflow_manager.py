@@ -24,7 +24,7 @@ from ..modeling.llama_editflow import EditFlowTransformer, LlamaEditFlowConfig
 from ..utils.gpu_monitor import get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
-from .beam_search import BeamSearchSymbolicRegression, BeamCandidate
+from .beam_search import BeamSearchSymbolicRegression, BeamCandidate, SimpleSymbolicRegression
 
 
 class EditFlowManager:
@@ -807,8 +807,8 @@ class EditFlowManager:
 
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, beam_size=5):
-        """符号回归 - 使用束搜索接收数据点对，输出表达式
+    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None):
+        """符号回归 - 使用简单推理(贪婪搜索)接收数据点对，输出表达式
 
         Args:
             model_path: 模型检查点路径
@@ -817,11 +817,10 @@ class EditFlowManager:
             n_steps: 推理步数
             input_dim: 输入维度，如果为None则自动推断
             max_expr_length: 表达式最大token长度，如果为None则使用args中的值
-            beam_size: 束搜索宽度，保留的候选数量
         """
         # 记录开始
         self.logger.log("SYMBOLIC_REGRESSION_START",
-                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | beam_size={beam_size}",
+                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | n_steps={n_steps}",
                        "inference", level=1)
 
         # 加载模型
@@ -902,10 +901,10 @@ class EditFlowManager:
         special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=actual_max_dim)
         special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
 
-        # 创建束搜索推理器
-        self.logger.log("BEAM_SEARCH_INIT", f"初始化束搜索推理器 | beam_size={beam_size}, n_steps={n_steps}", "inference", level=1)
+        # 创建简单推理器
+        self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=1)
 
-        beam_searcher = BeamSearchSymbolicRegression(
+        simple_searcher = SimpleSymbolicRegression(
             model=model,
             condition_encoder=condition_encoder,
             tokenizer=tokenizer,
@@ -917,33 +916,28 @@ class EditFlowManager:
             max_expression_length=self.MAX_EXPRESSION_LENGTH,
             numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
         )
-        # 传递accelerator用于日志判断
-        beam_searcher.accelerator = self.accelerator
 
-        # 执行束搜索
+        # 执行贪婪搜索
         initial_residuals_np = residuals.cpu().squeeze(0).numpy()
-        best_candidate, all_candidates = beam_searcher.beam_search(
+        best_candidate = simple_searcher.greedy_search(
             initial_tokens=current_tokens,
             initial_condition=condition,
             initial_residuals=initial_residuals_np,
             x_data=x_data,
             y_data=y_data,
             x_values=x_values,
-            n_steps=n_steps,
-            beam_size=beam_size,
-            top_k_actions=10  # 每步考虑top-10操作
+            n_steps=n_steps
         )
 
-        # 返回MSE最佳候选的表达式
+        # 返回最佳候选的表达式
         final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
 
         if best_candidate and self.accelerator.is_local_main_process:
-            # 记录MSE分数而不是操作分数
+            # 记录MSE分数
             mse_score = getattr(best_candidate, 'mse_score', None)
             mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
-            self.logger.log("BEAM_SEARCH_RESULT",
+            self.logger.log("SIMPLE_SEARCH_RESULT",
                            f"MSE分数: {mse_str} | "
-                           f"探索候选数: {len(all_candidates) if all_candidates else 0} | "
                            f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
                            "inference", level=1)
 

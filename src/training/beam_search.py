@@ -726,3 +726,201 @@ class BeamSearchSymbolicRegression:
         if hasattr(self, 'accelerator') and self.accelerator is not None:
             return self.accelerator.is_local_main_process
         return True
+
+
+class SimpleSymbolicRegression:
+    """简单符号回归推理器 - 使用贪婪搜索(每次选择最佳操作)"""
+
+    def __init__(self,
+                 model,
+                 condition_encoder,
+                 tokenizer,
+                 special_tokens_manager,
+                 device,
+                 args,
+                 logger,
+                 min_action_score=0.01,
+                 max_expression_length=50,
+                 numerical_clip_threshold=1e6):
+        """初始化简单推理器
+
+        Args:
+            model: EditFlow模型
+            condition_encoder: 条件编码器
+            tokenizer: 分词器
+            special_tokens_manager: 特殊token管理器
+            device: 计算设备
+            args: 参数配置
+            logger: 日志记录器
+            min_action_score: 最小操作分数阈值
+            max_expression_length: 表达式最大长度
+            numerical_clip_threshold: 数值裁剪阈值
+        """
+        self.model = model
+        self.condition_encoder = condition_encoder
+        self.tokenizer = tokenizer
+        self.special_tokens_manager = special_tokens_manager
+        self.device = device
+        self.args = args
+        self.logger = logger
+        self.min_action_score = min_action_score
+        self.max_expression_length = max_expression_length
+        self.numerical_clip_threshold = numerical_clip_threshold
+
+        # 复用BeamSearchSymbolicRegression的方法
+        self._beam_searcher = BeamSearchSymbolicRegression(
+            model=model,
+            condition_encoder=condition_encoder,
+            tokenizer=tokenizer,
+            special_tokens_manager=special_tokens_manager,
+            device=device,
+            args=args,
+            logger=logger,
+            min_action_score=min_action_score,
+            max_expression_length=max_expression_length,
+            numerical_clip_threshold=numerical_clip_threshold
+        )
+
+    def greedy_search(self,
+                      initial_tokens: List[str],
+                      initial_condition: torch.Tensor,
+                      initial_residuals: np.ndarray,
+                      x_data: np.ndarray,
+                      y_data: np.ndarray,
+                      x_values: torch.Tensor,
+                      n_steps: int,
+                      valid_variables: Optional[List[str]] = None) -> BeamCandidate:
+        """执行贪婪搜索推理
+
+        每一步选择模型预测的最佳操作并执行,不维护多个候选
+
+        Args:
+            initial_tokens: 初始token列表
+            initial_condition: 初始条件嵌入
+            initial_residuals: 初始残差
+            x_data: 输入x数据
+            y_data: 目标y数据
+            x_values: 输入x的tensor形式
+            n_steps: 推理步数
+            valid_variables: 有效的变量token列表（如 ['x0', 'x1']），如果为None则从x_data推断
+
+        Returns:
+            最佳候选
+        """
+        # 如果没有提供有效变量列表，从x_data推断
+        if valid_variables is None:
+            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
+            valid_variables = [f'x{i}' for i in range(input_dim)]
+
+        # 记录有效变量信息
+        if self.logger and self._is_main_process():
+            self.logger.log("VALID_VARIABLES",
+                           f"贪婪搜索初始化 | input_dim={input_dim if len(x_data.shape) > 1 else 1} | "
+                           f"valid_variables={valid_variables}",
+                           "greedy_search", level=1)
+            print(f"\n开始贪婪搜索推理 (共{n_steps}步)")
+            print(f"初始表达式: {','.join(initial_tokens)}")
+
+        # 初始化当前候选
+        current_candidate = BeamCandidate(
+            tokens=initial_tokens.copy(),
+            score=0.0,
+            condition=initial_condition,
+            residuals=initial_residuals
+        )
+
+        # 记录操作历史
+        history = []
+
+        for step in range(n_steps):
+            t = 0.1 + 0.9 * step / n_steps
+
+            if self.logger and self._is_main_process():
+                print(f"\n步骤 {step + 1}/{n_steps}")
+                print(f"当前表达式: {','.join(current_candidate.tokens)}")
+
+            # 为当前候选生成操作提案
+            proposals = self._beam_searcher.generate_action_proposals(
+                current_tokens=current_candidate.tokens,
+                condition=current_candidate.condition,
+                x_values=x_values,
+                t=t,
+                top_k=None,  # 获取所有操作提案
+                valid_variables=valid_variables,
+                step=step
+            )
+
+            if not proposals:
+                if self.logger and self._is_main_process():
+                    print(f"没有找到有效操作,提前终止")
+                    self.logger.log("GREEDY_SEARCH_STOP",
+                                   f"step={step} | 没有找到有效操作,提前终止",
+                                   "greedy_search", level=2)
+                break
+
+            # 选择分数最高的操作
+            best_proposal = proposals[0]
+            action_desc = f"{best_proposal.action_type}@{best_proposal.position}"
+            if best_proposal.token:
+                action_desc += f":{best_proposal.token}"
+            action_desc += f"(score={best_proposal.score:.4f})"
+
+            history.append(action_desc)
+
+            if self.logger and self._is_main_process():
+                print(f"执行操作: {action_desc}")
+                self.logger.log("GREEDY_SEARCH_ACTION",
+                               f"step={step} | action={action_desc} | "
+                               f"old_expr={','.join(current_candidate.tokens)} | "
+                               f"new_expr={','.join(best_proposal.new_tokens)}",
+                               "greedy_search", level=2)
+
+            # 更新当前候选
+            current_candidate = BeamCandidate(
+                tokens=best_proposal.new_tokens,
+                score=current_candidate.score + best_proposal.score,
+                condition=current_candidate.condition,
+                residuals=current_candidate.residuals,
+                history=history.copy()
+            )
+
+            # 更新残差（可选:重新计算条件嵌入）
+            # 这里保持简单,不重新计算条件嵌入
+
+        # 评估最终表达式的MSE
+        if self.logger and self._is_main_process():
+            print(f"\n贪婪搜索完成")
+            print(f"最终表达式: {','.join(current_candidate.tokens)}")
+
+        # 评估MSE
+        success, expr_mse_score, _ = self._beam_searcher.evaluate_candidate(
+            tokens=current_candidate.tokens,
+            x_data=x_data,
+            y_data=y_data,
+            step=n_steps,
+            candidate_id="final"
+        )
+
+        if success:
+            current_candidate.mse_score = -expr_mse_score  # 转换为正MSE
+            if self.logger and self._is_main_process():
+                print(f"最终MSE: {current_candidate.mse_score:.6f}")
+                self.logger.log("GREEDY_SEARCH_COMPLETE",
+                               f"tokens={','.join(current_candidate.tokens)} | "
+                               f"MSE={current_candidate.mse_score:.6f} | "
+                               f"总操作数={len(history)}",
+                               "inference", level=1)
+        else:
+            if self.logger and self._is_main_process():
+                print(f"无法评估最终表达式的MSE")
+                self.logger.log("GREEDY_SEARCH_FAILED",
+                               f"无法评估最终表达式 | tokens={','.join(current_candidate.tokens)}",
+                               "inference", level=1)
+
+        return current_candidate
+
+    def _is_main_process(self):
+        """检查是否为主进程"""
+        if hasattr(self._beam_searcher, 'accelerator') and self._beam_searcher.accelerator is not None:
+            return self._beam_searcher.accelerator.is_local_main_process
+        return True
