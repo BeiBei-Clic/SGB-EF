@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--max_dim", type=int, default=3, help="最大输入维度")
     parser.add_argument("--n_points", type=int, default=100, help="数据点数量")
     parser.add_argument("--max_depth", type=int, default=6, help="表达式最大深度")
-    parser.add_argument("--max_expr_length", type=int, default=12, help="表达式最大token长度")
+    parser.add_argument("--max_expr_length", type=int, default=24, help="表达式最大token长度")
     parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
 

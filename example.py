@@ -85,7 +85,7 @@ def main():
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 12, # 最大表达式长度
+        'max_expr_length': 24, # 最大表达式长度
         "num_timesteps": 1,
         # LLaMA模型架构参数
         'hidden_dim': 512,  # LLaMA隐藏层维度 (匹配checkpoint)
@@ -132,7 +132,7 @@ def main():
     sample['exp_gt'] = new_expr_gt
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_5"
+    model_path = "checkpoints/continuous_flow_final"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用束搜索来扩大搜索范围，提高发现更好表达式的概率
