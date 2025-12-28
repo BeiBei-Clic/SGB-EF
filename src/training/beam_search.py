@@ -1,5 +1,11 @@
 """
 简单推理模块 - 用于符号回归推理的贪婪搜索算法
+
+架构说明（v2.0 - 迭代优化模式）:
+- 推理时固定 t=0，与训练时完全一致
+- 条件编码器使用目标值y_target（北极星模式）
+- 每步都从"当前状态"预测"如何编辑到目标状态"
+- 移除了旧架构的"渐进式时间步"逻辑
 """
 
 import torch
@@ -59,7 +65,13 @@ class ActionProposal:
 
 
 class SimpleSymbolicRegression:
-    """简单符号回归推理器 - 使用贪婪搜索(每次选择最佳操作)"""
+    """简单符号回归推理器 - 使用贪婪搜索(每次选择最佳操作)
+
+    架构v2.0更新：
+    - 推理时固定 t=0（与训练一致），不再使用渐进式时间步
+    - 条件嵌入使用目标值y_target，在整个推理过程中保持恒定
+    - 模型学习"从当前状态到目标状态的直接编辑"
+    """
 
     def __init__(self,
                  model,
@@ -484,14 +496,19 @@ class SimpleSymbolicRegression:
                       x_values: torch.Tensor,
                       n_steps: int,
                       valid_variables: Optional[List[str]] = None) -> BeamCandidate:
-        """执行贪婪搜索推理
+        """执行贪婪搜索推理（架构v2.0 - 固定t=0模式）
 
         每一步选择模型预测的最佳操作并执行,不维护多个候选
 
+        架构关键改进：
+        - 固定 t=0：与训练时完全一致，避免分布漂移
+        - 恒定条件：initial_condition在推理过程中不变（北极星模式）
+        - 简化逻辑：不再需要渐进式时间步调度
+
         Args:
             initial_tokens: 初始token列表
-            initial_condition: 初始条件嵌入
-            initial_residuals: 初始残差
+            initial_condition: 初始条件嵌入（使用y_target生成，恒定不变）
+            initial_residuals: 初始残差（仅用于日志，不作为条件）
             x_data: 输入x数据
             y_data: 目标y数据
             x_values: 输入x的tensor形式
@@ -527,10 +544,11 @@ class SimpleSymbolicRegression:
         history = []
 
         for step in range(n_steps):
-            t = 0.1 + 0.9 * step / n_steps
+            # 关键修复：使用固定的 t=0，与训练时保持一致（架构v2.0 - 迭代优化模式）
+            t = 0.0  # 不再使用 t = 0.1 + 0.9 * step / n_steps
 
             if self.logger and self._is_main_process():
-                print(f"\n步骤 {step + 1}/{n_steps}")
+                print(f"\n步骤 {step + 1}/{n_steps} (架构v2.0: t固定为0)")
                 print(f"当前表达式: {','.join(current_candidate.tokens)}")
 
                 # 记录残差信息
@@ -594,16 +612,18 @@ class SimpleSymbolicRegression:
                                "greedy_search", level=2)
 
             # 更新当前候选
+            # 注意：不重新计算条件嵌入（架构v2.0：条件恒定）
             current_candidate = BeamCandidate(
                 tokens=best_proposal.new_tokens,
                 score=current_candidate.score + best_proposal.score,
-                condition=current_candidate.condition,
-                residuals=current_candidate.residuals,
+                condition=current_candidate.condition,  # 条件保持恒定
+                residuals=current_candidate.residuals,   # 残差仅用于日志
                 history=history.copy()
             )
 
-            # 更新残差（可选:重新计算条件嵌入）
-            # 这里保持简单,不重新计算条件嵌入
+            # 架构v2.0：不重新计算条件嵌入（北极星模式）
+            # 旧架构：每步重新计算残差和条件（导致分布漂移）
+            # 新架构：条件恒定，避免分布漂移，提供稳定的优化方向
 
         # 评估最终表达式的MSE
         if self.logger and self._is_main_process():

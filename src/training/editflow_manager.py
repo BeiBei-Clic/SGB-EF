@@ -306,74 +306,52 @@ class EditFlowManager:
 
   
     def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info=None):
-        # 多时间步采样参数
-        num_timesteps = self.args.num_timesteps  # 使用命令行参数值
+        """
+        修改后的前向传播：移除中间状态插值，直接预测从z0到z1的编辑操作
+        这将模型从"连续流匹配"转变为"迭代优化"架构
+        """
+        batch_size = z0_token_ids.size(0)
 
-        original_batch_size = z0_token_ids.size(0)
+        # 设置时间步为0，表示我们在起点（z0状态）
+        # 这样模型学习的是"从当前状态到目标状态的编辑"，而非任意时刻的流速
+        t = torch.zeros(batch_size, 1, device=self.device)
 
-
-        # 为每个样本采样多个时间步
-        t = torch.rand(original_batch_size, num_timesteps, 1, device=self.device)  # [B, K, 1]
-
-        # 扩展条件嵌入到多时间步
-        # condition_embeddings: [B, num_seeds, D] -> [B, K, num_seeds, D] -> [B*K, num_seeds, D]
-        if condition_embeddings.dim() == 3:
-            # 新格式：序列形式
-            num_seeds = condition_embeddings.shape[1]
-            condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1, -1)
-            condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, num_seeds, -1)
-        else:
-            # 旧格式：[B, D] -> [B, K, D]
-            condition_embeddings = condition_embeddings.unsqueeze(1).expand(-1, num_timesteps, -1)
-            condition_embeddings = condition_embeddings.reshape(original_batch_size * num_timesteps, -1)
-
-        # 扩展token序列到多时间步
-        # z0_token_ids: [B, L] -> [B*K, L]
-        z0_token_ids_expanded = z0_token_ids.unsqueeze(1).expand(-1, num_timesteps, -1).contiguous()
-        z1_token_ids_expanded = z1_token_ids.unsqueeze(1).expand(-1, num_timesteps, -1).contiguous()
-
-        # 重塑为标准批次格式
-        z0_token_ids = z0_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
-        z1_token_ids = z1_token_ids_expanded.reshape(original_batch_size * num_timesteps, -1)
-        t = t.reshape(original_batch_size * num_timesteps, -1)
-
-        batch_size = z0_token_ids.size(0)  # 更新batch_size为扩展后的大小
-
-        # z0 token序列转换为概率分布
+        # 直接使用z0作为输入状态（不再插值生成中间状态z_t）
         batch_size, seq_len = z0_token_ids.shape
         z0_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z0_token_ids.device)
         z0_probs.scatter_(2, z0_token_ids.unsqueeze(-1), 1.0)
 
-        # z1 token序列转换为概率分布
-        batch_size, seq_len = z1_token_ids.shape
+        # z1 token序列用于计算目标编辑操作
         z1_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
-        # 记录多时间步采样信息（仅在第一个batch时）
+        # 记录修改后的训练信息（仅在第一个batch时）
         if debug_info and debug_info.get('is_first_batch', False) and self.accelerator.is_local_main_process:
             context = debug_info.get('context', '')
-            self.logger.log("MULTI_TIMESTEP_SAMPLE",
-                            f"num_timesteps={num_timesteps} | original_batch={original_batch_size} | expanded_batch={batch_size}",
+            self.logger.log("DIRECT_EDIT_PREDICTION",
+                            f"直接编辑模式 | batch_size={batch_size} | t固定为0",
+                            context, level=1)
+            self.logger.log("ARCHITECTURE_CHANGE",
+                            "从'连续流匹配'转变为'迭代优化'架构",
                             context, level=1)
             self.logger.tensor("z0_probs", z0_probs, level=2, context=context)
             self.logger.tensor("z1_probs", z1_probs, level=2, context=context)
 
-            # 记录token ID和时间步信息
+            # 记录token ID信息
             for i in range(min(3, z0_token_ids.size(0))):
-                sample_idx = i // num_timesteps  # 原始样本索引
-                t_idx = i % num_timesteps       # 时间步索引
                 self.logger.log("TOKEN_SAMPLE_CHECK",
-                                f"样本{sample_idx} 时间步{t_idx} z0={z0_token_ids[i].tolist()} z1={z1_token_ids[i].tolist()} t={t[i].item():.4f}",
+                                f"样本{i} z0={z0_token_ids[i].tolist()} z1={z1_token_ids[i].tolist()} t={t[i].item():.4f}",
                                 context, level=3)
-            self.logger.log("TIMESTEP_STATS",
-                            f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}",
-                            context, level=2)
 
+        # 关键修改：直接使用z0作为z_t，不再进行插值
+        # 这消除了"假残差"问题，因为当前表达式与残差现在完全对齐
+        z_t_probs = z0_probs  # 3维概率分布: (batch_size, seq_len, vocab_size)
 
-        z_t = sample_conditional_path(z0_probs, z1_probs, t, self.scheduler)
+        # 转换为 token IDs（因为 remove_gap_tokens 需要2维输入）
+        z_t_token_ids = torch.argmax(z_t_probs, dim=-1)  # 2维: (batch_size, seq_len)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z_t, dataset.special_tokens_manager
+            z_t_token_ids, dataset.special_tokens_manager
         )
 
         # 调试：验证训练时的序列格式（仅验证第一个批次）
@@ -398,7 +376,7 @@ class EditFlowManager:
             'pred_ins_probs': pred_ins_probs,
             'pred_sub_probs': pred_sub_probs,
             'x_t': x_t,
-            'z_t': z_t,
+            'z_t': z_t_token_ids,  # 返回token IDs（2维），用于损失计算
             'z1_token_ids': z1_token_ids,
             'z_gap_mask': z_gap_mask,
             'z_pad_mask': z_pad_mask,
@@ -470,7 +448,8 @@ class EditFlowManager:
             # 自动处理梯度同步、累积步数判断、优化器更新
             with self.accelerator.accumulate([model, condition_encoder]):
                 x_values = batch['x_values'].to(self.device)
-                residuals = batch['residuals'].to(self.device)
+                y_target = batch['y_target'].to(self.device)  # 修改：使用y_target而非residuals
+                residuals = batch.get('residuals', torch.zeros_like(y_target)).to(self.device)  # 保留用于日志
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
 
@@ -506,7 +485,8 @@ class EditFlowManager:
                     self.logger.log("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", level=2)
 
                 point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
-                condition_embeddings = condition_encoder(x_values, residuals, point_mask)
+                # 关键修改：使用y_target作为条件而非residuals（架构改进）
+                condition_embeddings = condition_encoder(x_values, y_target, point_mask)
 
                 # 记录条件嵌入信息（每个batch都记录，用于调试NaN来源）
                 if self.accelerator.is_local_main_process:
@@ -663,12 +643,13 @@ class EditFlowManager:
             # === 修改：不再循环 dim，直接遍历 dataloader ===
             for batch in test_dataloader:
                 x_values = batch['x_values'].to(self.device)
-                residuals = batch['residuals'].to(self.device)
+                y_target = batch['y_target'].to(self.device)  # 修改：使用y_target
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
                 point_mask = batch['point_mask'].to(self.device)
 
-                condition_embeddings = condition_encoder(x_values, residuals, point_mask)
+                # 修改：使用y_target而非residuals
+                condition_embeddings = condition_encoder(x_values, y_target, point_mask)
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset, config)
 
                 # 尝试计算损失，如果包含NaN则跳过该批次
@@ -839,7 +820,7 @@ class EditFlowManager:
 
         # 准备输入数据
         x_values = torch.FloatTensor(x_data).unsqueeze(0).to(device)
-        y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)
+        y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)  # 这是目标值
 
         # 推断输入维度并生成初始表达式
         if input_dim is None:
@@ -850,7 +831,7 @@ class EditFlowManager:
         from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants, tree_to_expr
 
         # initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
-        initial_expr = sp.Symbol('x0')-sp.exp(sp.Symbol('x1'))
+        initial_expr = sp.Symbol('x0')
 
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
@@ -858,17 +839,22 @@ class EditFlowManager:
             self.logger.error("INITIAL_EXPR_FAILED", f"无法计算初始表达式 '{initial_expr}' 的预测值", "inference")
             return ""
 
-        # 计算残差：真实值 - 预测值
+        # 计算残差：真实值 - 预测值（仅用于评估，不作为条件）
         residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
-        # 创建全1mask（推理时使用的是原始数据，没有padding）
-        point_mask = torch.ones_like(residuals)
-        condition = condition_encoder(x_values, residuals, point_mask)
+
+        # 关键修改：使用目标值y_values作为条件，而非残差
+        # 这样条件在推理过程中保持恒定，作为"北极星"指引方向
+        point_mask = torch.ones_like(y_values)
+        condition = condition_encoder(x_values, y_values, point_mask)
 
         # 记录初始数据
         self.logger.log("INITIAL_DATA",
                        f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | "
-                       f"y_values: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
+                       f"y_target: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
                        f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}]",
+                       "inference", level=1)
+        self.logger.log("ARCHITECTURE_INFO",
+                       "使用目标值y_target作为条件（架构改进：北极星模式）",
                        "inference", level=1)
         self.logger.log("INITIAL_CONDITION",
                        f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}]",
@@ -894,7 +880,7 @@ class EditFlowManager:
         # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
         # current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
         # 使用 x0 - x1 作为初始表达式
-        current_tokens = ['sub','x0','exp','x1']
+        current_tokens = ['x0']
 
         # 初始化token管理器，确保覆盖数据维度
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim

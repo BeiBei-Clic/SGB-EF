@@ -265,7 +265,8 @@ class FlowDataset(torch.utils.data.Dataset):
                 sample = json.loads(line)
 
         x_values = torch.FloatTensor(sample['x_values'])
-        residuals = torch.FloatTensor(sample['residuals'])
+        y_target = torch.FloatTensor(sample['y_target'])  # 修改：加载y_target而非residuals
+        residuals = torch.FloatTensor(sample['residuals'])  # 保留residuals用于其他用途
 
         z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
         z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
@@ -282,7 +283,8 @@ class FlowDataset(torch.utils.data.Dataset):
 
         return {
             'x_values': x_values,
-            'residuals': residuals,
+            'y_target': y_target,  # 新增：返回y_target
+            'residuals': residuals,  # 保留：用于向后兼容或其他用途
             'z0_token_ids': pad_z_sequence(z0_tokens),
             'z1_token_ids': pad_z_sequence(z1_tokens),
             'gap_token': self.gap_token
@@ -290,10 +292,14 @@ class FlowDataset(torch.utils.data.Dataset):
 
 
 def custom_collate_fn(batch):
-    """处理不同维度数据的collate函数，使用padding + mask方案"""
+    """处理不同维度数据的collate函数，使用padding + mask方案
+
+    修改：添加y_target的处理（架构改进：使用目标值而非残差作为条件）
+    """
     if len(batch) == 0:
         return {
             'x_values': torch.empty(0, 0, 0),
+            'y_target': torch.empty(0, 0),  # 修改：添加y_target
             'residuals': torch.empty(0, 0),
             'dim_mask': torch.empty(0, 0),
             'z0_token_ids': torch.empty(0, 0),
@@ -308,15 +314,15 @@ def custom_collate_fn(batch):
 
     for i, item in enumerate(batch):
         x_val = item['x_values']  # [n_points, current_dim]
-        resid = item['residuals']  # [n_points]
+        y_tgt = item['y_target']  # [n_points]  # 新增：获取y_target
 
         # 确保x_values至少是2维的
         if x_val.dim() == 1:
             x_val = x_val.unsqueeze(1)  # [n_points, 1]
 
-        # 确保residuals是1维的
-        if resid.dim() > 1:
-            resid = resid.squeeze()
+        # 确保y_target是1维的
+        if y_tgt.dim() > 1:
+            y_tgt = y_tgt.squeeze()
 
         current_dim = x_val.shape[1]
         current_n_points = x_val.shape[0]
@@ -327,19 +333,23 @@ def custom_collate_fn(batch):
 
     # Padding所有数据到最大形状
     x_values_padded = []
+    y_target_padded = []  # 新增：y_target的padding
     residuals_padded = []
     dim_masks = []
     point_masks = []
 
     for i, item in enumerate(batch):
         x_val = item['x_values'].clone()  # [n_points, current_dim]
-        resid = item['residuals'].clone()  # [n_points]
+        y_tgt = item['y_target'].clone()  # [n_points]  # 新增：克隆y_target
+        resid = item['residuals'].clone()  # [n_points]  # 保留：用于向后兼容
 
         # 确保x_values至少是2维的
         if x_val.dim() == 1:
             x_val = x_val.unsqueeze(1)
 
-        # 确保residuals是1维的
+        # 确保y_target和residuals是1维的
+        if y_tgt.dim() > 1:
+            y_tgt = y_tgt.squeeze()
         if resid.dim() > 1:
             resid = resid.squeeze()
 
@@ -350,6 +360,9 @@ def custom_collate_fn(batch):
         if current_n_points < max_n_points:
             padding_points = torch.zeros(max_n_points - current_n_points, x_val.shape[1], dtype=x_val.dtype)
             x_val = torch.cat([x_val, padding_points], dim=0)
+
+            padding_y_tgt = torch.zeros(max_n_points - current_n_points, dtype=y_tgt.dtype)
+            y_tgt = torch.cat([y_tgt, padding_y_tgt], dim=0)
 
             padding_resid = torch.zeros(max_n_points - current_n_points, dtype=resid.dtype)
             resid = torch.cat([resid, padding_resid], dim=0)
@@ -368,15 +381,17 @@ def custom_collate_fn(batch):
         point_mask[:current_n_points] = 1.0
 
         x_values_padded.append(x_val)          # [max_n_points, max_dim]
+        y_target_padded.append(y_tgt)          # [max_n_points]  # 新增
         residuals_padded.append(resid)         # [max_n_points]
         dim_masks.append(dim_mask)             # [max_dim]
         point_masks.append(point_mask)         # [max_n_points]
 
     result = {
-        'x_values': torch.stack(x_values_padded),     # [batch_size, max_n_points, max_dim]
-        'residuals': torch.stack(residuals_padded),   # [batch_size, max_n_points]
-        'dim_mask': torch.stack(dim_masks),           # [batch_size, max_dim]
-        'point_mask': torch.stack(point_masks),       # [batch_size, max_n_points]
+        'x_values': torch.stack(x_values_padded),       # [batch_size, max_n_points, max_dim]
+        'y_target': torch.stack(y_target_padded),       # [batch_size, max_n_points]  # 新增
+        'residuals': torch.stack(residuals_padded),     # [batch_size, max_n_points]  # 保留
+        'dim_mask': torch.stack(dim_masks),             # [batch_size, max_dim]
+        'point_mask': torch.stack(point_masks),         # [batch_size, max_n_points]
         'z0_token_ids': torch.stack([item['z0_token_ids'] for item in batch]),
         'z1_token_ids': torch.stack([item['z1_token_ids'] for item in batch]),
         'gap_token': batch[0]['gap_token'],

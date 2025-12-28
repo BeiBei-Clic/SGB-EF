@@ -175,17 +175,24 @@ class SetTransformerConditionEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x_values: torch.Tensor, residuals: torch.Tensor, point_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_values: torch.Tensor, y_target: torch.Tensor, point_mask: torch.Tensor) -> torch.Tensor:
         """
-        使用SetTransformer编码残差点集 - 支持任意维度输入
+        使用SetTransformer编码目标值点集（修改：接受目标值而非残差）
+
         Args:
             x_values: (batch_size, num_points, input_dim) x值列表，input_dim可以是1,2,3,4...任意维度
-            residuals: (batch_size, num_points) 残差值
+            y_target: (batch_size, num_points) 目标值（而非残差）
             point_mask: (batch_size, num_points) 点掩码，1表示真实点，0表示填充点
+
         Returns:
             condition: (batch_size, num_seeds, dim_hidden) 条件序列，不再是单个向量
+
+        关键改进：
+        - 使用目标值y_target作为条件，而非残差(y_target - y_curr)
+        - 优势：目标值在整个推理过程中恒定，作为"北极星"指引方向
+        - 避免了残差在推理过程中不断变化导致的分布漂移问题
         """
-        batch_size, num_points = residuals.shape
+        batch_size, num_points = y_target.shape
         input_dim = x_values.shape[2]  # 可以是1,2,3,4...任意维度
 
         # 检查输入维度是否在支持范围内
@@ -193,9 +200,9 @@ class SetTransformerConditionEncoder(nn.Module):
             raise ValueError(f"输入维度 {input_dim} 超过了支持的最大维度 {self.max_input_dim}")
 
         # 修复：构建固定对齐的输入特征
-        # 目标格式：[x0, x1, ..., xN, 0, ..., 0, residual]
+        # 目标格式：[x0, x1, ..., xN, 0, ..., 0, y_target]
         #           ↑ 0..input_dim-1  ↑ input_dim..max_input_dim-1  ↑ max_input_dim
-        # 保证residual始终在最后一列（索引max_input_dim），避免语义混乱
+        # 保证y_target始终在最后一列（索引max_input_dim），避免语义混乱
         input_features = torch.zeros(
             batch_size, num_points, self.max_input_dim + 1,
             device=x_values.device, dtype=x_values.dtype
@@ -204,8 +211,8 @@ class SetTransformerConditionEncoder(nn.Module):
         # 填充x值到前面的列
         input_features[:, :, :input_dim] = x_values  # (batch_size, num_points, input_dim)
 
-        # 填充residual到最后一列（固定位置）
-        input_features[:, :, -1] = residuals  # (batch_size, num_points)
+        # 填充目标值到最后一列（固定位置）
+        input_features[:, :, -1] = y_target  # (batch_size, num_points)
 
         # 中间的列保持为0（自动padding）
 

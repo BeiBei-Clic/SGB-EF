@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 带调试信息的符号回归实例 - 直接调用EditFlowManager中的symbolic_regression方法
+
+架构说明（v2.0 - 迭代优化模式）:
+- 从"连续流匹配"转变为"离散编辑预测"
+- 条件编码器使用目标值y_target（北极星模式）而非残差
+- 推理时条件保持恒定，提供稳定的优化方向
+- 模型直接学习"从当前状态到目标状态的编辑操作"
 """
 
 import numpy as np
@@ -77,30 +83,31 @@ def main():
     # 设置参数
     args = type('Args', (), {
         'seed': 42,
-        'base_model_name': "google-bert/bert-base-uncased",
-        'condition_model_name': "settransformer",  # 现在使用SetTransformer架构
+        'base_model_name': "google-bert/bert-base-uncased",  # 已弃用，保留用于兼容性
+        'condition_model_name': "settransformer",  # 使用SetTransformer架构编码目标值
         'cache_dir': "models/huggingface_cache",  # 模型缓存目录
         'use_fp16': False,  # 推理时关闭混合精度
         'gradient_accumulation_steps': 1,  # 推理时不需要梯度累积
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
-        'max_dim': 3,  # 添加最大维度参数，确保覆盖变量范围
-        'max_expr_length': 24, # 最大表达式长度
-        "num_timesteps": 1,
+        'max_dim': 3,  # 支持的最大输入维度
+        'max_expr_length': 24,  # 最大表达式长度
+        "num_timesteps": 1,  # 已弃用：新架构固定t=0，不需要多时间步采样
         # LLaMA模型架构参数
         'hidden_dim': 512,  # LLaMA隐藏层维度 (匹配checkpoint)
         'n_layers': 8,  # LLaMA Transformer层数 (匹配checkpoint)
         'n_heads': 8,  # LLaMA注意力头数
         'dropout': 0.1,  # Dropout比率
         'use_condition_injection': True,  # 是否使用交叉注意力条件注入
-        # SetTransformer参数
-        'condition_dim_hidden': 768,  # 匹配 BERT 的 hidden_size
-        'condition_num_heads': 4,
-        'condition_num_inds': 32,
-        'condition_num_layers': 3,
-        'condition_num_seeds': 32,  # 输出序列长度
-        'condition_dim_output': 128,  # 已弃用
-        'condition_input_normalization': False,
+        # SetTransformer参数（条件编码器）
+        'condition_max_input_dim': 3,  # 条件编码器支持的最大输入维度
+        'condition_dim_hidden': 768,  # SetTransformer隐藏层维度
+        'condition_num_heads': 4,  # 注意力头数
+        'condition_num_inds': 32,  # 诱导点数
+        'condition_num_layers': 3,  # SetTransformer层数
+        'condition_num_seeds': 32,  # 输出序列长度（特征向量数量）
+        'condition_dim_output': 128,  # 已弃用（现在输出序列而非单个向量）
+        'condition_input_normalization': False,  # 是否对输入进行归一化
     })()
 
     manager = EditFlowManager(args)
@@ -142,11 +149,14 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/continuous_flow_final"
+    model_path = "checkpoints/checkpoint_epoch_15"
 
     # 执行符号回归（使用重新组织后的数据）
-    # 使用简单推理（贪婪搜索）单纯依赖模型的编辑动作
-    logger.log("INFERENCE_START", f"开始符号回归推理 模型路径: {model_path} | 推理步数: 10 | 方法: 贪婪搜索", "example")
+    # 使用简单推理（贪婪搜索）+ 北极星模式（目标值作为恒定条件）
+    logger.log("INFERENCE_START",
+               f"开始符号回归推理 | 模型路径: {model_path} | 推理步数: {20} | "
+               f"方法: 贪婪搜索 | 架构: 迭代优化（北极星模式）",
+               "example")
 
     predicted_expression = manager.symbolic_regression(
         model_path=model_path,
@@ -156,9 +166,12 @@ def main():
     )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
-    print(f"\n最终结果对比:")
+    print(f"\n{'='*60}")
+    print(f"最终结果对比 (架构v2.0 - 迭代优化模式)")
+    print(f"{'='*60}")
     print(f"真实表达式: {new_expr_gt}")  # 使用更新后的表达式
     print(f"预测表达式: {predicted_expression}")
+    print(f"{'='*60}")
 
     # 验证表达式质量（支持常数优化）
     if predicted_expression:

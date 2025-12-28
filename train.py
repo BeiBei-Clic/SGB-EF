@@ -1,7 +1,12 @@
 """
-EditFlow连续流符号回归预训练主脚本
-实现基于多步连续流匹配的编辑流模型训练
-使用 Hugging Face Accelerate 进行分布式训练加速
+EditFlow符号回归训练主脚本 (v2.0 - 迭代优化架构)
+
+架构更新说明：
+- 从"连续流匹配"转变为"离散编辑预测"
+- 移除中间状态插值，直接学习从z0到z1的编辑操作
+- 条件编码器使用目标值y_target（北极星模式）而非残差
+- 训练时固定t=0，不再需要多时间步采样
+- 使用 Hugging Face Accelerate 进行分布式训练加速
 """
 
 import argparse
@@ -36,8 +41,8 @@ def main():
     parser.add_argument("--eval_every", type=int, default=5, help="每多少轮评估一次测试集")
 
     # 模型参数
-    parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称")
-    parser.add_argument("--condition_model_name", type=str, default="settransformer", help="条件嵌入模型名称 (现在使用SetTransformer架构)")
+    parser.add_argument("--base_model_name", type=str, default="google-bert/bert-base-uncased", help="基础模型名称（已弃用，保留兼容性）")
+    parser.add_argument("--condition_model_name", type=str, default="settransformer", help="条件嵌入模型名称 (使用SetTransformer编码目标值y_target)")
     parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
     # LLaMA模型架构参数
@@ -56,27 +61,27 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--save_every", type=int, default=5, help="每多少轮保存一次")
 
-    # 多GPU参数 - 现在由 Accelerate 自动管理
+    # 多GPU参数 - 由 Accelerate 自动管理
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
 
-    # 多时间步采样参数
-    parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
+    # 多时间步采样参数（已弃用 - v2.0架构固定t=0）
+    parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量（已弃用：新架构固定t=0，无需多时间步）")
 
     # 对齐方法参数
     parser.add_argument("--alignment_method", type=str, default='randomized',
                        choices=['levenshtein', 'randomized'],
                        help="数据对齐方法: 'levenshtein' (确定性对齐) 或 'randomized' (随机化对齐，来自Edit Flows论文)")
 
-    # SetTransformer条件编码器参数
+    # SetTransformer条件编码器参数（编码目标值y_target）
     parser.add_argument("--condition_max_input_dim", type=int, default=3, help="SetTransformer支持的最大输入维度")
-    parser.add_argument("--condition_dim_hidden", type=int, default=768, help="SetTransformer隐藏层维度（应匹配BERT的hidden_size）")
-    parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数 ")
+    parser.add_argument("--condition_dim_hidden", type=int, default=768, help="SetTransformer隐藏层维度")
+    parser.add_argument("--condition_num_heads", type=int, default=8, help="SetTransformer注意力头数")
     parser.add_argument("--condition_num_inds", type=int, default=32, help="SetTransformer诱导点数")
-    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数 ")
-    parser.add_argument("--condition_num_seeds", type=int, default=32, help="SetTransformer种子数（输出序列长度）")
-    parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度（已弃用，保留以兼容）")
+    parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数")
+    parser.add_argument("--condition_num_seeds", type=int, default=32, help="SetTransformer种子数（输出序列长度，特征向量数量）")
+    parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度（已弃用：现在输出序列而非单个向量）")
     parser.add_argument("--condition_input_normalization", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否对输入进行标准化")
 
     # 保持向后兼容性，但现在不再使用的参数
@@ -100,7 +105,9 @@ def main():
 
     # 只有在主进程才打印完成信息
     if hasattr(manager.accelerator, 'is_local_main_process') and manager.accelerator.is_local_main_process:
-        print("\nEditFlow训练完成!")
+        print("\n" + "="*60)
+        print("EditFlow训练完成! (架构v2.0 - 迭代优化模式)")
+        print("="*60)
 
 
 if __name__ == "__main__":
