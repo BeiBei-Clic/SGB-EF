@@ -105,34 +105,44 @@ def main():
 
     manager = EditFlowManager(args)
 
-    # 生成测试数据
+    # 生成测试数据 - 使用 x1*x2 作为目标表达式
     print("生成测试数据...")
-    logger.log("DATA_GENERATION", "开始生成测试数据", "example")
+    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: x1*x2)", "example")
 
-    # 使用不同的种子生成不同的测试数据
-    import sys
+    # 直接构造 x1*x2 的数据
+    np.random.seed(42)
+    n_points = 100
+    input_dimension = 3  # 需要3维，这样才有x1和x2
 
-    sample = generate_sample(input_dimension=3, n_points=100, max_depth=5, seed=5)
-    x_data = np.array(sample['x'])
-    y_data = np.array(sample['y'])
+    # 生成随机数据
+    x_data = np.random.randn(n_points, input_dimension) * 2  # 使用标准正态分布
+    y_data = x_data[:, 1] * x_data[:, 2]  # x1 * x2
 
-    logger.log("DATA_INFO", f"真实表达式: {sample['exp_gt']} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example")
+    # 目标表达式字符串
+    target_expr = "x1*x2"
 
-    print(f"\n原始数据信息:")
-    print(f"真实表达式: {sample['exp_gt']}")
+    logger.log("DATA_INFO", f"目标表达式: {target_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example")
+
+    print(f"\n数据信息:")
+    print(f"目标表达式: {target_expr}")
+    print(f"初始表达式: {target_expr}")  # 初始表达式和目标表达式相同
     print(f"x_data 形状: {x_data.shape}")
     print(f"y_data 形状: {y_data.shape}")
 
     # 根据表达式实际使用的变量重新组织数据
     new_expr_gt, x_data_reorganized, new_used_vars = reorganize_data_by_used_variables(
-        sample['exp_gt'], x_data, y_data
+        target_expr, x_data, y_data
     )
 
-    # 更新sample以使用新的表达式
-    sample['exp_gt'] = new_expr_gt
+    # 创建一个类似sample的字典以保持兼容性
+    sample = {
+        'exp_gt': new_expr_gt,
+        'x': x_data_reorganized,
+        'y': y_data
+    }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_5"
+    model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用简单推理（贪婪搜索）单纯依赖模型的编辑动作

@@ -24,7 +24,7 @@ from ..modeling.llama_editflow import EditFlowTransformer, LlamaEditFlowConfig
 from ..utils.gpu_monitor import get_gpu_memory_usage_string
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
-from .beam_search import BeamSearchSymbolicRegression, BeamCandidate, SimpleSymbolicRegression
+from .beam_search import BeamCandidate, SimpleSymbolicRegression
 
 
 class EditFlowManager:
@@ -850,7 +850,7 @@ class EditFlowManager:
         from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants, tree_to_expr
 
         # initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
-        initial_expr = sp.Symbol('x0')
+        initial_expr = sp.Symbol('x0')-sp.exp(sp.Symbol('x1'))
 
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
@@ -894,7 +894,7 @@ class EditFlowManager:
         # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
         # current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
         # 使用 x0 - x1 作为初始表达式
-        current_tokens = ['x0']
+        current_tokens = ['sub','x0','exp','x1']
 
         # 初始化token管理器，确保覆盖数据维度
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
