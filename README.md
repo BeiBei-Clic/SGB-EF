@@ -72,7 +72,7 @@ accelerate launch \
     --dynamo_backend=no \
     --multi_gpu \
     train.py \
-    --num_epochs 5 \
+    --num_epochs 50 \
     --num_timesteps 10 \
     --num_samples 1000000\
     --batch_size 48
