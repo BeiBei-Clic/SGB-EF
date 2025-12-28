@@ -14,11 +14,32 @@ from src.symbolic.symbolic_utils import (
     generate_reduction_sequence,
     evaluate_expression_safe,
     levenshtein_alignment_with_gap,
+    randomized_alignment_with_gap,
 )
 from src.symbolic.corruption import corrupt_expression
 
 # 全局变量存储 Logger 实例
 _sample_logger = Logger(enabled=True)
+
+# 对齐方法配置：'levenshtein' 或 'randomized'
+# 默认使用 'randomized' (来自《Edit Flows》论文的随机化辅助对齐方法)
+# 这种方法通过随机打乱编辑操作序列，避免gap集中在序列开头
+_alignment_method = 'randomized'
+
+def set_alignment_method(method: str):
+    """设置对齐方法
+
+    Args:
+        method: 'levenshtein' (确定性对齐) 或 'randomized' (随机化对齐，来自Edit Flows论文)
+    """
+    global _alignment_method
+    if method not in ['levenshtein', 'randomized']:
+        raise ValueError(f"未知的对齐方法: {method}. 请使用 'levenshtein' 或 'randomized'")
+    _alignment_method = method
+
+def get_alignment_method() -> str:
+    """获取当前对齐方法"""
+    return _alignment_method
 
 def set_logger(logger: Logger):
     """设置 Logger 实例"""
@@ -183,9 +204,13 @@ def generate_single_sample(
             _sample_logger.convert_to_trees(sample_id, i+1, len(target_tokens), len(curr_tokens), tree_time)
 
             # 对齐到Z空间，包含gap token
-            _sample_logger.sample_step(sample_id, f"对齐到Z空间 {i+1}")
+            _sample_logger.sample_step(sample_id, f"对齐到Z空间 {i+1} (方法: {_alignment_method})")
             align_start = time.time()
-            z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
+            # 根据配置选择对齐方法
+            if _alignment_method == 'randomized':
+                z0_tokens, z1_tokens = randomized_alignment_with_gap(curr_tokens, target_tokens)
+            else:  # 'levenshtein'
+                z0_tokens, z1_tokens = levenshtein_alignment_with_gap(curr_tokens, target_tokens)
             align_time = (time.time() - align_start) * 1000
             _sample_logger.levenshtein_alignment(sample_id, i+1, len(z0_tokens), len(z1_tokens), align_time)
 

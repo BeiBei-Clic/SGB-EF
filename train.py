@@ -64,6 +64,11 @@ def main():
     # 多时间步采样参数
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量")
 
+    # 对齐方法参数
+    parser.add_argument("--alignment_method", type=str, default='randomized',
+                       choices=['levenshtein', 'randomized'],
+                       help="数据对齐方法: 'levenshtein' (确定性对齐) 或 'randomized' (随机化对齐，来自Edit Flows论文)")
+
     # SetTransformer条件编码器参数
     parser.add_argument("--condition_max_input_dim", type=int, default=3, help="SetTransformer支持的最大输入维度")
     parser.add_argument("--condition_dim_hidden", type=int, default=768, help="SetTransformer隐藏层维度（应匹配BERT的hidden_size）")

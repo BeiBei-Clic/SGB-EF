@@ -253,6 +253,7 @@ def generate_flow_samples(
     batch_size: int = 50000,
     verbose: bool = True,
     num_processes: int = None,
+    alignment_method: str = 'randomized',
 ):
     """生成用于EditFlow连续流训练的数据文件，支持断点续传和多进程并行处理
 
@@ -265,10 +266,17 @@ def generate_flow_samples(
         batch_size: 批次大小
         verbose: 是否显示详细输出
         num_processes: 进程数，None表示使用所有可用CPU核心
+        alignment_method: 对齐方法，'levenshtein' (确定性) 或 'randomized' (随机化，来自Edit Flows论文)
     """
 
     # 设置样本生成器的 Logger 实例
     set_logger(_sample_logger)
+
+    # 设置对齐方法
+    from src.symbolic.sample_generator import set_alignment_method
+    set_alignment_method(alignment_method)
+    if verbose:
+        print(f"对齐方法设置为: {alignment_method}")
 
     # 使用高精度时间戳和系统信息生成主随机种子
     main_time_ms = int(time.time() * 1000000)  # 微秒级时间戳

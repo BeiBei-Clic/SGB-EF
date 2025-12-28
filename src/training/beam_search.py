@@ -104,7 +104,8 @@ class BeamSearchSymbolicRegression:
                                   x_values: torch.Tensor,
                                   t: float,
                                   top_k: Optional[int] = None,
-                                  valid_variables: Optional[List[str]] = None) -> List[ActionProposal]:
+                                  valid_variables: Optional[List[str]] = None,
+                                  step: int = -1) -> List[ActionProposal]:
         """为当前表达式生成操作提案
 
         Args:
@@ -114,11 +115,16 @@ class BeamSearchSymbolicRegression:
             t: 时间步
             top_k: 每种操作类型保留的top-k数量，None表示全部
             valid_variables: 有效的变量token列表（如 ['x0', 'x1']），用于过滤无效变量
+            step: 当前推理步数（用于日志记录）
 
         Returns:
             操作提案列表
         """
+        import time
         proposals = []
+
+        # 记录开始时间用于性能统计
+        start_time = time.time()
 
         # 构建模型输入 - 确保与训练时的序列格式完全一致
         tokenized_expr = self.special_tokens_manager.tokenize_expression(','.join(current_tokens))
@@ -142,18 +148,33 @@ class BeamSearchSymbolicRegression:
         t_tensor = torch.tensor([[t]], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
+            model_forward_start = time.time()
             rates, insert_probs, substitute_probs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 time_steps=t_tensor,
                 condition=condition
             )
+            model_forward_time = (time.time() - model_forward_start) * 1000  # ms
 
             # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
             # 因此索引 0=插入, 1=删除, 2=替换
             lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入速率
             lambda_del = rates[0, :, 1].cpu().numpy()  # 删除速率（修复：原来是 lambda_sub）
             lambda_sub = rates[0, :, 2].cpu().numpy()  # 替换速率（修复：原来是 lambda_del）
+
+            # 统计操作速率信息
+            ins_rate_mean = float(lambda_ins.mean())
+            ins_rate_max = float(lambda_ins.max())
+            ins_rate_above_threshold = int(np.sum(lambda_ins > self.min_action_score))
+
+            del_rate_mean = float(lambda_del.mean())
+            del_rate_max = float(lambda_del.max())
+            del_rate_above_threshold = int(np.sum(lambda_del > self.min_action_score))
+
+            sub_rate_mean = float(lambda_sub.mean())
+            sub_rate_max = float(lambda_sub.max())
+            sub_rate_above_threshold = int(np.sum(lambda_sub > self.min_action_score))
 
             # 调试：验证序列格式
             base_length = int(attention_mask[0].sum().item())
@@ -294,23 +315,50 @@ class BeamSearchSymbolicRegression:
 
         # 按分数排序
         proposals.sort(key=lambda p: p.score, reverse=True)
+
+        # 记录提案生成性能和统计信息
+        total_time = (time.time() - start_time) * 1000  # ms
+
+        # 统计各类操作数量
+        insert_count = sum(1 for p in proposals if p.action_type == 'insert')
+        delete_count = sum(1 for p in proposals if p.action_type == 'delete')
+        substitute_count = sum(1 for p in proposals if p.action_type == 'substitute')
+
+        if self.logger and self._is_main_process():
+            self.logger.log("ACTION_PROPOSALS_GENERATED",
+                           f"step={step} | t={t:.4f} | "
+                           f"proposals={len(proposals)} (ins={insert_count}, del={delete_count}, sub={substitute_count}) | "
+                           f"rates: ins(mean={ins_rate_mean:.4f}, max={ins_rate_max:.4f}, >thr={ins_rate_above_threshold}) "
+                           f"del(mean={del_rate_mean:.4f}, max={del_rate_max:.4f}, >thr={del_rate_above_threshold}) "
+                           f"sub(mean={sub_rate_mean:.4f}, max={sub_rate_max:.4f}, >thr={sub_rate_above_threshold}) | "
+                           f"time: model={model_forward_time:.1f}ms total={total_time:.1f}ms | "
+                           f"current_tokens={','.join(current_tokens) if len(current_tokens)<=10 else ','.join(current_tokens[:10])+'...'}",
+                           "beam_search", level=3)
+
         return proposals
 
     def evaluate_candidate(self,
                           tokens: List[str],
                           x_data: np.ndarray,
-                          y_data: np.ndarray) -> Tuple[bool, float, np.ndarray]:
+                          y_data: np.ndarray,
+                          step: int = -1,
+                          candidate_id: str = "") -> Tuple[bool, float, np.ndarray]:
         """评估候选表达式（支持常数优化）
 
         Args:
             tokens: token列表
             x_data: 输入x数据
             y_data: 目标y数据
+            step: 当前推理步数（用于日志记录）
+            candidate_id: 候选标识（用于日志记录）
 
         Returns:
             (成功标志, MSE分数, 残差)
         """
+        import time
         try:
+            eval_start = time.time()
+
             from ..symbolic.symbolic_utils import (
                 evaluate_expression_with_constants,
                 evaluate_expression_safe,
@@ -325,6 +373,18 @@ class BeamSearchSymbolicRegression:
                 x_values=x_data,
                 y_values=y_data
             )
+
+            eval_time = (time.time() - eval_start) * 1000  # ms
+
+            # 记录表达式评估性能
+            if self.logger and self._is_main_process():
+                expr_short = expr_str if len(expr_str) <= 30 else expr_str[:30] + "..."
+                self.logger.log("EXPR_EVALUATION",
+                               f"step={step} | candidate={candidate_id} | expr='{expr_short}' | "
+                               f"success={success} | mse={mse:.6f if success else 'N/A'} | "
+                               f"optimized_expr={optimized_expr if optimized_expr else 'N/A'} | "
+                               f"time={eval_time:.1f}ms",
+                               "beam_search", level=3)
 
             if success and optimized_expr is not None:
                 # 用优化后的表达式重新计算预测值，获取residuals
@@ -354,8 +414,10 @@ class BeamSearchSymbolicRegression:
                     return_all_candidates: bool = False) -> Tuple[BeamCandidate, Optional[List[BeamCandidate]]]:
         """执行束搜索
 
-        束搜索策略：使用模型预测的操作分数作为引导，扩大搜索空间，
-        最后从所有候选中根据MSE选择最佳表达式。
+        束搜索策略：
+        - 每一步使用模型预测的前top_k_actions个操作进行展开
+        - 仅使用模型预测的操作分数进行筛选和选择（无MSE评价，无额外惩罚）
+        - 最终从所有探索的候选中根据MSE选择最佳表达式
 
         Args:
             initial_tokens: 初始token列表
@@ -365,8 +427,8 @@ class BeamSearchSymbolicRegression:
             y_data: 目标y数据
             x_values: 输入x的tensor形式
             n_steps: 推理步数
-            beam_size: 束大小
-            top_k_actions: 每步考虑的top-k操作数
+            beam_size: 每步保留的候选数量（基于模型操作分数）
+            top_k_actions: 每个候选考虑的top-k操作数（基于模型预测分数）
             valid_variables: 有效的变量token列表（如 ['x0', 'x1']），如果为None则从x_data推断
             return_all_candidates: 是否返回所有有效候选
 
@@ -385,12 +447,11 @@ class BeamSearchSymbolicRegression:
                            f"valid_variables={valid_variables}",
                            "beam_search", level=1)
 
-        # 初始化beam - 使用操作分数作为引导（不使用MSE）
-        # 初始分数设为0，表示探索起点
+        # 初始化beam - 使用模型操作分数作为唯一筛选依据
         beam = [
             BeamCandidate(
                 tokens=initial_tokens.copy(),
-                score=0.0,  # 初始分数，仅用于操作引导
+                score=0.0,  # 模型操作分数累积
                 condition=initial_condition,
                 residuals=initial_residuals
             )
@@ -403,6 +464,9 @@ class BeamSearchSymbolicRegression:
         all_valid_candidates = []
 
         for step in range(n_steps):
+            import time
+            step_start = time.time()
+
             if self.logger and self._is_main_process():
                 print(f"\n束搜索步骤 {step + 1}/{n_steps}")
                 print(f"当前beam大小: {len(beam)}")
@@ -411,6 +475,11 @@ class BeamSearchSymbolicRegression:
 
             # 使用字典去重：相同表达式只保留操作分数最高的
             candidate_map = {}
+
+            # 统计本步的操作提案
+            step_proposals_generated = 0
+            step_proposals_filtered_duplicate = 0
+            step_proposals_filtered_length = 0
 
             for candidate in beam:
                 t = 0.1 + 0.9 * step / n_steps
@@ -422,7 +491,8 @@ class BeamSearchSymbolicRegression:
                     x_values=x_values,
                     t=t,
                     top_k=top_k_actions,
-                    valid_variables=valid_variables
+                    valid_variables=valid_variables,
+                    step=step
                 )
 
                 if not proposals:
@@ -432,32 +502,29 @@ class BeamSearchSymbolicRegression:
                         candidate_map[cand_key] = candidate
                     continue
 
-                # 只保留分数最高的N个操作
-                top_proposals = proposals[:top_k_actions]
+                step_proposals_generated += len(proposals)
 
-                for proposal in top_proposals:
+                # 处理所有提案
+                for proposal in proposals:
                     # 跳过已经见过的表达式
                     prop_key = tuple(proposal.new_tokens)
                     if prop_key in seen_expressions:
+                        step_proposals_filtered_duplicate += 1
                         continue
 
                     # 跳过过长的表达式
                     if len(proposal.new_tokens) > self.max_expression_length:
+                        step_proposals_filtered_length += 1
                         continue
 
-                    # 新分数使用操作分数累积（模型预测的引导）
-                    # 不在这里使用MSE，仅用模型预测的操作分数来引导搜索
+                    # 新分数使用操作分数累积（仅模型预测分数，无额外惩罚）
                     new_score = candidate.score + proposal.score
-
-                    # 添加长度惩罚：偏好更简洁的表达式
-                    length_penalty = 0.001 * len(proposal.new_tokens)
-                    new_score -= length_penalty
 
                     # 临时保存候选，稍后统一评估MSE
                     new_candidate = BeamCandidate(
                         tokens=proposal.new_tokens,
                         score=new_score,  # 操作分数
-                        condition=candidate.condition,  # 暂时沿用原条件
+                        condition=candidate.condition,
                         residuals=candidate.residuals,
                         history=candidate.history + [f"{proposal.action_type}@{proposal.position}:{proposal.token if proposal.token else 'N/A'}(score={proposal.score:.4f})"]
                     )
@@ -475,6 +542,28 @@ class BeamSearchSymbolicRegression:
             all_candidates = list(candidate_map.values())
             all_candidates.sort(key=lambda c: c.score, reverse=True)
             beam = all_candidates[:beam_size]
+
+            # 记录束搜索步内详细性能指标
+            step_time = (time.time() - step_start) * 1000  # ms
+
+            if self.logger and self._is_main_process():
+                # 统计beam中的表达式长度分布
+                beam_lengths = [len(c.tokens) for c in beam]
+                beam_scores = [c.score for c in beam]
+
+                self.logger.log("BEAM_SEARCH_STEP",
+                               f"step={step}/{n_steps} | t={t:.4f} | "
+                               f"proposals: gen={step_proposals_generated} "
+                               f"filt(dup={step_proposals_filtered_duplicate}, len={step_proposals_filtered_length}) | "
+                               f"beam: size={len(beam)} "
+                               f"lengths(min={min(beam_lengths) if beam_lengths else 0}, "
+                               f"max={max(beam_lengths) if beam_lengths else 0}, "
+                               f"mean={sum(beam_lengths)/len(beam_lengths) if beam_lengths else 0:.1f}) | "
+                               f"scores(min={min(beam_scores) if beam_scores else 0:.4f}, "
+                               f"max={max(beam_scores) if beam_scores else 0:.4f}) | "
+                               f"step_time={step_time:.1f}ms | "
+                               f"seen_expressions={len(seen_expressions)}",
+                               "beam_search", level=3)
 
             # 检查是否收敛（操作分数连续多步无改善）
             if step > 5 and len(beam) > 0:
@@ -495,17 +584,24 @@ class BeamSearchSymbolicRegression:
         exploration_pool = list(candidate_map.values()) if candidate_map else []
         exploration_pool.extend(beam)  # 确保当前beam也被包含
 
-        for candidate in exploration_pool:
+        import time
+        mse_eval_start = time.time()
+
+        for idx, candidate in enumerate(exploration_pool):
             # 评估每个候选的MSE
             success, expr_mse_score, _ = self.evaluate_candidate(
                 tokens=candidate.tokens,
                 x_data=x_data,
-                y_data=y_data
+                y_data=y_data,
+                step=n_steps,  # 表示最终评估阶段
+                candidate_id=f"final_{idx}"
             )
             if success:
                 # 保存MSE分数到候选对象
                 candidate.mse_score = -expr_mse_score  # 转换回正MSE
                 all_valid_candidates.append(candidate)
+
+        mse_eval_time = (time.time() - mse_eval_start) * 1000  # ms
 
         # 如果没有任何有效候选，返回初始表达式
         if not all_valid_candidates:
@@ -513,7 +609,9 @@ class BeamSearchSymbolicRegression:
             init_success, init_mse_score, _ = self.evaluate_candidate(
                 tokens=initial_tokens,
                 x_data=x_data,
-                y_data=y_data
+                y_data=y_data,
+                step=n_steps,
+                candidate_id="initial"
             )
             best_candidate = BeamCandidate(
                 tokens=initial_tokens.copy(),
@@ -532,10 +630,13 @@ class BeamSearchSymbolicRegression:
         if self.logger and self._is_main_process():
             self.logger.log("BEAM_SEARCH_COMPLETE",
                            f"MSE最佳候选 | MSE={best_candidate.mse_score:.6f} | tokens={','.join(best_candidate.tokens) if best_candidate.tokens else '<blank>'} | "
-                           f"探索了{len(all_valid_candidates)}个有效候选",
+                           f"探索了{len(all_valid_candidates)}个有效候选 | "
+                           f"MSE评估总时间={mse_eval_time:.1f}ms | "
+                           f"平均每个候选={mse_eval_time/len(exploration_pool):.1f}ms",
                            "inference", level=1)
             print(f"\n束搜索完成:")
             print(f"  探索了 {len(all_valid_candidates)} 个有效表达式")
+            print(f"  MSE评估耗时: {mse_eval_time:.1f}ms")
             print(f"  最佳MSE: {best_candidate.mse_score:.6f}")
             print(f"  最佳表达式: {','.join(best_candidate.tokens) if best_candidate.tokens else '<blank>'}")
             # 显示top-5

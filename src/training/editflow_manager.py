@@ -110,6 +110,10 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"准备连续流训练数据 (单进程生成模式)...")
 
+            # 获取对齐方法配置
+            alignment_method = getattr(self.args, 'alignment_method', 'randomized')
+            print(f"使用对齐方法: {alignment_method}")
+
             # 调用数据生成函数
             generate_flow_samples(
                 num_samples=self.args.num_samples,
@@ -118,6 +122,7 @@ class EditFlowManager:
                 max_depth=self.args.max_depth,
                 max_expr_length=self.args.max_expr_length,
                 verbose=True,  # 显示详细日志
+                alignment_method=alignment_method,
             )
         else:
             # 非主进程跳过数据生成，等待主进程完成

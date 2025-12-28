@@ -142,8 +142,8 @@ def main():
         model_path=model_path,
         x_data=x_data_reorganized,  # 使用重新组织后的数据
         y_data=y_data,
-        n_steps=30,      # 推理步数
-        beam_size=5      # 束搜索宽度，每步保留5个最佳候选
+        n_steps=10,      # 推理步数
+        beam_size=2      # 束搜索宽度，每步保留5个最佳候选
     )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")

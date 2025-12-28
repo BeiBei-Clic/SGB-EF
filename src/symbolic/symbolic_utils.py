@@ -301,6 +301,84 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
     return list(reversed(z1)), list(reversed(z2))
 
 
+def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
+    """随机化辅助对齐方法 (来自《Edit Flows》论文)
+
+    通过随机打乱编辑操作序列来解决"gap集中"问题：
+    - Levenshtein对齐倾向于把gap挤在序列开头
+    - 随机化对齐让gap均匀分布在整个序列中
+
+    算法步骤：
+    1. 计算编辑操作配额（MATCH, SUB, INS, DEL的数量）
+    2. 创建操作序列并随机打乱（关键步骤！）
+    3. 根据打乱后的操作序列填充内容
+
+    Args:
+        tokens1: 源token序列（当前表达式）
+        tokens2: 目标token序列（目标表达式）
+
+    Returns:
+        Tuple[List[str], List[str]]: 对齐后的两个等长序列，包含<gap>标记
+
+    Example:
+        tokens1 = ['add', 'x0', 'x1']
+        tokens2 = ['add', 'sin', 'x0', 'cos', 'x1']
+
+        可能的对齐结果（每次运行不同）:
+        z1 = ['add', 'x0', '<gap>', 'x1', '<gap>']
+        z2 = ['add', 'sin', 'x0', 'cos', 'x1']
+    """
+    m, n = len(tokens1), len(tokens2)
+
+    # 步骤1：使用Levenshtein计算编辑操作配额
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if tokens1[i-1] == tokens2[j-1]:
+                dp[i][j] = dp[i-1][j-1]  # 匹配
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+
+    # 回溯确定操作类型
+    operations = []
+    i, j = m, n
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and tokens1[i-1] == tokens2[j-1]:
+            operations.append(('MATCH', tokens1[i-1], tokens2[j-1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+            operations.append(('SUB', tokens1[i-1], tokens2[j-1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+            operations.append(('DEL', tokens1[i-1], '<gap>'))
+            i -= 1
+        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
+            operations.append(('INS', '<gap>', tokens2[j-1]))
+            j -= 1
+
+    # 反转操作序列（从正向顺序）
+    operations = list(reversed(operations))
+
+    # 步骤2：随机打乱操作序列（关键！）
+    # 使用完全随机打乱策略
+    random.shuffle(operations)
+
+    # 步骤3：根据打乱后的操作序列填充内容
+    z1, z2 = [], []
+    for op_type, tok1, tok2 in operations:
+        z1.append(tok1)
+        z2.append(tok2)
+
+    return z1, z2
+
+
 def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
     """在给定x值上计算表达式
 
