@@ -14,17 +14,19 @@ class BeamCandidate:
     """束搜索候选
 
     Attributes:
-        score: 累积分数（越高越好）
+        score: 累积操作分数（越高越好，用于搜索引导）
         tokens: 表达式token列表
         condition: 对应的条件嵌入
         residuals: 对应的残差
         history: 操作历史（可选，用于调试）
+        mse_score: 表达式的MSE分数（越低越好，用于最终选择）
     """
     score: float
     tokens: List[str] = field(compare=False)
     condition: Optional[torch.Tensor] = field(default=None, compare=False)
     residuals: Optional[np.ndarray] = field(default=None, compare=False)
     history: List[str] = field(default_factory=list, compare=False)
+    mse_score: Optional[float] = field(default=None, compare=False)
 
     def __repr__(self):
         return f"BeamCandidate(score={self.score:.4f}, tokens={','.join(self.tokens) if self.tokens else '<blank>'})"
@@ -155,7 +157,7 @@ class BeamSearchSymbolicRegression:
 
             # 调试：验证序列格式
             base_length = int(attention_mask[0].sum().item())
-            effective_length = max(base_length, min(10, input_ids.size(1)))
+            effective_length = base_length  # 使用实际序列长度
 
             # 调试：打印序列格式信息（仅在第一次调用时）
             if not hasattr(self, '_sequence_format_logged'):
@@ -166,6 +168,18 @@ class BeamSearchSymbolicRegression:
                                    f"current_tokens={current_tokens[:3]}",
                                    "beam_search", level=2)
                 self._sequence_format_logged = True
+
+            # 调试：打印top-5插入概率和token（仅在第一次调用时）
+            if not hasattr(self, '_insert_probs_logged'):
+                if self.logger and self._is_main_process():
+                    for i in range(min(3, effective_length)):
+                        top5 = torch.topk(insert_probs[0, i], 5)
+                        tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top5.indices]
+                        probs = top5.values.tolist()
+                        self.logger.log("INSERT_PROBS_DEBUG",
+                                       f"位置{i}: lambda={lambda_ins[i]:.4f} | top5_tokens={tokens} | top5_probs={probs}",
+                                       "beam_search", level=2)
+                self._insert_probs_logged = True
 
             # 生成insert操作提案
             # 关键修复：训练-推理索引对齐
@@ -334,8 +348,12 @@ class BeamSearchSymbolicRegression:
                     n_steps: int,
                     beam_size: int = 5,
                     top_k_actions: int = 10,
-                    valid_variables: Optional[List[str]] = None) -> BeamCandidate:
+                    valid_variables: Optional[List[str]] = None,
+                    return_all_candidates: bool = False) -> Tuple[BeamCandidate, Optional[List[BeamCandidate]]]:
         """执行束搜索
+
+        束搜索策略：使用模型预测的操作分数作为引导，扩大搜索空间，
+        最后从所有候选中根据MSE选择最佳表达式。
 
         Args:
             initial_tokens: 初始token列表
@@ -348,9 +366,10 @@ class BeamSearchSymbolicRegression:
             beam_size: 束大小
             top_k_actions: 每步考虑的top-k操作数
             valid_variables: 有效的变量token列表（如 ['x0', 'x1']），如果为None则从x_data推断
+            return_all_candidates: 是否返回所有有效候选
 
         Returns:
-            最佳候选
+            (MSE最佳候选, 所有有效候选列表)
         """
         # 如果没有提供有效变量列表，从x_data推断
         if valid_variables is None:
@@ -364,15 +383,22 @@ class BeamSearchSymbolicRegression:
                            f"valid_variables={valid_variables}",
                            "beam_search", level=1)
 
-        # 初始化beam
+        # 初始化beam - 使用操作分数作为引导（不使用MSE）
+        # 初始分数设为0，表示探索起点
         beam = [
             BeamCandidate(
                 tokens=initial_tokens.copy(),
-                score=0.0,
+                score=0.0,  # 初始分数，仅用于操作引导
                 condition=initial_condition,
                 residuals=initial_residuals
             )
         ]
+
+        # 记录历史表达式，避免重复探索
+        seen_expressions = {tuple(initial_tokens)}
+
+        # 收集所有有效候选（用于最终MSE选择）
+        all_valid_candidates = []
 
         for step in range(n_steps):
             if self.logger and self._is_main_process():
@@ -381,8 +407,8 @@ class BeamSearchSymbolicRegression:
                 for i, cand in enumerate(beam[:3]):  # 显示前3个
                     print(f"  候选{i}: score={cand.score:.4f}, tokens={','.join(cand.tokens) if cand.tokens else '<blank>'}")
 
-            # 所有候选的扩展
-            all_candidates = []
+            # 使用字典去重：相同表达式只保留操作分数最高的
+            candidate_map = {}
 
             for candidate in beam:
                 t = 0.1 + 0.9 * step / n_steps
@@ -394,80 +420,127 @@ class BeamSearchSymbolicRegression:
                     x_values=x_values,
                     t=t,
                     top_k=top_k_actions,
-                    valid_variables=valid_variables  # 传递有效变量列表
+                    valid_variables=valid_variables
                 )
 
                 if not proposals:
                     # 没有有效操作，保留原候选
-                    all_candidates.append(candidate)
+                    cand_key = tuple(candidate.tokens)
+                    if cand_key not in candidate_map or candidate.score > candidate_map[cand_key].score:
+                        candidate_map[cand_key] = candidate
                     continue
 
                 # 只保留分数最高的N个操作
-                top_proposals = proposals[:beam_size]
+                top_proposals = proposals[:top_k_actions]
 
                 for proposal in top_proposals:
-                    # 评估新候选的表达式质量
-                    success, expr_score, new_residuals = self.evaluate_candidate(
-                        tokens=proposal.new_tokens,
-                        x_data=x_data,
-                        y_data=y_data
-                    )
+                    # 跳过已经见过的表达式
+                    prop_key = tuple(proposal.new_tokens)
+                    if prop_key in seen_expressions:
+                        continue
 
-                    # 计算新分数：原分数 + 操作分数 + 表达式分数
-                    # 这里使用加权和，可以调整权重
-                    action_weight = 1.0
-                    expr_weight = 0.1
+                    # 跳过过长的表达式
+                    if len(proposal.new_tokens) > self.max_expression_length:
+                        continue
 
-                    new_score = candidate.score + action_weight * proposal.score
-                    if success:
-                        new_score += expr_weight * expr_score
-                    else:
-                        new_score -= 10.0  # 惩罚无效表达式
+                    # 新分数使用操作分数累积（模型预测的引导）
+                    # 不在这里使用MSE，仅用模型预测的操作分数来引导搜索
+                    new_score = candidate.score + proposal.score
 
-                    # 更新条件嵌入
-                    if success and new_residuals is not None:
-                        new_residuals_tensor = torch.FloatTensor(new_residuals).unsqueeze(0).to(self.device)
-                        # 创建全1mask（因为这些都是真实点，没有padding）
-                        new_point_mask = torch.ones_like(new_residuals_tensor)
-                        new_condition = self.condition_encoder(
-                            x_values,
-                            new_residuals_tensor,
-                            new_point_mask
-                        )
-                    else:
-                        new_condition = candidate.condition
+                    # 添加长度惩罚：偏好更简洁的表达式
+                    length_penalty = 0.001 * len(proposal.new_tokens)
+                    new_score -= length_penalty
 
-                    # 创建新候选
-                    history = candidate.history.copy()
-                    history.append(f"{proposal.action_type}@{proposal.position}:{proposal.token if proposal.token else 'N/A'}")
-
+                    # 临时保存候选，稍后统一评估MSE
                     new_candidate = BeamCandidate(
                         tokens=proposal.new_tokens,
-                        score=new_score,
-                        condition=new_condition,
-                        residuals=new_residuals if success else candidate.residuals,
-                        history=history
+                        score=new_score,  # 操作分数
+                        condition=candidate.condition,  # 暂时沿用原条件
+                        residuals=candidate.residuals,
+                        history=candidate.history + [f"{proposal.action_type}@{proposal.position}:{proposal.token if proposal.token else 'N/A'}(score={proposal.score:.4f})"]
                     )
 
-                    all_candidates.append(new_candidate)
+                    # 去重：相同表达式只保留操作分数最高的
+                    if prop_key not in candidate_map or new_score > candidate_map[prop_key].score:
+                        candidate_map[prop_key] = new_candidate
+                        seen_expressions.add(prop_key)
 
             # 如果没有任何有效扩展，提前终止
-            if not all_candidates:
+            if not candidate_map:
                 break
 
-            # 选择top-k候选
+            # 转换为列表并按操作分数排序
+            all_candidates = list(candidate_map.values())
             all_candidates.sort(key=lambda c: c.score, reverse=True)
             beam = all_candidates[:beam_size]
 
-        # 返回最佳候选
-        best = beam[0] if beam else None
+            # 检查是否收敛（操作分数连续多步无改善）
+            if step > 5 and len(beam) > 0:
+                best_current_score = beam[0].score
+                if step > 0 and hasattr(self, '_prev_best_score'):
+                    if abs(best_current_score - self._prev_best_score) < 1e-6:
+                        self._convergence_count = getattr(self, '_convergence_count', 0) + 1
+                        if self._convergence_count >= 3:
+                            if self.logger and self._is_main_process():
+                                print(f"\n收敛检测：操作分数连续3步无改善，提前终止")
+                            break
+                    else:
+                        self._convergence_count = 0
+                self._prev_best_score = best_current_score
 
-        if self.logger and best:
+        # 收集所有有效候选并评估MSE
+        # 将初始表达式和所有探索到的表达式都加入候选池
+        exploration_pool = list(candidate_map.values()) if candidate_map else []
+        exploration_pool.extend(beam)  # 确保当前beam也被包含
+
+        for candidate in exploration_pool:
+            # 评估每个候选的MSE
+            success, expr_mse_score, _ = self.evaluate_candidate(
+                tokens=candidate.tokens,
+                x_data=x_data,
+                y_data=y_data
+            )
+            if success:
+                # 保存MSE分数到候选对象
+                candidate.mse_score = -expr_mse_score  # 转换回正MSE
+                all_valid_candidates.append(candidate)
+
+        # 如果没有任何有效候选，返回初始表达式
+        if not all_valid_candidates:
+            # 至少评估初始表达式
+            init_success, init_mse_score, _ = self.evaluate_candidate(
+                tokens=initial_tokens,
+                x_data=x_data,
+                y_data=y_data
+            )
+            best_candidate = BeamCandidate(
+                tokens=initial_tokens.copy(),
+                score=0.0,
+                condition=initial_condition,
+                residuals=initial_residuals
+            )
+            if init_success:
+                best_candidate.mse_score = -init_mse_score
+            return best_candidate, None
+
+        # 按MSE排序，选择最佳
+        all_valid_candidates.sort(key=lambda c: c.mse_score)
+        best_candidate = all_valid_candidates[0]
+
+        if self.logger and self._is_main_process():
             self.logger.log("BEAM_SEARCH_COMPLETE",
-                           f"最佳候选 | score={best.score:.4f} | tokens={','.join(best.tokens) if best.tokens else '<blank>'}",
+                           f"MSE最佳候选 | MSE={best_candidate.mse_score:.6f} | tokens={','.join(best_candidate.tokens) if best_candidate.tokens else '<blank>'} | "
+                           f"探索了{len(all_valid_candidates)}个有效候选",
                            "inference", level=1)
+            print(f"\n束搜索完成:")
+            print(f"  探索了 {len(all_valid_candidates)} 个有效表达式")
+            print(f"  最佳MSE: {best_candidate.mse_score:.6f}")
+            print(f"  最佳表达式: {','.join(best_candidate.tokens) if best_candidate.tokens else '<blank>'}")
+            # 显示top-5
+            for i, cand in enumerate(all_valid_candidates[:5]):
+                print(f"  Top-{i+1}: MSE={cand.mse_score:.6f}, expr={','.join(cand.tokens) if cand.tokens else '<blank>'}")
 
-        return best
+        return best_candidate, (all_valid_candidates if return_all_candidates else None)
 
     def _is_main_process(self):
         """检查是否为主进程"""

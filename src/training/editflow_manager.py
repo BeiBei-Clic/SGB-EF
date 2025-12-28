@@ -839,7 +839,8 @@ class EditFlowManager:
         import sympy as sp
         from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants, tree_to_expr
 
-        initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
+        # initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
+        initial_expr = sp.Symbol('x0') - sp.Symbol('x1')
 
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
@@ -881,7 +882,9 @@ class EditFlowManager:
         # 构建初始前缀表达式（与训练格式一致）
         # 统一处理：对于n维，需要(n-1)个add + n个变量
         # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
-        current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
+        # current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
+        # 使用 x0 - x1 作为初始表达式
+        current_tokens = ['sub', 'x0', 'x1']
 
         # 初始化token管理器，确保覆盖数据维度
         actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
@@ -908,7 +911,7 @@ class EditFlowManager:
 
         # 执行束搜索
         initial_residuals_np = residuals.cpu().squeeze(0).numpy()
-        best_candidate = beam_searcher.beam_search(
+        best_candidate, all_candidates = beam_searcher.beam_search(
             initial_tokens=current_tokens,
             initial_condition=condition,
             initial_residuals=initial_residuals_np,
@@ -920,12 +923,16 @@ class EditFlowManager:
             top_k_actions=10  # 每步考虑top-10操作
         )
 
-        # 返回最佳候选的表达式
+        # 返回MSE最佳候选的表达式
         final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
 
         if best_candidate and self.accelerator.is_local_main_process:
+            # 记录MSE分数而不是操作分数
+            mse_score = getattr(best_candidate, 'mse_score', None)
+            mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
             self.logger.log("BEAM_SEARCH_RESULT",
-                           f"最终得分: {best_candidate.score:.4f} | "
+                           f"MSE分数: {mse_str} | "
+                           f"探索候选数: {len(all_candidates) if all_candidates else 0} | "
                            f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
                            "inference", level=1)
 
