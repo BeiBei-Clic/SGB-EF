@@ -216,8 +216,94 @@ def reduce_expression(expr: sp.Expr) -> sp.Expr:
     return random.choice(args) if args else sp.Integer(1)
 
 
-def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:
-    """生成从目标表达式逐步删减的序列，直到得到最简表达式"""
+def reduce_expression_random_subtree(expr: sp.Expr) -> sp.Expr:
+    """随机删减表达式中的任意子树，不局限于根节点
+
+    这个方法解决了原版reduce_expression只删减根节点的问题，
+    让模型学习在不同位置进行编辑操作。
+
+    改进点：
+    - 30%概率删减根节点（保持原方法的行为）
+    - 70%概率深入子树删减（新增行为，让编辑分布更均匀）
+
+    Args:
+        expr: 要删减的表达式
+
+    Returns:
+        删减后的表达式
+
+    Examples:
+        目标: add(sin(x0), cos(x1))
+
+        原方法 (reduce_expression):
+            → sin(x0) 或 cos(x1)  # 只能删根节点add
+
+        新方法 (reduce_expression_random_subtree):
+            → add(x0, cos(x1))    # 删减sin子树
+            → add(sin(x0), x1)    # 删减cos子树
+            → sin(x0)             # 删减根节点（30%概率）
+            → cos(x1)             # 删减根节点（30%概率）
+    """
+    # 如果表达式已经是常数或符号，无法进一步删减
+    if expr.is_Number or expr.is_Symbol:
+        return expr
+
+    # 如果表达式没有参数，返回常数1
+    if not hasattr(expr, 'args') or not expr.args:
+        return sp.Integer(1)
+
+    func_name = str(expr.func).lower()
+
+    # 决定删减策略：删减根节点 vs 深入子树删减
+    # 30%概率删减根节点，70%概率深入子树删减
+    strategy = np.random.choice(['root', 'subtree'], p=[0.3, 0.7])
+
+    if strategy == 'root':
+        # 使用原有的根节点删减逻辑（保持向后兼容）
+        if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
+            # 一元操作：直接返回操作数
+            return expr.args[0] if expr.args else sp.Integer(1)
+        else:
+            # 二元操作：随机选择一个子树
+            return random.choice(expr.args) if expr.args else sp.Integer(1)
+
+    else:  # subtree策略
+        # 深入子树删减：随机选择一个参数进行内部删减
+        if not expr.args:
+            return sp.Integer(1)
+
+        # 随机选择一个子树位置
+        subtree_idx = random.randint(0, len(expr.args) - 1)
+        selected_subtree = expr.args[subtree_idx]
+
+        # 对选中的子树进行删减（递归调用原方法）
+        if selected_subtree.is_Number or selected_subtree.is_Symbol:
+            # 子树是叶子节点，简化为0或1
+            reduced_subtree = sp.Integer(0) if random.random() < 0.5 else sp.Integer(1)
+        elif hasattr(selected_subtree, 'args') and selected_subtree.args:
+            # 递归删减子树（使用原方法，保持简单）
+            reduced_subtree = reduce_expression(selected_subtree)
+        else:
+            reduced_subtree = sp.Integer(1)
+
+        # 构建新的表达式，用删减后的子树替换原子树
+        new_args = list(expr.args)
+        new_args[subtree_idx] = reduced_subtree
+        return expr.func(*new_args)
+
+
+def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool = True) -> List[sp.Expr]:
+    """生成从目标表达式逐步删减的序列，直到得到最简表达式
+
+    Args:
+        target_expr: 目标表达式
+        use_random_subtree: 是否使用随机子树删减方法（默认True）
+            - True: 使用reduce_expression_random_subtree（推荐）
+            - False: 使用原版reduce_expression（只删根节点）
+
+    Returns:
+        删减序列，从目标表达式到最简表达式
+    """
     reduction_sequence = []
     current_expr = target_expr
 
@@ -233,7 +319,12 @@ def generate_reduction_sequence(target_expr: sp.Expr) -> List[sp.Expr]:
             break
 
         # 应用一次删减操作
-        reduced_expr = reduce_expression(current_expr)
+        if use_random_subtree:
+            # 使用新的随机子树删减方法（让编辑分布更均匀）
+            reduced_expr = reduce_expression_random_subtree(current_expr)
+        else:
+            # 使用原版删减方法（只删根节点）
+            reduced_expr = reduce_expression(current_expr)
 
         # 如果删减后的表达式与原表达式相同，说明无法进一步删减
         if reduced_expr == current_expr:

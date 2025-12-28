@@ -74,7 +74,7 @@ accelerate launch \
     train.py \
     --num_epochs 50 \
     --num_timesteps 10 \
-    --num_samples 1000000\
+    --num_samples 1000\
     --batch_size 48
 
 # 将会话挂到后台
