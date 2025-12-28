@@ -132,7 +132,7 @@ def main():
     sample['exp_gt'] = new_expr_gt
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_45"
+    model_path = "checkpoints/checkpoint_epoch_5"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用束搜索来扩大搜索范围，提高发现更好表达式的概率
