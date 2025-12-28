@@ -222,7 +222,9 @@ class BeamSearchSymbolicRegression:
             for current_token_pos in range(len(current_tokens)):
                 input_ids_pos = current_token_pos + 1  # +1因为input_ids[0]是BOS
                 if input_ids_pos < lambda_ins.shape[0] and lambda_ins[input_ids_pos] > self.min_action_score:
-                    insert_pos = current_token_pos  # 在current_tokens[current_token_pos]之后插入
+                    # 关键修复：Python的list.insert(i, x)是在索引i之前插入
+                    # 要在current_tokens[current_token_pos]之后插入，需要用current_token_pos + 1
+                    insert_pos = current_token_pos + 1
                     top_k_tokens = top_k if top_k else insert_probs.shape[2]
                     # 使用input_ids[input_ids_pos]的预测
                     top_tokens = torch.topk(insert_probs[0, input_ids_pos], min(top_k_tokens, insert_probs.shape[2]))

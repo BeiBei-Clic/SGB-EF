@@ -426,13 +426,19 @@ class EditFlowManager:
         ins_probs = lambda_ins * pred_ins_probs
         sub_probs = lambda_sub * pred_sub_probs
 
-        u_cat = torch.cat([ins_probs, sub_probs, lambda_del], dim=-1)
+        # u_cat_x 是 X 空间（原始序列空间）的预测速率
+        # 形状: [batch, x_seq_len, 2*vocab_size+1]
+        u_cat_x = torch.cat([ins_probs, sub_probs, lambda_del], dim=-1)
 
-        u_z = fill_gap_tokens_with_repeats(u_cat, z_gap_mask, z_pad_mask)
+        # u_z 是 Z 空间（扩展空间，含gap重复）的预测速率
+        # 形状: [batch, z_seq_len, 2*vocab_size+1]
+        u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
         u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
 
-        loss = criterion(u_z, u_mask, t, effective_vocab_size, accelerator=self.accelerator)
+        # 关键修复：传入 u_cat_x (X空间) 用于正确的 u_total 计算
+        # u_z 仍用于 cross_entropy 计算（监督带路径编辑操作）
+        loss = criterion(u_cat_x, u_z, u_mask, t, effective_vocab_size, accelerator=self.accelerator)
 
         return loss
 

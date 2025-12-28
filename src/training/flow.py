@@ -132,17 +132,31 @@ class ContinuousFlowLoss:
 
         return u_mask
 
-    def __call__(self, u_cat: torch.Tensor, u_mask: torch.Tensor,
+    def __call__(self, u_cat_x: torch.Tensor, u_z: torch.Tensor, u_mask: torch.Tensor,
                  t: torch.Tensor, vocab_size: int, accelerator=None) -> torch.Tensor:
+        """
+        连续流损失计算
 
-        # NaN/Inf检测
-        nan_count = torch.isnan(u_cat).sum().item()
-        inf_count = torch.isinf(u_cat).sum().item()
+        Args:
+            u_cat_x: X空间的预测速率 [batch, x_seq_len, 2*vocab_size+1]（原始空间，不含gap）
+            u_z: Z空间的预测速率 [batch, z_seq_len, 2*vocab_size+1]（扩展空间，含gap重复）
+            u_mask: 操作掩码 [batch, z_seq_len, 2*vocab_size+1]
+            t: 时间步 [batch, 1]
+            vocab_size: 词汇表大小
+            accelerator: Accelerate加速器
 
+        Returns:
+            loss: 标量损失值
+        """
+        # NaN/Inf检测 - 检测两个输入
+        nan_count_x = torch.isnan(u_cat_x).sum().item()
+        inf_count_x = torch.isinf(u_cat_x).sum().item()
+        nan_count_z = torch.isnan(u_z).sum().item()
+        inf_count_z = torch.isinf(u_z).sum().item()
 
         # 分布式NaN检测：如果使用accelerator，确保所有进程同步跳过
-        has_nan_or_inf = torch.tensor(1 if (nan_count > 0 or inf_count > 0) else 0,
-                                    device=u_cat.device)
+        has_nan_or_inf = torch.tensor(1 if ((nan_count_x > 0 or inf_count_x > 0) or (nan_count_z > 0 or inf_count_z > 0)) else 0,
+                                    device=u_cat_x.device)
 
         if accelerator is not None and accelerator.distributed_type != "NO":
             # 同步所有进程的NaN检测结果
@@ -154,24 +168,23 @@ class ContinuousFlowLoss:
 
         # 如果任何进程包含NaN或Inf，抛出异常让训练循环跳过该批次
         if has_nan_or_inf > 0:
-            raise ValueError(f"批次包含异常值: 本地NaN={nan_count}, Inf={inf_count}, 分布式检测={has_nan_or_inf}")
+            raise ValueError(f"批次包含异常值: X空间NaN={nan_count_x}, Inf={inf_count_x}, Z空间NaN={nan_count_z}, Inf={inf_count_z}, 分布式检测={has_nan_or_inf}")
 
+        # 关键修复：u_total 在 X 空间计算（原始序列空间，无gap重复）
+        # u_cat_x 形状: [batch, x_seq_len, 2*vocab_size+1]
+        # 这确保了每个位置的速率只被计算一次，不会因gap重复而被重复计数
+        u_total = u_cat_x.sum(dim=(1, 2))
 
-        u_total = u_cat.sum(dim=(1, 2))
-
-
+        # 调度系数
         sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
         sched_coeff = torch.clamp(sched_coeff, min=-10, max=40)
 
+        # cross_entropy 在 Z 空间计算（用于监督带路径编辑操作）
+        log_u_z = torch.log(torch.clamp(u_z, min=1e-12, max=1e12))
+        cross_entropy = (log_u_z * u_mask.float()).sum(dim=(1, 2))
 
-        log_u_cat = torch.log(torch.clamp(u_cat, min=1e-12, max=1e12))
-
-
-        cross_entropy = (log_u_cat * u_mask.float()).sum(dim=(1, 2))
-
-
+        # 最终损失 = 速率总和 - 交叉熵 * 调度系数
         loss = (u_total - cross_entropy * sched_coeff).mean()
-
 
         return loss
 
