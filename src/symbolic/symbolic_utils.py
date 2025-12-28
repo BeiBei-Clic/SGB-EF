@@ -304,14 +304,14 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
 def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
     """随机化辅助对齐方法 (来自《Edit Flows》论文)
 
-    通过随机打乱编辑操作序列来解决"gap集中"问题：
-    - Levenshtein对齐倾向于把gap挤在序列开头
-    - 随机化对齐让gap均匀分布在整个序列中
+    通过在DP回溯时随机选择最优路径来解决"gap集中"问题：
+    - Levenshtein对齐按照固定优先级回溯，导致gap集中在序列开头
+    - 随机化对齐在所有最优路径中随机选择，保持Token相对顺序不变
 
-    算法步骤：
-    1. 计算编辑操作配额（MATCH, SUB, INS, DEL的数量）
-    2. 创建操作序列并随机打乱（关键步骤！）
-    3. 根据打乱后的操作序列填充内容
+    核心原理：
+    1. 构建标准编辑距离DP矩阵
+    2. 回溯时，当存在多个最优方向时随机选择一个
+    3. 保证 frm_blanks(z1) == tokens1 和 frm_blanks(z2) == tokens2
 
     Args:
         tokens1: 源token序列（当前表达式）
@@ -324,13 +324,15 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
         tokens1 = ['add', 'x0', 'x1']
         tokens2 = ['add', 'sin', 'x0', 'cos', 'x1']
 
-        可能的对齐结果（每次运行不同）:
+        可能的对齐结果（每次运行gap位置不同）:
         z1 = ['add', 'x0', '<gap>', 'x1', '<gap>']
         z2 = ['add', 'sin', 'x0', 'cos', 'x1']
+
+        注意：移除<gap>后，z2始终保持['add', 'sin', 'x0', 'cos', 'x1']
     """
     m, n = len(tokens1), len(tokens2)
 
-    # 步骤1：使用Levenshtein计算编辑操作配额
+    # 步骤1：构建标准编辑距离DP矩阵
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(m + 1):
         dp[i][0] = i
@@ -340,43 +342,51 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
     for i in range(1, m + 1):
         for j in range(1, n + 1):
             if tokens1[i-1] == tokens2[j-1]:
-                dp[i][j] = dp[i-1][j-1]  # 匹配
+                dp[i][j] = dp[i-1][j-1]  # 匹配，代价不变
             else:
                 dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
 
-    # 回溯确定操作类型
-    operations = []
-    i, j = m, n
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and tokens1[i-1] == tokens2[j-1]:
-            operations.append(('MATCH', tokens1[i-1], tokens2[j-1]))
-            i -= 1
-            j -= 1
-        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
-            operations.append(('SUB', tokens1[i-1], tokens2[j-1]))
-            i -= 1
-            j -= 1
-        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
-            operations.append(('DEL', tokens1[i-1], '<gap>'))
-            i -= 1
-        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
-            operations.append(('INS', '<gap>', tokens2[j-1]))
-            j -= 1
-
-    # 反转操作序列（从正向顺序）
-    operations = list(reversed(operations))
-
-    # 步骤2：随机打乱操作序列（关键！）
-    # 使用完全随机打乱策略
-    random.shuffle(operations)
-
-    # 步骤3：根据打乱后的操作序列填充内容
+    # 步骤2：随机回溯（关键修改！）
+    # 在每一步，收集所有最优方向，然后随机选择一个
     z1, z2 = [], []
-    for op_type, tok1, tok2 in operations:
-        z1.append(tok1)
-        z2.append(tok2)
+    i, j = m, n
 
-    return z1, z2
+    while i > 0 or j > 0:
+        choices = []
+        current_cost = dp[i][j]
+
+        # 检查左上方 (匹配或替换)
+        if i > 0 and j > 0:
+            cost_diag = dp[i-1][j-1]
+            # 如果是匹配，代价不变；如果是替换，代价+1
+            expected_cost = cost_diag if tokens1[i-1] == tokens2[j-1] else cost_diag + 1
+            if expected_cost == current_cost:
+                choices.append(('DIAG', tokens1[i-1], tokens2[j-1]))
+
+        # 检查上方 (删除 tokens1[i-1])
+        if i > 0 and dp[i-1][j] + 1 == current_cost:
+            choices.append(('UP', tokens1[i-1], '<gap>'))
+
+        # 检查左方 (向 tokens1 插入 tokens2[j-1])
+        if j > 0 and dp[i][j-1] + 1 == current_cost:
+            choices.append(('LEFT', '<gap>', tokens2[j-1]))
+
+        # 从所有最优选项中随机选一个（论文的随机性所在）
+        move, t1, t2 = random.choice(choices)
+
+        z1.append(t1)
+        z2.append(t2)
+
+        if move == 'DIAG':
+            i -= 1
+            j -= 1
+        elif move == 'UP':
+            i -= 1
+        elif move == 'LEFT':
+            j -= 1
+
+    # 步骤3：反转序列，因为我们是反向构建的
+    return list(reversed(z1)), list(reversed(z2))
 
 
 def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
