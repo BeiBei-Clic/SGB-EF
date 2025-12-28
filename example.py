@@ -142,7 +142,7 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_10"
+    model_path = "checkpoints/continuous_flow_final"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用简单推理（贪婪搜索）单纯依赖模型的编辑动作

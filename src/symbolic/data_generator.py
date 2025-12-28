@@ -123,7 +123,22 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             _sample_logger.log("DEBUG_EXCEPTION", f"捕获异常: {type(e).__name__}", f"错误信息: {str(e)}", level=1)
             _sample_logger.log("DEBUG_TRACEBACK", f"完整堆栈跟踪:", f"\n{''.join(traceback.format_exc())}", level=1)
             _sample_logger.sample_error(sample_id, type(e).__name__, str(e))
-            raise  # 直接抛出异常,不再继续
+
+            # 保存当前已生成的样本（如果有的话）
+            if batch_samples:
+                try:
+                    os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
+                    with open(batch_filename, 'w', encoding='utf-8') as f:
+                        for sample in batch_samples:
+                            sample_line = json.dumps(sample, ensure_ascii=False)
+                            f.write(sample_line + '\n')
+                    print(f"\n{process_prefix} 异常发生，已保存部分数据 ({len(batch_samples)} 个样本) 到 {batch_filename}")
+                except Exception as save_error:
+                    print(f"\n{process_prefix} 保存部分数据失败: {save_error}")
+
+            # 返回失败标记 (-1 表示失败)
+            print(f"\n{process_prefix} 批次失败: {type(e).__name__}: {str(e)}")
+            return batch_idx, -1, {}
 
     # 批次完成，无需关闭进度条
 
@@ -326,63 +341,125 @@ def generate_flow_samples(
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
-    # 收集需要处理的批次
-    batch_tasks = []
-    for batch_idx in range(num_batches):
-        # 获取当前批次的文件名
-        batch_filename = batch_filenames[batch_idx]
-        current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
+    # 重试机制：最多重试3次
+    MAX_RETRIES = 3
+    retry_count = 0
+    all_success = False
 
-        # 如果这个批次文件已经存在，直接跳过
-        if os.path.exists(batch_filename):
+    while retry_count < MAX_RETRIES and not all_success:
+        if retry_count > 0:
             if verbose:
-                print(f"跳过已存在的批次 {batch_idx + 1}")
-            continue
+                print(f"\n=== 第 {retry_count} 次重试，回到阶段2重新检查缺失批次 ===")
 
-        # 添加到任务列表，为每个任务分配一个进程ID
-        process_id = len(batch_tasks) % num_processes
-        batch_tasks.append((
-            batch_idx, current_batch_size, max_dim, n_points, max_depth,
-            max_expr_length, batch_filename, verbose, process_id
-        ))
+        # 收集需要处理的批次
+        batch_tasks = []
+        for batch_idx in range(num_batches):
+            # 获取当前批次的文件名
+            batch_filename = batch_filenames[batch_idx]
+            current_batch_size = min(batch_size, num_samples - batch_idx * batch_size)
 
-    if not batch_tasks:
-        if verbose:
-            print("所有批次文件已存在，跳过生成阶段")
-    else:
-        if verbose:
-            print(f"开始并行处理 {len(batch_tasks)} 个批次...")
+            # 如果这个批次文件已经存在，直接跳过
+            if os.path.exists(batch_filename):
+                if verbose and retry_count > 0:
+                    print(f"跳过已存在的批次 {batch_idx + 1}")
+                continue
 
-        # 统一使用进程池处理（num_processes=1 时退化为单进程）
-        if verbose:
-            print(f"开始处理 {len(batch_tasks)} 个批次任务...")
+            # 添加到任务列表，为每个任务分配一个进程ID
+            process_id = len(batch_tasks) % num_processes
+            batch_tasks.append((
+                batch_idx, current_batch_size, max_dim, n_points, max_depth,
+                max_expr_length, batch_filename, verbose, process_id
+            ))
 
-        try:
-            # 使用map方法确保所有任务同步完成，避免BrokenPipeError
-            with multiprocessing.Pool(processes=num_processes) as pool:
-                results = pool.map(generate_batch_worker, batch_tasks)
+        if not batch_tasks:
+            # 所有批次文件都已存在
+            all_success = True
+            if verbose:
+                print("所有批次文件已存在，跳过生成阶段")
+        else:
+            if verbose:
+                print(f"开始并行处理 {len(batch_tasks)} 个批次...")
 
-            # 处理所有结果（在pool已完全关闭后）
-            for batch_idx, sample_count, dimension_count in results:
+            # 统一使用进程池处理（num_processes=1 时退化为单进程）
+            if verbose:
+                print(f"开始处理 {len(batch_tasks)} 个批次任务...")
+
+            try:
+                # 使用map方法确保所有任务同步完成，避免BrokenPipeError
+                with multiprocessing.Pool(processes=num_processes) as pool:
+                    results = pool.map(generate_batch_worker, batch_tasks)
+
+                # 处理所有结果（在pool已完全关闭后）
+                failed_batches = []
+                for batch_idx, sample_count, dimension_count in results:
+                    if sample_count == -1:
+                        # 批次失败，记录并删除可能存在的部分文件
+                        failed_batches.append(batch_idx)
+                        batch_filename = batch_filenames[batch_idx]
+                        if os.path.exists(batch_filename):
+                            os.remove(batch_filename)
+                            if verbose:
+                                print(f"\n删除批次 {batch_idx + 1} 的不完整文件")
+                    else:
+                        # 批次成功
+                        if verbose:
+                            print(f"\r批次 {batch_idx + 1} 完成 (生成{sample_count}个样本)", end='', flush=True)
+
+                        # 累积维度统计
+                        for dim, count in dimension_count.items():
+                            total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
+
+                if failed_batches:
+                    # 有失败的批次，需要重试
+                    retry_count += 1
+                    if verbose:
+                        print(f"\n发现 {len(failed_batches)} 个失败的批次: {failed_batches}")
+                        print(f"将回到阶段2重新生成这些批次...")
+
+                    if retry_count >= MAX_RETRIES:
+                        # 达到最大重试次数
+                        if verbose:
+                            print(f"\n错误: 已达到最大重试次数 ({MAX_RETRIES})，以下批次仍然失败:")
+                            for batch_idx in failed_batches:
+                                print(f"  批次 {batch_idx + 1}")
+                        raise RuntimeError(f"有 {len(failed_batches)} 个批次在重试 {MAX_RETRIES} 次后仍然失败")
+                else:
+                    # 所有批次都成功
+                    all_success = True
+                    if verbose:
+                        print(f"\n所有 {len(batch_tasks)} 个批次并行处理完成")
+
+            except (BrokenPipeError, KeyboardInterrupt) as e:
                 if verbose:
-                    print(f"\r批次 {batch_idx + 1} 完成 (生成{sample_count}个样本)", end='', flush=True)
-
-                # 累积维度统计
-                for dim, count in dimension_count.items():
-                    total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
-
-            if verbose:
-                print(f"\n所有 {len(batch_tasks)} 个批次并行处理完成")
-
-        except (BrokenPipeError, KeyboardInterrupt) as e:
-            if verbose:
-                print(f"\n检测到进程通信中断: {type(e).__name__}")
-            raise
+                    print(f"\n检测到进程通信中断: {type(e).__name__}")
+                raise
+            except RuntimeError as e:
+                if "批次在重试" in str(e):
+                    raise
+                else:
+                    # 其他 RuntimeError，直接抛出
+                    raise
 
     if verbose and total_dimension_count:
         print(f"\n已完成批次的维度分布:")
         for dim, count in sorted(total_dimension_count.items()):
             print(f"{dim}维: {count} 个样本")
+
+    # === 最终验证：确保所有批次文件都成功生成 ===
+    if verbose:
+        print(f"\n验证所有批次文件是否完整生成...")
+    missing_batches = []
+    for batch_idx, batch_filename in enumerate(batch_filenames):
+        if not os.path.exists(batch_filename):
+            missing_batches.append(batch_idx)
+
+    if missing_batches:
+        error_msg = f"严重错误: 以下批次文件缺失，无法进行合并: {missing_batches}"
+        print(f"\n{error_msg}")
+        raise RuntimeError(error_msg)
+
+    if verbose:
+        print(f"验证通过: 所有 {num_batches} 个批次文件都已成功生成")
 
     # === 合并批次文件 ===
     if verbose:
