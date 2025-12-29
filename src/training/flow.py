@@ -8,38 +8,6 @@ import os
 import time
 from typing import List, Dict, Tuple, Optional
 from ..symbolic.data_generator import generate_flow_samples
-# from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
-
-
-class KappaScheduler:
-    """时间调度器，用于控制流的插值"""
-
-    def __init__(self, scheduler_type='cubic'):
-        self.scheduler_type = scheduler_type
-
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
-        """返回时间t的调度系数"""
-        return 3 * t**2 - 2 * t**3 if self.scheduler_type == 'cubic' else t
-
-    def derivative(self, t: torch.Tensor) -> torch.Tensor:
-        """返回时间t的调度系数导数"""
-        return 6 * t - 6 * t**2 if self.scheduler_type == 'cubic' else torch.ones_like(t)
-
-
-def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor, scheduler: KappaScheduler) -> torch.Tensor:
-    """在给定时间t采样条件路径"""
-    batch_size, seq_len, vocab_size = p0.shape
-    t = t.view(-1, 1, 1) if t.dim() == 1 else t
-    kappa_t = scheduler(t).view(batch_size, 1, 1).expand(batch_size, seq_len, 1)
-
-    pt = (1 - kappa_t) * p0 + kappa_t * p1
-    pt = torch.clamp(pt, min=0.0)
-    pt_sum = torch.clamp(pt.sum(dim=-1, keepdim=True), min=1e-8)
-    pt = pt / pt_sum
-
-    pt_flat = pt.view(-1, pt.size(-1))
-    return torch.multinomial(pt_flat, 1).view(batch_size, seq_len)
-
 
 
 def remove_gap_tokens(z_t: torch.Tensor, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -108,10 +76,10 @@ def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z
 
 
 class ContinuousFlowLoss:
-    """连续时间流匹配损失函数"""
+    """连续时间流匹配损失函数（架构v2.0 - 固定t=0，不再需要调度器）"""
 
-    def __init__(self, scheduler_type='cubic'):
-        self.scheduler = KappaScheduler(scheduler_type)
+    def __init__(self):
+        pass
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
                            gap_token: int, tokenizer) -> torch.Tensor:

@@ -570,6 +570,26 @@ class Logger:
             msg = separator
             self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
 
+    def log_greedy_search_sequence_format(self, input_ids_head, base_length,
+                                         effective_length, current_tokens_head, level=2):
+        """记录推理序列格式信息
+
+        Args:
+            input_ids_head: input_ids的前几个token
+            base_length: 基础序列长度
+            effective_length: 有效序列长度
+            current_tokens_head: current_tokens的前几个token
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        self.log("SEQUENCE_FORMAT",
+                f"推理序列格式验证 | input_ids[0:5]={input_ids_head} | "
+                f"base_length={base_length} | effective_length={effective_length} | "
+                f"current_tokens={current_tokens_head}",
+                "simple_search", level=level)
+
     def log_greedy_search_insert_probs(self, position, lambda_rate, tokens, probs, level=2):
         """记录插入操作的预测概率
 

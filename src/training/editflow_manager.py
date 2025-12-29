@@ -14,7 +14,6 @@ from accelerate.utils import set_seed
 # from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
 from .flow import (
-    # KappaScheduler, sample_conditional_path,  # 已移除：不再需要时间调度器
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
 )
@@ -252,7 +251,7 @@ class EditFlowManager:
         ).to(self.device)
 
         # 创建优化器和损失函数
-        criterion = ContinuousFlowLoss(scheduler_type='cubic')
+        criterion = ContinuousFlowLoss()
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate * self.LEARNING_RATE_SCALE,
@@ -679,9 +678,6 @@ class EditFlowManager:
                     'mixed_precision': str(self.accelerator.mixed_precision),
                 }
             }
-
-            if is_final:
-                config_data['scheduler_type'] = 'cubic'
 
             # 保存配置信息
             config_path = os.path.join(checkpoint_dir, "training_config.json")
