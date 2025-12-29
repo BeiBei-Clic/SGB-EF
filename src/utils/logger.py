@@ -24,6 +24,7 @@ class Logger:
     TRAIN_DEBUG_LOG = "logs/training_debug.log"
     INFERENCE_LOG = "logs/inference.log"
     SAMPLE_LOG = "logs/sample_generation.log"
+    CRASH_LOG = "logs/training_crash.log"
 
     MAX_LOG_LINES = 100000
     _log_line_count = {}
@@ -180,6 +181,90 @@ class Logger:
                     msg += " | HAS_INF"
         else:
             msg += f" | type={type(tensor)} | value={tensor}"
+
+        # 根据级别选择日志文件
+        if level == 1:
+            self._write(msg, self.TRAIN_LOG)
+        elif level == 2:
+            self._write(msg, self.TRAIN_DEBUG_LOG)
+        else:
+            self._write(msg, self.INFERENCE_LOG)
+
+    def tensor_values(self, tensor_name, tensor, context="", level=2,
+                      max_elements=100, sample_first_n=5, sample_last_n=5):
+        """记录张量的完整内容（直接输出变量值）
+
+        Args:
+            tensor_name (str): 张量名称
+            tensor: 张量对象
+            context (str): 上下文
+            level (int): 日志级别
+            max_elements (int): 最大元素数量，超过则采样显示
+            sample_first_n (int): 当元素过多时，显示前N个
+            sample_last_n (int): 当元素过多时，显示后N个
+        """
+        if not self.enabled:
+            return
+
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        msg = f"{timestamp} TENSOR_VALUES {tensor_name}"
+        if context:
+            msg += f" [{context}]"
+
+        if isinstance(tensor, torch.Tensor):
+            msg += f" | shape={list(tensor.shape)} | dtype={tensor.dtype} | device={tensor.device}"
+            tensor_cpu = tensor.detach().cpu()
+
+            # 转换为numpy数组便于处理
+            if tensor_cpu.numel() == 0:
+                msg += " | EMPTY"
+            elif tensor_cpu.numel() <= max_elements:
+                # 元素较少，显示所有内容
+                values = tensor_cpu.flatten().numpy()
+                values_str = ", ".join([f"{v:.6f}" for v in values])
+                msg += f" | values=[{values_str}]"
+            else:
+                # 元素过多，显示采样
+                values = tensor_cpu.flatten().numpy()
+                total = len(values)
+                first_vals = values[:sample_first_n]
+                last_vals = values[-sample_last_n:]
+
+                first_str = ", ".join([f"{v:.6f}" for v in first_vals])
+                last_str = ", ".join([f"{v:.6f}" for v in last_vals])
+
+                msg += f" | total_elements={total} | sampled: first_{sample_first_n}=[{first_str}] ... last_{sample_last_n}=[{last_str}]"
+
+                # 额外统计信息
+                msg += f" | min={values.min():.6f} | max={values.max():.6f} | mean={values.mean():.6f} | std={values.std():.6f}"
+
+        elif isinstance(tensor, np.ndarray):
+            msg += f" | shape={list(tensor.shape)} | dtype={tensor.dtype}"
+
+            if tensor.size == 0:
+                msg += " | EMPTY"
+            elif tensor.size <= max_elements:
+                # 元素较少，显示所有内容
+                values = tensor.flatten()
+                values_str = ", ".join([f"{v:.6f}" for v in values])
+                msg += f" | values=[{values_str}]"
+            else:
+                # 元素过多，显示采样
+                values = tensor.flatten()
+                total = len(values)
+                first_vals = values[:sample_first_n]
+                last_vals = values[-sample_last_n:]
+
+                first_str = ", ".join([f"{v:.6f}" for v in first_vals])
+                last_str = ", ".join([f"{v:.6f}" for v in last_vals])
+
+                msg += f" | total_elements={total} | sampled: first_{sample_first_n}=[{first_str}] ... last_{sample_last_n}=[{last_str}]"
+
+                # 额外统计信息
+                msg += f" | min={values.min():.6f} | max={values.max():.6f} | mean={values.mean():.6f} | std={values.std():.6f}"
+        else:
+            # 标量或其他类型
+            msg += f" | type={type(tensor).__name__} | value={tensor}"
 
         # 根据级别选择日志文件
         if level == 1:
@@ -549,6 +634,69 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] TIMEOUT: Sample generation exceeded {timeout_seconds}s"
         self._write(msg, self.SAMPLE_LOG)
 
+    # ==================== 编辑操作日志 ====================
+
+    def log_edit_operations(self, u_mask_sample, x_t_sample, vocab_size,
+                           context="", level=2, max_ops=20):
+        """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）
+
+        Args:
+            u_mask_sample: [x_seq_len, 2*vocab_size+1] 的one-hot掩码
+            x_t_sample: [x_seq_len] 的当前序列token IDs
+            vocab_size: 词汇表大小
+            context: 上下文标识
+            level: 日志级别
+            max_ops: 最多显示的操作数量
+        """
+        if not self.enabled:
+            return
+
+        ops = []
+        x_seq_len = u_mask_sample.shape[0]
+        pad_token_id = 0  # 假设pad token ID为0
+
+        for pos in range(x_seq_len):
+            # 跳过pad位置
+            if x_t_sample[pos].item() == pad_token_id:
+                break
+
+            # 检查是否需要操作
+            if u_mask_sample[pos].any():
+                # 检查插入操作 (前vocab_size维)
+                ins_idx = u_mask_sample[pos, :vocab_size].nonzero(as_tuple=False)
+                if ins_idx.numel() > 0:
+                    token_id = ins_idx[0].item()
+                    ops.append(f"pos{pos}: INSERT id({token_id})")
+
+                # 检查替换操作 (中间vocab_size维, 偏移vocab_size)
+                sub_idx = u_mask_sample[pos, vocab_size:2*vocab_size].nonzero(as_tuple=False)
+                if sub_idx.numel() > 0:
+                    token_id = sub_idx[0].item()
+                    current_id = x_t_sample[pos].item()
+                    ops.append(f"pos{pos}: SUBSTITUTE id({current_id})→id({token_id})")
+
+                # 检查删除操作 (最后一维)
+                if u_mask_sample[pos, -1].item():
+                    current_id = x_t_sample[pos].item()
+                    ops.append(f"pos{pos}: DELETE id({current_id})")
+
+            # 限制显示数量
+            if len(ops) >= max_ops:
+                remaining = sum([u_mask_sample[i].any().item() for i in range(pos, x_seq_len)]) - (len(ops) if pos < x_seq_len - 1 else 0)
+                if remaining > 0:
+                    ops.append(f"... (还有{remaining}个操作)")
+                break
+
+        # 记录解码后的操作
+        if ops:
+            self.log("GT_EDIT_OPS_DECODED",
+                    f"Ground Truth编辑操作 ({len(ops)}个): {' | '.join(ops)}",
+                    context, level=level)
+        else:
+            self.log("GT_EDIT_OPS_DECODED",
+                    "Ground Truth编辑操作: 无操作（序列完全匹配）",
+                    context, level=level)
+
     # ==================== 束搜索推理日志 ====================
 
     def log_greedy_search_separator(self, title="", level=2):
@@ -849,6 +997,66 @@ class Logger:
                 f"del_rate: mean={lambda_del.mean():.4f} max={lambda_del.max():.4f} | "
                 f"sub_rate: mean={lambda_sub.mean():.4f} max={lambda_sub.max():.4f}",
                 context, level=level)
+
+    def log_crash(self, step_name, batch_idx, dimension, error, extra_info=None):
+        """记录训练崩溃信息到专门的crash日志文件
+
+        Args:
+            step_name (str): 崩溃发生的步骤名称（如 "BACKWARD", "OPTIMIZER_STEP"）
+            batch_idx (int): 崩溃时的批次索引
+            dimension (str): 崩溃时的维度
+            error (Exception): 捕获的异常对象
+            extra_info (str): 额外的诊断信息（可选）
+        """
+        import traceback
+        import sys
+
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 收集GPU内存信息
+        gpu_info = ""
+        try:
+            if torch.cuda.is_available():
+                gpu_info = "\nGPU内存状态:\n"
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    reserved = torch.cuda.memory_reserved(i) / 1024**3
+                    gpu_info += f"  GPU {i}: 已分配 {allocated:.2f}GB, 已保留 {reserved:.2f}GB\n"
+        except:
+            gpu_info = "\nGPU内存信息获取失败\n"
+
+        # 构建崩溃日志
+        crash_info = f"""
+{'='*60}
+训练崩溃 - {step_name}
+{'='*60}
+时间: {timestamp}
+批次: {batch_idx}
+维度: {dimension}
+步骤: {step_name}
+错误类型: {type(error).__name__}
+错误信息: {str(error)}
+{gpu_info}
+异常栈:
+{traceback.format_exc()}
+"""
+
+        if extra_info:
+            crash_info += f"\n额外信息:\n{extra_info}\n"
+
+        crash_info += f"{'='*60}\n"
+
+        # 写入crash日志文件（始终写入，不受enabled限制）
+        try:
+            with open(self.CRASH_LOG, 'a', encoding='utf-8') as f:
+                f.write(crash_info)
+        except Exception as e:
+            # 如果无法写入crash日志，至少打印到标准错误
+            print(f"无法写入崩溃日志: {e}", file=sys.stderr)
+            print(crash_info, file=sys.stderr)
+
+        # 同时输出到标准错误
+        print(crash_info, file=sys.stderr)
 
 
 __all__ = ['Logger']

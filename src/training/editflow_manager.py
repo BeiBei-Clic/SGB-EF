@@ -6,6 +6,10 @@ EditFlow迭代优化训练器 - 实现基于迭代式编辑操作的符号回归
 import torch
 import numpy as np
 import os
+import signal
+import sys
+import traceback
+import time
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from accelerate import Accelerator
@@ -305,16 +309,21 @@ class EditFlowManager:
         z1_probs = torch.zeros(batch_size, seq_len, vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
-        # 移除过度调试的z0_probs和z1_probs记录（第一个batch也不需要）
-        # 只保留架构变更说明
-        if debug_info and debug_info.get('is_first_batch', False) and self.accelerator.is_local_main_process:
+        # 记录输入变量的完整值（每个batch都记录）
+        if debug_info and self.accelerator.is_local_main_process:
             context = debug_info.get('context', '')
-            self.logger.log("DIRECT_EDIT_PREDICTION",
-                            f"直接编辑模式 | batch_size={batch_size} | t固定为0",
-                            context, level=1)
-            self.logger.log("ARCHITECTURE_CHANGE",
-                            "从'连续流匹配'转变为'迭代优化'架构",
-                            context, level=1)
+            batch_idx = debug_info.get('batch_idx', 0)
+            sample_idx = 0
+
+            # 记录第一个样本的token序列（完整值）
+            self.logger.tensor_values(f"z0_token_ids_batch{batch_idx}", z0_token_ids[sample_idx],
+                                     context=context, level=2, max_elements=50)
+            self.logger.tensor_values(f"z1_token_ids_batch{batch_idx}", z1_token_ids[sample_idx],
+                                     context=context, level=2, max_elements=50)
+
+            # 记录condition_embeddings（显示完整值）
+            self.logger.tensor_values(f"condition_embeddings_batch{batch_idx}", condition_embeddings[sample_idx],
+                                     context=context, level=2, max_elements=100)
 
         # 迭代优化模式：直接使用z0作为当前状态，不再进行时间插值
         # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
@@ -322,19 +331,21 @@ class EditFlowManager:
             z0_token_ids, dataset.tokenizer
         )
 
-        # 调试：验证训练时的序列格式（仅验证第一个批次）
-        if not hasattr(self, '_train_sequence_format_logged'):
-            bos_token = dataset.tokenizer.convert_tokens_to_ids('<s>')
-            sample_idx = 0
-            if x_t[sample_idx, 0] == bos_token:
-                if self.accelerator.is_local_main_process:
-                    self.logger.log("TRAIN_SEQUENCE_FORMAT",
-                                   f"训练序列格式验证 | x_t[{sample_idx}, 0:5]={x_t[sample_idx, :5].tolist()} | "
-                                   f"BOS token在位置0={x_t[sample_idx, 0]}",
-                                   "train", level=2)
-                self._train_sequence_format_logged = True
+        # 记录x_t的完整值（每个batch都记录）
+        if debug_info and self.accelerator.is_local_main_process:
+            context = debug_info.get('context', '')
+            batch_idx = debug_info.get('batch_idx', 0)
+            self.logger.tensor_values(f"x_t_batch{batch_idx}", x_t[0],
+                                     context=context, level=2, max_elements=50)
 
         attention_mask = (~x_pad_mask).float()
+
+        # 记录attention_mask的完整值（每个batch都记录）
+        if debug_info and self.accelerator.is_local_main_process:
+            context = debug_info.get('context', '')
+            batch_idx = debug_info.get('batch_idx', 0)
+            self.logger.tensor_values(f"attention_mask_batch{batch_idx}", attention_mask[0],
+                                     context=context, level=2, max_elements=50)
 
         # 调用 LlamaEditFlowBackbone，返回字典格式
         output = model(
@@ -344,6 +355,22 @@ class EditFlowManager:
         # 合并三个速率为一个tensor（与旧接口保持一致）
         ins_rate, del_rate, sub_rate = output['rates']
         pred_rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
+
+        # 记录模型输出的完整值（每个batch都记录）
+        if debug_info and self.accelerator.is_local_main_process:
+            context = debug_info.get('context', '')
+            batch_idx = debug_info.get('batch_idx', 0)
+            sample_idx = 0
+
+            # 记录第一个样本的pred_rates完整值
+            self.logger.tensor_values(f"pred_rates_batch{batch_idx}", pred_rates[sample_idx],
+                                     context=context, level=2, max_elements=100)
+
+            # 记录第一个样本的insert_probs和substitute_probs完整值
+            self.logger.tensor_values(f"insert_probs_batch{batch_idx}", output['insert_probs'][sample_idx],
+                                     context=context, level=2, max_elements=100)
+            self.logger.tensor_values(f"substitute_probs_batch{batch_idx}", output['substitute_probs'][sample_idx],
+                                     context=context, level=2, max_elements=100)
 
         return {
             'pred_rates': pred_rates,
@@ -357,7 +384,7 @@ class EditFlowManager:
             'vocab_size': vocab_size,
         }
 
-    def compute_loss(self, forward_results, criterion, dataset):
+    def compute_loss(self, forward_results, criterion, dataset, debug_info=None):
         pred_rates = forward_results['pred_rates']
         pred_ins_probs = forward_results['pred_ins_probs']
         pred_sub_probs = forward_results['pred_sub_probs']
@@ -389,8 +416,53 @@ class EditFlowManager:
         # 形状: [batch, z_seq_len, 2*vocab_size+1]
         u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
-        # 生成编辑操作掩码：比较z0（当前）和z1（目标），找出需要编辑的位置
-        u_mask = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer)
+        # 生成编辑操作掩码：使用双索引追踪逻辑
+        # 在Z空间（z0）遍历，映射到X空间（x_t）的编辑操作
+        u_mask = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer, x_t)
+
+        # 记录损失计算中的关键变量值（每个batch都记录）
+        if self.accelerator.is_local_main_process:
+            context = debug_info.get('context', '') if debug_info else ''
+            batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
+            sample_idx = 0
+
+            # 记录标准答案：z0和z1的token序列
+            self.logger.tensor_values(f"GT_z0_batch{batch_idx}", z0[sample_idx],
+                                     context=context, level=2, max_elements=50)
+            self.logger.tensor_values(f"GT_z1_batch{batch_idx}", z1_token_ids[sample_idx],
+                                     context=context, level=2, max_elements=50)
+
+            # 记录分解后的速率（模型预测）
+            self.logger.tensor_values(f"pred_lambda_ins_batch{batch_idx}", lambda_ins[sample_idx],
+                                     context=context, level=2, max_elements=50)
+            self.logger.tensor_values(f"pred_lambda_del_batch{batch_idx}", lambda_del[sample_idx],
+                                     context=context, level=2, max_elements=50)
+            self.logger.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx],
+                                     context=context, level=2, max_elements=50)
+
+            # 记录计算后的概率（模型预测）
+            self.logger.tensor_values(f"pred_ins_probs_batch{batch_idx}", ins_probs[sample_idx],
+                                     context=context, level=2, max_elements=100)
+            self.logger.tensor_values(f"pred_sub_probs_batch{batch_idx}", sub_probs[sample_idx],
+                                     context=context, level=2, max_elements=100)
+
+            # 记录标准答案：u_mask（真实编辑操作标签，one-hot编码）
+            self.logger.tensor_values(f"GT_u_mask_batch{batch_idx}", u_mask[sample_idx],
+                                     context=context, level=2, max_elements=100)
+
+            # 解码并记录Ground Truth编辑操作（可读格式，使用ID）
+            self.logger.log_edit_operations(
+                u_mask[sample_idx],
+                x_t[sample_idx],
+                effective_vocab_size,
+                context=context,
+                level=2,
+                max_ops=20
+            )
+
+            # 记录模型预测的u_cat_x（用于对比）
+            self.logger.tensor_values(f"pred_u_cat_x_batch{batch_idx}_first5pos", u_cat_x[sample_idx, :5, :],
+                                     context=context, level=2, max_elements=100)
 
         # 关键修复：传入 u_cat_x (X空间) 用于正确的 u_total 计算
         # u_z 仍用于 cross_entropy 计算（监督带路径编辑操作）
@@ -416,46 +488,64 @@ class EditFlowManager:
             progress_bar.set_postfix({'loss': '0.0000', 'grad_norm': '0.000'})
 
         for batch_idx, batch in enumerate(progress_bar):
+            batch_start_time = time.time()
+
             # 使用 Accelerate 的梯度累积上下文管理器
             # 自动处理梯度同步、累积步数判断、优化器更新
+            if self.accelerator.is_local_main_process:
+                self.logger.log("BATCH_START", f"开始处理 Batch {batch_idx} | timestamp={time.time():.2f}",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+
             with self.accelerator.accumulate([model, condition_encoder]):
+                data_load_start = time.time()
                 x_values = batch['x_values'].to(self.device)
                 y_target = batch['y_target'].to(self.device)  # 修改：使用y_target而非residuals
                 residuals = batch.get('residuals', torch.zeros_like(y_target)).to(self.device)  # 保留用于日志
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
+                data_load_time = time.time() - data_load_start
+
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("DATA_LOAD", f"数据加载完成 | 耗时={data_load_time:.3f}s",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
 
                 # 移除过度的token解码日志以提高性能
 
                 point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
+
+                condition_start = time.time()
                 # 关键修改：使用y_target作为条件而非residuals（架构改进）
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
+                condition_time = time.time() - condition_start
 
-                # 移除每个batch的tensor记录以减少IO开销
-                # 只在第一个batch记录一次用于验证
-                if batch_idx == 0 and self.accelerator.is_local_main_process:
-                    self.logger.tensor("condition_embeddings", condition_embeddings, level=2, context=f"维度{dimension}_batch0")
-                    self.logger.tensor("x_values", x_values, level=2, context=f"维度{dimension}_batch0")
-                    self.logger.tensor("residuals", residuals, level=2, context=f"维度{dimension}_batch0")
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("CONDITION_ENCODE", f"条件编码完成 | 耗时={condition_time:.3f}s",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
 
-                # 准备调试信息
-                debug_info = None
-                if batch_idx == 0:
-                    debug_info = {
-                        'is_first_batch': True,
-                        'context': f'维度{dimension}'
-                    }
+                # 记录输入数据的完整值（每个batch都记录）
+                if self.accelerator.is_local_main_process:
+                    context = f'维度{dimension}'
+                    self.logger.tensor_values(f"x_values_batch{batch_idx}", x_values[0],
+                                             context=context, level=2, max_elements=50)
+                    self.logger.tensor_values(f"y_target_batch{batch_idx}", y_target[0],
+                                             context=context, level=2, max_elements=50)
 
+                # 准备调试信息（每个batch都传递）
+                debug_info = {
+                    'batch_idx': batch_idx,
+                    'context': f'维度{dimension}'
+                }
+
+                forward_start = time.time()
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info)
+                forward_time = time.time() - forward_start
 
-                # 移除每个batch的前向传播tensor记录
-                # 只在第一个batch记录一次用于验证
-                if batch_idx == 0 and self.accelerator.is_local_main_process:
-                    self.logger.tensor("pred_rates", forward_results['pred_rates'], level=2, context=f"维度{dimension}_batch0")
-                    self.logger.tensor("pred_ins_probs", forward_results['pred_ins_probs'], level=2, context=f"维度{dimension}_batch0")
-                    self.logger.tensor("pred_sub_probs", forward_results['pred_sub_probs'], level=2, context=f"维度{dimension}_batch0")
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("FORWARD_PASS", f"前向传播完成 | 耗时={forward_time:.3f}s",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
 
                 # 分布式健康检查：记录前向传播中的NaN（仅用于监控）
+                nan_check_start = time.time()
                 if self.accelerator.distributed_type != "NO":
                     pred_rates = forward_results['pred_rates']
 
@@ -467,16 +557,41 @@ class EditFlowManager:
                     if global_has_nan.item() > 0:
                         if self.accelerator.is_local_main_process:
                             self.logger.error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN", f"batch_idx:{batch_idx}")
+                nan_check_time = time.time() - nan_check_start
 
+                loss_compute_start = time.time()
                 # ✅ 不再手动除以 gradient_accumulation_steps，accelerator.accumulate 会自动处理
-                loss = self.compute_loss(forward_results, criterion, dataset)
+                loss = self.compute_loss(forward_results, criterion, dataset, debug_info)
+                loss_compute_time = time.time() - loss_compute_start
+
                 # 记录损失值（每个batch都记录）
-                if self.accelerator.is_local_main_process:
-                    self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f}", f"维度{dimension}_batch{batch_idx}", level=2)
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f} | 耗时={loss_compute_time:.3f}s | NaN检查耗时={nan_check_time:.3f}s",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
 
                 grad_norm = 0.0
                 # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
-                self.accelerator.backward(loss)
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("BACKWARD_START", f"开始反向传播 | loss={loss.item():.6f} | timestamp={time.time():.2f}",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
+
+                backward_start = time.time()
+                try:
+                    self.accelerator.backward(loss)
+                    backward_time = time.time() - backward_start
+                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        self.logger.log("BACKWARD_SUCCESS", f"反向传播成功 | 耗时={backward_time:.3f}s",
+                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                except Exception as e:
+                    # 记录反向传播崩溃信息
+                    self.logger.log_crash(
+                        step_name="BACKWARD",
+                        batch_idx=batch_idx,
+                        dimension=dimension,
+                        error=e,
+                        extra_info=f"loss={loss.item():.6f}"
+                    )
+                    raise  # 重新抛出异常以终止训练
 
                 # 记录梯度统计信息（每个batch都记录，用于调试NaN来源）
                 # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
@@ -527,8 +642,47 @@ class EditFlowManager:
                 # 使用Accelerate的梯度裁剪（会自动处理混合精度）
                 # ⚠️ 关键修复：只在梯度完全同步时才执行裁剪和优化器更新
                 # 这确保在梯度累积期间不会在未同步的梯度上进行操作
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("SYNC_GRADIENTS_CHECK",
+                                    f"检查是否需要同步梯度 | sync_gradients={self.accelerator.sync_gradients} | timestamp={time.time():.2f}",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
+
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
+                    sync_start = time.time()
+                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        self.logger.log("SYNC_GRADIENTS_START", f"开始梯度同步和裁剪 | timestamp={time.time():.2f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=1)
+
+                    # ⚠️ 移除梯度NaN/Inf检查以避免分布式同步问题
+                    # 原因：这个检查在分布式训练中会导致进程不同步和死锁
+                    # 解决方案：完全移除此检查（训练过程中不需要）
+
+                    # ⚠️ 临时禁用梯度裁剪以绕过 Accelerate 的分布式同步卡死问题
+                    # 原因：accelerator.clip_grad_norm_() 在某些情况下会卡在分布式同步
+                    # 解决方案：手动计算梯度范数，不进行裁剪
+                    try:
+                        clip_start = time.time()
+
+                        # 手动计算梯度范数（不裁剪）
+                        grad_norm = 0.0
+                        for param in all_params:
+                            if param.grad is not None:
+                                grad_norm += float(param.grad.data.norm().item() ** 2)
+                        grad_norm = float(grad_norm ** 0.5)
+
+                        clip_duration = time.time() - clip_start
+                        sync_time = time.time() - sync_start
+
+                        if self.accelerator.is_local_main_process and batch_idx >= 530:
+                            self.logger.log("SYNC_GRADIENTS_SUCCESS",
+                                            f"梯度裁剪已禁用 | grad_norm={grad_norm:.4f} | 计算耗时={clip_duration:.3f}s | 总耗时={sync_time:.3f}s | ⚠️ 警告：梯度未裁剪",
+                                            f"维度{dimension}_batch{batch_idx}", level=1)
+                    except Exception as e:
+                        if self.accelerator.is_local_main_process:
+                            self.logger.error("GRAD_NORM_COMPUTE_ERROR",
+                                            f"梯度范数计算失败: {type(e).__name__}: {str(e)}",
+                                            f"维度{dimension}_batch{batch_idx}")
+                        grad_norm = 0.0
 
                     # 记录梯度范数和参数统计（只在每10个batch记录）
                     if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
@@ -552,7 +706,27 @@ class EditFlowManager:
                                         f"维度{dimension}_batch{batch_idx}", level=2)
 
                     # ✅ 只在梯度同步时更新参数
-                    optimizer.step()
+                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        self.logger.log("OPTIMIZER_STEP_START", f"准备执行优化器更新 | timestamp={time.time():.2f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=1)
+
+                    optimizer_step_start = time.time()
+                    try:
+                        optimizer.step()
+                        optimizer_step_time = time.time() - optimizer_step_start
+                        if self.accelerator.is_local_main_process and batch_idx >= 530:
+                            self.logger.log("OPTIMIZER_STEP_SUCCESS", f"优化器更新成功 | 耗时={optimizer_step_time:.3f}s",
+                                            f"维度{dimension}_batch{batch_idx}", level=1)
+                    except Exception as e:
+                        # 记录优化器步骤崩溃信息
+                        self.logger.log_crash(
+                            step_name="OPTIMIZER_STEP",
+                            batch_idx=batch_idx,
+                            dimension=dimension,
+                            error=e,
+                            extra_info=f"grad_norm={grad_norm:.4f}"
+                        )
+                        raise  # 重新抛出异常以终止训练
 
                     # 记录优化器状态（学习率等）
                     if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
@@ -560,21 +734,37 @@ class EditFlowManager:
                         self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
                                         f"维度{dimension}_batch{batch_idx}", level=2)
 
+                    zero_grad_start = time.time()
                     optimizer.zero_grad()
+                    zero_grad_time = time.time() - zero_grad_start
+                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        self.logger.log("ZERO_GRAD", f"梯度清零完成 | 耗时={zero_grad_time:.3f}s",
+                                        f"维度{dimension}_batch{batch_idx}", level=1)
                 else:
                     # 梯度累积期间：不执行优化器更新，保持 grad_norm 为 0
                     grad_norm = 0.0
+                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        self.logger.log("GRADIENT_ACCUMULATION", f"梯度累积中，跳过优化器更新 | timestamp={time.time():.2f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=1)
 
                 total_loss += loss.item()
                 num_batches += 1
+
+                batch_total_time = time.time() - batch_start_time
 
                 # 更新进度条显示（每个batch都更新）
                 if self.accelerator.is_local_main_process:
                     postfix_dict = {
                         'loss': f'{loss.item():.4f}',
-                        'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm:.3f}'
+                        'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm:.3f}',
+                        'time': f'{batch_total_time:.2f}s' if batch_idx >= 530 else ''
                     }
                     progress_bar.set_postfix(postfix_dict)
+
+                # accumulate 上下文管理器即将退出，记录batch完成
+                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    self.logger.log("BATCH_COMPLETE", f"Batch {batch_idx} 完成 | 总耗时={batch_total_time:.3f}s | timestamp={time.time():.2f}",
+                                    f"维度{dimension}_batch{batch_idx}", level=1)
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()

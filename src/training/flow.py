@@ -82,21 +82,85 @@ class ContinuousFlowLoss:
         pass
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
-                           gap_token: int, tokenizer) -> torch.Tensor:
+                           gap_token: int, tokenizer, x_t: torch.Tensor) -> torch.Tensor:
+        """
+        根据论文Fig. 13的双索引追踪逻辑，生成正确的编辑操作掩码
+
+        核心思想：在Z空间（含gap）遍历，动态维护X空间（无gap）的索引指针
+
+        Args:
+            z_t: 当前状态（Z空间，含gap）[batch, z_seq_len]
+            z_1: 目标状态（Z空间，含gap）[batch, z_seq_len]
+            vocab_size: 词汇表大小
+            gap_token: gap token的ID
+            tokenizer: 分词器
+            x_t: 当前状态（X空间，无gap）[batch, x_seq_len] - 用于双索引映射
+
+        Returns:
+            u_mask: 编辑操作掩码 [batch, x_seq_len, 2*vocab_size+1]
+                    每个位置对应：[vocab_size个插入操作, vocab_size个替换操作, 1个删除操作]
+        """
         batch_size, z_seq_len = z_t.shape
-        n_ops = 2 * vocab_size + 1
+        x_seq_len = x_t.shape[1]
+        n_ops = 2 * vocab_size + 1  # 插入(vocab_size) + 替换(vocab_size) + 删除(1)
 
         pad_token = tokenizer.convert_tokens_to_ids('<pad>')
 
-        z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
-        z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq
-        z_del = (z_t != gap_token) & (z_1 == gap_token) & z_neq
-        z_sub = z_neq & ~z_ins & ~z_del
+        # 初始化输出掩码（在X空间）
+        u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
 
-        u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
-        u_mask[z_ins, z_1[z_ins]] = True
-        u_mask[z_sub, z_1[z_sub] + vocab_size] = True
-        u_mask[:, :, -1][z_del] = True
+        # 对每个样本进行双索引遍历（论文Fig. 13的核心逻辑）
+        for b in range(batch_size):
+            x_t_index = -1  # X空间指针初始化为-1（指向x_t的前一个位置）
+
+            for i in range(z_seq_len):
+                token_t = z_t[b, i].item()
+                token_1 = z_1[b, i].item()
+
+                # 跳过z_t和z_1的pad位置
+                if token_t == pad_token or token_1 == pad_token:
+                    continue
+
+                # === 关键步骤1：维护X空间指针 ===
+                # 如果z_t当前位置不是gap，说明它在x_t中占据一个位置
+                # 因此需要将x_t_index向前移动一位
+                if token_t != gap_token:
+                    x_t_index += 1  # 移动到x_t中的下一个位置
+
+                    # === 关键修复：检查x_t当前位置是否是pad ===
+                    # 如果x_t当前位置是pad，说明已经超出有效长度，停止遍历
+                    if x_t_index >= x_seq_len:
+                        break  # 超出x_t的有效长度，停止
+
+                    if x_t[b, x_t_index].item() == pad_token:
+                        break  # x_t当前位置是pad，说明已经是填充区域，停止
+
+                # === 关键步骤2：判断编辑类型并标记 ===
+                # 根据z_t[i]和z_1[i]的关系，决定在x_t[x_t_index]位置执行什么操作
+
+                if token_t == gap_token and token_1 != gap_token:
+                    # 插入操作：
+                    # z_t[i]是gap，z_1[i]是有效token
+                    # 意味着需要在gap位置插入token_1
+                    # 由于gap不占X空间位置，插入操作标记在x_t_index位置（gap的前一个token）
+                    if x_t_index >= 0 and x_t_index < x_seq_len:
+                        u_mask[b, x_t_index, token_1] = True  # 插入token_1
+
+                elif token_t != gap_token and token_1 == gap_token:
+                    # 删除操作：
+                    # z_t[i]是有效token，z_1[i]是gap
+                    # 意味着需要删除当前token
+                    # 删除操作直接标记在x_t_index位置（当前token的位置）
+                    if x_t_index >= 0 and x_t_index < x_seq_len:
+                        u_mask[b, x_t_index, -1] = True  # 删除操作（最后一维）
+
+                elif token_t != gap_token and token_1 != gap_token and token_t != token_1:
+                    # 替换操作：
+                    # z_t[i]和z_1[i]都是有效token但不同
+                    # 意味着需要将token_t替换为token_1
+                    # 替换操作标记在x_t_index位置（偏移vocab_size以区分插入和替换）
+                    if x_t_index >= 0 and x_t_index < x_seq_len:
+                        u_mask[b, x_t_index, token_1 + vocab_size] = True  # 替换为token_1
 
         return u_mask
 
