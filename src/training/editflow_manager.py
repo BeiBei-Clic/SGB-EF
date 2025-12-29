@@ -297,7 +297,7 @@ class EditFlowManager:
         # 获取 vocab_size（从tokenizer获取，避免访问被DDP包装的model属性）
         vocab_size = dataset.tokenizer.vocab_size
 
-        # 直接使用z0作为输入状态（不再插值生成中间状态z_t）
+        # 迭代优化模式：使用z0作为当前状态的输入（z0 -> z1的编辑操作）
         batch_size, seq_len = z0_token_ids.shape
         z0_probs = torch.zeros(batch_size, seq_len, vocab_size, device=z0_token_ids.device)
         z0_probs.scatter_(2, z0_token_ids.unsqueeze(-1), 1.0)
@@ -317,15 +317,10 @@ class EditFlowManager:
                             "从'连续流匹配'转变为'迭代优化'架构",
                             context, level=1)
 
-        # 关键修改：直接使用z0作为z_t，不再进行插值
-        # 这消除了"假残差"问题，因为当前表达式与残差现在完全对齐
-        z_t_probs = z0_probs  # 3维概率分布: (batch_size, seq_len, vocab_size)
-
-        # 转换为 token IDs（因为 remove_gap_tokens 需要2维输入）
-        z_t_token_ids = torch.argmax(z_t_probs, dim=-1)  # 2维: (batch_size, seq_len)
-
+        # 迭代优化模式：直接使用z0作为当前状态，不再进行时间插值
+        # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z_t_token_ids, dataset.tokenizer
+            z0_token_ids, dataset.tokenizer
         )
 
         # 调试：验证训练时的序列格式（仅验证第一个批次）
@@ -356,8 +351,8 @@ class EditFlowManager:
             'pred_ins_probs': output['insert_probs'],
             'pred_sub_probs': output['substitute_probs'],
             'x_t': x_t,
-            'z_t': z_t_token_ids,  # 返回token IDs（2维），用于损失计算
-            'z1_token_ids': z1_token_ids,
+            'z0': z0_token_ids,  # 当前状态（起点），用于损失计算
+            'z1_token_ids': z1_token_ids,  # 目标状态（终点）
             'z_gap_mask': z_gap_mask,
             'z_pad_mask': z_pad_mask,
             'vocab_size': vocab_size,
@@ -368,8 +363,8 @@ class EditFlowManager:
         pred_ins_probs = forward_results['pred_ins_probs']
         pred_sub_probs = forward_results['pred_sub_probs']
         x_t = forward_results['x_t']
-        z_t = forward_results['z_t']
-        z1_token_ids = forward_results['z1_token_ids']
+        z0 = forward_results['z0']  # 当前状态（起点）
+        z1_token_ids = forward_results['z1_token_ids']  # 目标状态（终点）
         z_gap_mask = forward_results['z_gap_mask']
         z_pad_mask = forward_results['z_pad_mask']
         effective_vocab_size = forward_results['vocab_size']
@@ -395,7 +390,8 @@ class EditFlowManager:
         # 形状: [batch, z_seq_len, 2*vocab_size+1]
         u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
-        u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer)
+        # 生成编辑操作掩码：比较z0（当前）和z1（目标），找出需要编辑的位置
+        u_mask = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer)
 
         # 关键修复：传入 u_cat_x (X空间) 用于正确的 u_total 计算
         # u_z 仍用于 cross_entropy 计算（监督带路径编辑操作）
@@ -530,41 +526,45 @@ class EditFlowManager:
                                     f"维度{dimension}_batch{batch_idx}", level=2)
 
                 # 使用Accelerate的梯度裁剪（会自动处理混合精度）
-                # accumulate 会在适当的时机自动调用这个裁剪
-                grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
+                # ⚠️ 关键修复：只在梯度完全同步时才执行裁剪和优化器更新
+                # 这确保在梯度累积期间不会在未同步的梯度上进行操作
+                if self.accelerator.sync_gradients:
+                    grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
 
-                # 记录梯度范数和参数统计（只在每10个batch记录）
-                if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
-                    # 统计参数范数
-                    param_norm = 0.0
-                    param_max = 0.0
-                    param_mean = 0.0
-                    param_count = 0
-                    for param in all_params:
-                        if param.data is not None:
-                            param_count += 1
-                            param_norm += float(param.data.norm().item() ** 2)
-                            param_max = max(param_max, float(param.data.abs().max().item()))
-                            param_mean += float(param.data.abs().mean().item())
-                    param_norm = float(param_norm ** 0.5)
-                    param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
+                    # 记录梯度范数和参数统计（只在每10个batch记录）
+                    if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
+                        # 统计参数范数
+                        param_norm = 0.0
+                        param_max = 0.0
+                        param_mean = 0.0
+                        param_count = 0
+                        for param in all_params:
+                            if param.data is not None:
+                                param_count += 1
+                                param_norm += float(param.data.norm().item() ** 2)
+                                param_max = max(param_max, float(param.data.abs().max().item()))
+                                param_mean += float(param.data.abs().mean().item())
+                        param_norm = float(param_norm ** 0.5)
+                        param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
 
-                    self.logger.log("GRAD_NORM",
-                                    f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
-                                    f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
+                        self.logger.log("GRAD_NORM",
+                                        f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
+                                        f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
-                # ✅ 关键修复：手动调用 optimizer.step() 和 zero_grad()
-                # accelerator.accumulate() 只管理梯度累积和同步，不会自动更新参数
-                optimizer.step()
+                    # ✅ 只在梯度同步时更新参数
+                    optimizer.step()
 
-                # 记录优化器状态（学习率等）
-                if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
-                    current_lr = float(optimizer.param_groups[0]['lr'])
-                    self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
+                    # 记录优化器状态（学习率等）
+                    if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
+                        current_lr = float(optimizer.param_groups[0]['lr'])
+                        self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
-                optimizer.zero_grad()
+                    optimizer.zero_grad()
+                else:
+                    # 梯度累积期间：不执行优化器更新，保持 grad_norm 为 0
+                    grad_norm = 0.0
 
                 total_loss += loss.item()
                 num_batches += 1
