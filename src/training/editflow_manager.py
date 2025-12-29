@@ -421,7 +421,9 @@ class EditFlowManager:
 
         # 关键修复：传入 u_cat_x (X空间) 用于正确的 u_total 计算
         # u_z 仍用于 cross_entropy 计算（监督带路径编辑操作）
-        loss = criterion(u_cat_x, u_z, u_mask, t, effective_vocab_size, accelerator=self.accelerator)
+        # 传入 logger 用于记录详细的损失统计信息
+        loss = criterion(u_cat_x, u_z, u_mask, t, effective_vocab_size,
+                        accelerator=self.accelerator, logger=self.logger)
 
         return loss
 
@@ -563,16 +565,43 @@ class EditFlowManager:
 
                     if self.accelerator.is_local_main_process:
                         grad_max = 0.0
-                        grad_min = 0.0
+                        grad_min = float('inf')
+                        grad_mean = 0.0
+                        grad_std = 0.0
                         grad_has_nan = False
+                        grad_has_inf = False
+                        grad_num_zero = 0
+                        grad_num_params = 0
+
                         for param in all_params:
                             if param.grad is not None:
-                                if torch.isnan(param.grad).any():
+                                grad_num_params += 1
+                                grad_data = param.grad.data
+
+                                # 检查NaN和Inf
+                                if torch.isnan(grad_data).any():
                                     grad_has_nan = True
-                                    break
-                                grad_max = max(grad_max, param.grad.abs().max().item())
-                                grad_min = max(grad_min, param.grad.abs().min().item())
-                        self.logger.log("GRAD_STATS", f"max={grad_max:.6f} min={grad_min:.6f} has_nan={grad_has_nan}",
+                                if torch.isinf(grad_data).any():
+                                    grad_has_inf = True
+
+                                # 统计梯度值
+                                grad_abs = grad_data.abs()
+                                grad_max = max(grad_max, float(grad_abs.max().item()))
+                                grad_min = min(grad_min, float(grad_abs.min().item()))
+                                grad_mean += float(grad_abs.mean().item())
+                                grad_std += float(grad_abs.std().item())
+                                grad_num_zero += int((grad_data == 0).sum().item())
+
+                        # 计算平均值
+                        if grad_num_params > 0:
+                            grad_mean = float(grad_mean / grad_num_params)
+                            grad_std = float(grad_std / grad_num_params)
+
+                        # 记录详细的梯度统计
+                        self.logger.log("GRAD_STATS",
+                                        f"params={grad_num_params} | max={grad_max:.6f} min={grad_min:.6f} "
+                                        f"mean={grad_mean:.6f} std={grad_std:.6f} | zeros={grad_num_zero} "
+                                        f"has_nan={grad_has_nan} has_inf={grad_has_inf}",
                                         f"维度{dimension}_batch{batch_idx}", level=2)
 
                     # 检查是否有NaN梯度
@@ -593,14 +622,37 @@ class EditFlowManager:
                     # accumulate 会在适当的时机自动调用这个裁剪
                     grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
 
-                    # 记录梯度范数
+                    # 记录梯度范数和参数统计
                     if self.accelerator.is_local_main_process:
-                        self.logger.log("GRAD_NORM", f"grad_norm={grad_norm:.4f}",
+                        # 统计参数范数
+                        param_norm = 0.0
+                        param_max = 0.0
+                        param_mean = 0.0
+                        param_count = 0
+                        for param in all_params:
+                            if param.data is not None:
+                                param_count += 1
+                                param_norm += float(param.data.norm().item() ** 2)
+                                param_max = max(param_max, float(param.data.abs().max().item()))
+                                param_mean += float(param.data.abs().mean().item())
+                        param_norm = float(param_norm ** 0.5)
+                        param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
+
+                        self.logger.log("GRAD_NORM",
+                                        f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
+                                        f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
                                         f"维度{dimension}_batch{batch_idx}", level=2)
 
                     # ✅ 关键修复：手动调用 optimizer.step() 和 zero_grad()
                     # accelerator.accumulate() 只管理梯度累积和同步，不会自动更新参数
                     optimizer.step()
+
+                    # 记录优化器状态（学习率等）
+                    if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
+                        current_lr = float(optimizer.param_groups[0]['lr'])
+                        self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
+
                     optimizer.zero_grad()
 
                 total_loss += loss.item()

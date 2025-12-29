@@ -133,7 +133,7 @@ class ContinuousFlowLoss:
         return u_mask
 
     def __call__(self, u_cat_x: torch.Tensor, u_z: torch.Tensor, u_mask: torch.Tensor,
-                 t: torch.Tensor, vocab_size: int, accelerator=None) -> torch.Tensor:
+                 t: torch.Tensor, vocab_size: int, accelerator=None, logger=None) -> torch.Tensor:
         """
         连续流损失计算
 
@@ -144,6 +144,7 @@ class ContinuousFlowLoss:
             t: 时间步 [batch, 1]
             vocab_size: 词汇表大小
             accelerator: Accelerate加速器
+            logger: 日志记录器（可选）
 
         Returns:
             loss: 标量损失值
@@ -153,6 +154,15 @@ class ContinuousFlowLoss:
         inf_count_x = torch.isinf(u_cat_x).sum().item()
         nan_count_z = torch.isnan(u_z).sum().item()
         inf_count_z = torch.isinf(u_z).sum().item()
+
+        # 额外检查：u_z 是否包含接近0的值（可能导致 log(0)）
+        u_z_min = float(u_z.min().item())
+        u_z_max = float(u_z.max().item())
+        u_z_mean = float(u_z.mean().item())
+        u_z_std = float(u_z.std().item())
+        u_z_has_near_zero = bool((u_z < 1e-10).any().item())
+        u_z_has_negative = bool((u_z < 0).any().item())
+        u_z_num_zeros = int((u_z == 0).sum().item())
 
         # 分布式NaN检测：如果使用accelerator，确保所有进程同步跳过
         has_nan_or_inf = torch.tensor(1 if ((nan_count_x > 0 or inf_count_x > 0) or (nan_count_z > 0 or inf_count_z > 0)) else 0,
@@ -175,16 +185,59 @@ class ContinuousFlowLoss:
         # 这确保了每个位置的速率只被计算一次，不会因gap重复而被重复计数
         u_total = u_cat_x.sum(dim=(1, 2))
 
-        # 调度系数
-        sched_coeff = (self.scheduler.derivative(t) / (1 - self.scheduler(t) + 1e-8)).squeeze(-1)
-        sched_coeff = torch.clamp(sched_coeff, min=-10, max=40)
+        # 归一化 u_z 使其成为有效的概率分布
+        # u_z 形状: [batch, z_seq_len, 2*vocab_size+1]
+        # 使用 logsumexp 技巧提高数值稳定性
+        u_z_max_for_softmax = u_z.max(dim=-1, keepdim=True)[0]  # [batch, z_seq_len, 1]
+        u_z_stable = u_z - u_z_max_for_softmax  # 减去最大值防止溢出
+        u_z_sum_stable = torch.exp(u_z_stable).sum(dim=-1, keepdim=True) + 1e-8
+        log_u_z = u_z_stable - torch.log(u_z_sum_stable)  # log_softmax
 
-        # cross_entropy 在 Z 空间计算（用于监督带路径编辑操作）
-        log_u_z = torch.log(torch.clamp(u_z, min=1e-12, max=1e12))
-        cross_entropy = (log_u_z * u_mask.float()).sum(dim=(1, 2))
+        # 统计信息：log_u_z（应该在负无穷到0之间）
+        log_u_z_min = float(log_u_z.min().item())
+        log_u_z_max = float(log_u_z.max().item())
+        log_u_z_mean = float(log_u_z.mean().item())
+        log_u_z_has_inf = bool(torch.isinf(log_u_z).any().item())
+        log_u_z_has_nan = bool(torch.isnan(log_u_z).any().item())
 
-        # 最终损失 = 速率总和 - 交叉熵 * 调度系数
-        loss = (u_total - cross_entropy * sched_coeff).mean()
+        # 统计信息：u_mask（标记需要预测的位置）
+        u_mask_num_true = int(u_mask.sum().item())
+        u_mask_total = int(u_mask.numel())
+        u_mask_sparsity = float(1.0 - (u_mask_num_true / u_mask_total))
+
+        # cross_entropy 在 Z 空间计算（负对数似然）
+        # u_mask 标记了正确的操作位置（one-hot编码）
+        # 只在 u_mask=True 的位置累加（其他位置不影响损失）
+        masked_log_u_z = log_u_z * u_mask.float()
+        cross_entropy = masked_log_u_z.sum(dim=(1, 2))
+
+        # 统计信息：cross_entropy（负对数似然，应该是负数）
+        cross_entropy_min = float(cross_entropy.min().item())
+        cross_entropy_max = float(cross_entropy.max().item())
+        cross_entropy_mean = float(cross_entropy.mean().item())
+        cross_entropy_std = float(cross_entropy.std().item() if cross_entropy.numel() > 1 else 0.0)
+
+        # 最终损失：负对数似然（要最小化）
+        # 不再使用 u_total 和 sched_coeff
+        loss = -cross_entropy.mean()
+
+        # 统计信息：loss
+        loss_value = float(loss.item())
+        loss_is_nan = bool(torch.isnan(loss).item())
+        loss_is_inf = bool(torch.isinf(loss).item())
+
+        # 记录所有统计信息到日志
+        if logger is not None:
+            logger.log(f"LOSS_STATS",
+                      f"u_z: min={u_z_min:.6f}, max={u_z_max:.6f}, mean={u_z_mean:.6f}, std={u_z_std:.6f} | "
+                      f"zeros={u_z_num_zeros}, near_zero={u_z_has_near_zero}, negative={u_z_has_negative} | "
+                      f"log_u_z: min={log_u_z_min:.6f}, max={log_u_z_max:.6f}, mean={log_u_z_mean:.6f} | "
+                      f"has_inf={log_u_z_has_inf}, has_nan={log_u_z_has_nan} | "
+                      f"u_mask: {u_mask_num_true}/{u_mask_total} ({(1-u_mask_sparsity)*100:.2f}%) | "
+                      f"cross_entropy: min={cross_entropy_min:.6f}, max={cross_entropy_max:.6f}, "
+                      f"mean={cross_entropy_mean:.6f}, std={cross_entropy_std:.6f} | "
+                      f"loss: {loss_value:.6f}, is_nan={loss_is_nan}, is_inf={loss_is_inf}",
+                      level=2)
 
         return loss
 
