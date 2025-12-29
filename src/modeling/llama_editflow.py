@@ -194,20 +194,6 @@ class LlamaEditFlowBackbone(nn.Module):
             nn.Linear(hidden_dim // 2, vocab_size)
         )
 
-        # 改进输出层初始化：使用较大的std避免logits过小
-        self._init_vocab_weights()
-
-    def _init_vocab_weights(self):
-        """改进词汇表输出层的初始化，避免softmax数值下溢"""
-        def init_fn(module):
-            if isinstance(module, nn.Linear):
-                # 使用较大的标准差初始化最后一层
-                nn.init.normal_(module.weight, mean=0.0, std=0.1)  # 比默认0.02大
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        self.ins_vocab_head.apply(init_fn)
-        self.sub_vocab_head.apply(init_fn)
 
     def forward(
         self,

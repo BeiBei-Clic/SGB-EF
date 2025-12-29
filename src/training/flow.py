@@ -163,7 +163,7 @@ class ContinuousFlowLoss:
         u_z_has_negative = bool((u_z < 0).any().item())
         u_z_num_zeros = int((u_z == 0).sum().item())
 
-        # 分布式NaN检测：如果使用accelerator，确保所有进程同步跳过
+        # 分布式NaN检测：如果使用accelerator，确保所有进程同步检测结果
         has_nan_or_inf = torch.tensor(1 if ((nan_count_x > 0 or inf_count_x > 0) or (nan_count_z > 0 or inf_count_z > 0)) else 0,
                                     device=u_cat_x.device)
 
@@ -175,9 +175,12 @@ class ContinuousFlowLoss:
         else:
             has_nan_or_inf = has_nan_or_inf.item()
 
-        # 如果任何进程包含NaN或Inf，抛出异常让训练循环跳过该批次
-        if has_nan_or_inf > 0:
-            raise ValueError(f"批次包含异常值: X空间NaN={nan_count_x}, Inf={inf_count_x}, Z空间NaN={nan_count_z}, Inf={inf_count_z}, 分布式检测={has_nan_or_inf}")
+        # 记录NaN/Inf检测结果（仅用于监控，不再抛出异常跳过）
+        if has_nan_or_inf > 0 and logger is not None and accelerator.is_local_main_process:
+            logger.error("INPUT_NAN_INF",
+                        f"检测到异常值: X空间NaN={nan_count_x}, Inf={inf_count_x}, "
+                        f"Z空间NaN={nan_count_z}, Inf={inf_count_z}, 分布式检测={has_nan_or_inf}",
+                        "compute_loss", level=1)
 
         # 关键修复：u_total 在 X 空间计算（原始序列空间，无gap重复）
         # u_cat_x 形状: [batch, x_seq_len, 2*vocab_size+1]

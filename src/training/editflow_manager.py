@@ -294,16 +294,20 @@ class EditFlowManager:
         """
         batch_size = z0_token_ids.size(0)
 
+        # 获取 vocab_size（从tokenizer获取，避免访问被DDP包装的model属性）
+        vocab_size = dataset.tokenizer.vocab_size
+
         # 直接使用z0作为输入状态（不再插值生成中间状态z_t）
         batch_size, seq_len = z0_token_ids.shape
-        z0_probs = torch.zeros(batch_size, seq_len, model.vocab_size, device=z0_token_ids.device)
+        z0_probs = torch.zeros(batch_size, seq_len, vocab_size, device=z0_token_ids.device)
         z0_probs.scatter_(2, z0_token_ids.unsqueeze(-1), 1.0)
 
         # z1 token序列用于计算目标编辑操作
-        z1_probs = torch.zeros(batch_size, seq_len, model.vocab_size, device=z1_token_ids.device)
+        z1_probs = torch.zeros(batch_size, seq_len, vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
-        # 记录修改后的训练信息（仅在第一个batch时）
+        # 移除过度调试的z0_probs和z1_probs记录（第一个batch也不需要）
+        # 只保留架构变更说明
         if debug_info and debug_info.get('is_first_batch', False) and self.accelerator.is_local_main_process:
             context = debug_info.get('context', '')
             self.logger.log("DIRECT_EDIT_PREDICTION",
@@ -312,14 +316,6 @@ class EditFlowManager:
             self.logger.log("ARCHITECTURE_CHANGE",
                             "从'连续流匹配'转变为'迭代优化'架构",
                             context, level=1)
-            self.logger.tensor("z0_probs", z0_probs, level=2, context=context)
-            self.logger.tensor("z1_probs", z1_probs, level=2, context=context)
-
-            # 记录token ID信息
-            for i in range(min(3, z0_token_ids.size(0))):
-                self.logger.log("TOKEN_SAMPLE_CHECK",
-                                f"样本{i} z0={z0_token_ids[i].tolist()} z1={z1_token_ids[i].tolist()} t={t[i].item():.4f}",
-                                context, level=3)
 
         # 关键修改：直接使用z0作为z_t，不再进行插值
         # 这消除了"假残差"问题，因为当前表达式与残差现在完全对齐
@@ -364,7 +360,7 @@ class EditFlowManager:
             'z1_token_ids': z1_token_ids,
             'z_gap_mask': z_gap_mask,
             'z_pad_mask': z_pad_mask,
-            'vocab_size': model.vocab_size,
+            'vocab_size': vocab_size,
         }
 
     def compute_loss(self, forward_results, criterion, dataset):
@@ -434,46 +430,18 @@ class EditFlowManager:
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
 
-                # 记录token解码信息
-                if self.accelerator.is_local_main_process:
-                    self.logger.log("TOKEN_DECODE", f"维度 {dimension} - 第一个batch的token解码信息", level=2)
-
-                    # 解码z0_token_ids
-                    vocab = dataset.tokenizer.get_vocab()
-                    id_to_token = {v: k for k, v in vocab.items()}
-
-                    z0_expressions = []
-                    for i in range(min(3, z0_token_ids.size(0))):
-                        z0_tokens = []
-                        for token_id in z0_token_ids[i].tolist():
-                            if token_id in id_to_token:
-                                token = id_to_token[token_id]
-                                z0_tokens.append(token)
-                        z0_expression = ','.join(z0_tokens) if z0_tokens else "<empty>"
-                        z0_expressions.append(f"样本{i}: {z0_expression}")
-
-                    z1_expressions = []
-                    for i in range(min(3, z1_token_ids.size(0))):
-                        z1_tokens = []
-                        for token_id in z1_token_ids[i].tolist():
-                            if token_id in id_to_token:
-                                token = id_to_token[token_id]
-                                z1_tokens.append(token)
-                        z1_expression = ','.join(z1_tokens) if z1_tokens else "<empty>"
-                        z1_expressions.append(f"样本{i}: {z1_expression}")
-
-                    self.logger.log("TOKEN_DECODE_Z0", "\n".join(z0_expressions), f"维度{dimension}", level=2)
-                    self.logger.log("TOKEN_DECODE_Z1", "\n".join(z1_expressions), f"维度{dimension}", level=2)
+                # 移除过度的token解码日志以提高性能
 
                 point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
                 # 关键修改：使用y_target作为条件而非residuals（架构改进）
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
 
-                # 记录条件嵌入信息（每个batch都记录，用于调试NaN来源）
-                if self.accelerator.is_local_main_process:
-                    self.logger.tensor("condition_embeddings", condition_embeddings, level=2, context=f"维度{dimension}_batch{batch_idx}")
-                    self.logger.tensor("x_values", x_values, level=2, context=f"维度{dimension}_batch{batch_idx}")
-                    self.logger.tensor("residuals", residuals, level=2, context=f"维度{dimension}_batch{batch_idx}")
+                # 移除每个batch的tensor记录以减少IO开销
+                # 只在第一个batch记录一次用于验证
+                if batch_idx == 0 and self.accelerator.is_local_main_process:
+                    self.logger.tensor("condition_embeddings", condition_embeddings, level=2, context=f"维度{dimension}_batch0")
+                    self.logger.tensor("x_values", x_values, level=2, context=f"维度{dimension}_batch0")
+                    self.logger.tensor("residuals", residuals, level=2, context=f"维度{dimension}_batch0")
 
                 # 准备调试信息
                 debug_info = None
@@ -485,13 +453,14 @@ class EditFlowManager:
 
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info)
 
-                # 记录前向传播输出（每个batch都记录，用于调试NaN来源）
-                if self.accelerator.is_local_main_process:
-                    self.logger.tensor("pred_rates", forward_results['pred_rates'], level=2, context=f"维度{dimension}_batch{batch_idx}")
-                    self.logger.tensor("pred_ins_probs", forward_results['pred_ins_probs'], level=2, context=f"维度{dimension}_batch{batch_idx}")
-                    self.logger.tensor("pred_sub_probs", forward_results['pred_sub_probs'], level=2, context=f"维度{dimension}_batch{batch_idx}")
+                # 移除每个batch的前向传播tensor记录
+                # 只在第一个batch记录一次用于验证
+                if batch_idx == 0 and self.accelerator.is_local_main_process:
+                    self.logger.tensor("pred_rates", forward_results['pred_rates'], level=2, context=f"维度{dimension}_batch0")
+                    self.logger.tensor("pred_ins_probs", forward_results['pred_ins_probs'], level=2, context=f"维度{dimension}_batch0")
+                    self.logger.tensor("pred_sub_probs", forward_results['pred_sub_probs'], level=2, context=f"维度{dimension}_batch0")
 
-                # 分布式健康检查：确保前向传播结果在不同进程间合理
+                # 分布式健康检查：记录前向传播中的NaN（仅用于监控）
                 if self.accelerator.distributed_type != "NO":
                     pred_rates = forward_results['pred_rates']
 
@@ -502,137 +471,100 @@ class EditFlowManager:
 
                     if global_has_nan.item() > 0:
                         if self.accelerator.is_local_main_process:
-                            self.logger.error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN，跳过批次", f"batch_idx:{batch_idx}")
-                        # 继续执行到criterion中的分布式NaN检测，那里会统一跳过
+                            self.logger.error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN", f"batch_idx:{batch_idx}")
 
-                # 尝试计算损失，如果包含NaN则跳过该批次
-                try:
-                    # ✅ 不再手动除以 gradient_accumulation_steps，accelerator.accumulate 会自动处理
-                    loss = self.compute_loss(forward_results, criterion, dataset)
-                    # 记录损失值（每个batch都记录）
-                    if self.accelerator.is_local_main_process:
-                        self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f}", f"维度{dimension}_batch{batch_idx}", level=2)
-                except ValueError as e:
-                    if "批次包含异常值" in str(e):
-                        self.logger.error("BATCH_SKIP", f"跳过批次 {batch_idx} (包含NaN/Inf): {e}", f"维度{dimension}")
-
-                        # 分布式同步：确保所有进程都到达这个点
-                        self.logger.log("SYNC_SKIP", f"所有进程同步跳过批次 {batch_idx}", f"维度{dimension}", level=2)
-
-                        # 等待所有进程都准备好跳过
-                        self.accelerator.wait_for_everyone()
-
-                        # 清理GPU内存
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                        # 再次同步确保所有进程都完成了清理
-                        self.accelerator.wait_for_everyone()
-
-                        continue  # 跳过此批次
-                    else:
-                        raise  # 重新抛出其他类型的ValueError
+                # ✅ 不再手动除以 gradient_accumulation_steps，accelerator.accumulate 会自动处理
+                loss = self.compute_loss(forward_results, criterion, dataset)
+                # 记录损失值（每个batch都记录）
+                if self.accelerator.is_local_main_process:
+                    self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f}", f"维度{dimension}_batch{batch_idx}", level=2)
 
                 grad_norm = 0.0
-                if not torch.isnan(loss):
-                    # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
-                    self.accelerator.backward(loss)
+                # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
+                self.accelerator.backward(loss)
 
-                    # 记录梯度统计信息（用于调试NaN来源）
-                    # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
-                    all_params = list(model.parameters()) + list(condition_encoder.parameters())
+                # 记录梯度统计信息（每个batch都记录，用于调试NaN来源）
+                # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
+                all_params = list(model.parameters()) + list(condition_encoder.parameters())
 
-                    if self.accelerator.is_local_main_process:
-                        grad_max = 0.0
-                        grad_min = float('inf')
-                        grad_mean = 0.0
-                        grad_std = 0.0
-                        grad_has_nan = False
-                        grad_has_inf = False
-                        grad_num_zero = 0
-                        grad_num_params = 0
+                # 只在每10个batch或第一个batch记录详细梯度统计，减少日志量
+                if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
+                    grad_max = 0.0
+                    grad_min = float('inf')
+                    grad_mean = 0.0
+                    grad_std = 0.0
+                    grad_has_nan = False
+                    grad_has_inf = False
+                    grad_num_zero = 0
+                    grad_num_params = 0
 
-                        for param in all_params:
-                            if param.grad is not None:
-                                grad_num_params += 1
-                                grad_data = param.grad.data
-
-                                # 检查NaN和Inf
-                                if torch.isnan(grad_data).any():
-                                    grad_has_nan = True
-                                if torch.isinf(grad_data).any():
-                                    grad_has_inf = True
-
-                                # 统计梯度值
-                                grad_abs = grad_data.abs()
-                                grad_max = max(grad_max, float(grad_abs.max().item()))
-                                grad_min = min(grad_min, float(grad_abs.min().item()))
-                                grad_mean += float(grad_abs.mean().item())
-                                grad_std += float(grad_abs.std().item())
-                                grad_num_zero += int((grad_data == 0).sum().item())
-
-                        # 计算平均值
-                        if grad_num_params > 0:
-                            grad_mean = float(grad_mean / grad_num_params)
-                            grad_std = float(grad_std / grad_num_params)
-
-                        # 记录详细的梯度统计
-                        self.logger.log("GRAD_STATS",
-                                        f"params={grad_num_params} | max={grad_max:.6f} min={grad_min:.6f} "
-                                        f"mean={grad_mean:.6f} std={grad_std:.6f} | zeros={grad_num_zero} "
-                                        f"has_nan={grad_has_nan} has_inf={grad_has_inf}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
-
-                    # 检查是否有NaN梯度
-                    has_nan_grad = False
                     for param in all_params:
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            has_nan_grad = True
-                            break
+                        if param.grad is not None:
+                            grad_num_params += 1
+                            grad_data = param.grad.data
 
-                    if has_nan_grad:
-                        if self.accelerator.is_local_main_process:
-                            self.logger.error("GRAD_NAN", f"检测到NaN梯度，跳过此次更新", f"维度{dimension}_batch{batch_idx}")
-                        # 在 accumulate 上下文中不需要手动 zero_grad，但需要跳过优化器步骤
-                        # 使用 continue 会导致 accumulate 上下文跳过 optimizer.step()
-                        continue
+                            # 检查NaN和Inf
+                            if torch.isnan(grad_data).any():
+                                grad_has_nan = True
+                            if torch.isinf(grad_data).any():
+                                grad_has_inf = True
 
-                    # 使用Accelerate的梯度裁剪（会自动处理混合精度）
-                    # accumulate 会在适当的时机自动调用这个裁剪
-                    grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
+                            # 统计梯度值
+                            grad_abs = grad_data.abs()
+                            grad_max = max(grad_max, float(grad_abs.max().item()))
+                            grad_min = min(grad_min, float(grad_abs.min().item()))
+                            grad_mean += float(grad_abs.mean().item())
+                            grad_std += float(grad_abs.std().item())
+                            grad_num_zero += int((grad_data == 0).sum().item())
 
-                    # 记录梯度范数和参数统计
-                    if self.accelerator.is_local_main_process:
-                        # 统计参数范数
-                        param_norm = 0.0
-                        param_max = 0.0
-                        param_mean = 0.0
-                        param_count = 0
-                        for param in all_params:
-                            if param.data is not None:
-                                param_count += 1
-                                param_norm += float(param.data.norm().item() ** 2)
-                                param_max = max(param_max, float(param.data.abs().max().item()))
-                                param_mean += float(param.data.abs().mean().item())
-                        param_norm = float(param_norm ** 0.5)
-                        param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
+                    # 计算平均值
+                    if grad_num_params > 0:
+                        grad_mean = float(grad_mean / grad_num_params)
+                        grad_std = float(grad_std / grad_num_params)
 
-                        self.logger.log("GRAD_NORM",
-                                        f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
-                                        f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
+                    # 记录详细的梯度统计
+                    self.logger.log("GRAD_STATS",
+                                    f"params={grad_num_params} | max={grad_max:.6f} min={grad_min:.6f} "
+                                    f"mean={grad_mean:.6f} std={grad_std:.6f} | zeros={grad_num_zero} "
+                                    f"has_nan={grad_has_nan} has_inf={grad_has_inf}",
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
-                    # ✅ 关键修复：手动调用 optimizer.step() 和 zero_grad()
-                    # accelerator.accumulate() 只管理梯度累积和同步，不会自动更新参数
-                    optimizer.step()
+                # 使用Accelerate的梯度裁剪（会自动处理混合精度）
+                # accumulate 会在适当的时机自动调用这个裁剪
+                grad_norm = self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
 
-                    # 记录优化器状态（学习率等）
-                    if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
-                        current_lr = float(optimizer.param_groups[0]['lr'])
-                        self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
+                # 记录梯度范数和参数统计（只在每10个batch记录）
+                if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
+                    # 统计参数范数
+                    param_norm = 0.0
+                    param_max = 0.0
+                    param_mean = 0.0
+                    param_count = 0
+                    for param in all_params:
+                        if param.data is not None:
+                            param_count += 1
+                            param_norm += float(param.data.norm().item() ** 2)
+                            param_max = max(param_max, float(param.data.abs().max().item()))
+                            param_mean += float(param.data.abs().mean().item())
+                    param_norm = float(param_norm ** 0.5)
+                    param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
 
-                    optimizer.zero_grad()
+                    self.logger.log("GRAD_NORM",
+                                    f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
+                                    f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
+
+                # ✅ 关键修复：手动调用 optimizer.step() 和 zero_grad()
+                # accelerator.accumulate() 只管理梯度累积和同步，不会自动更新参数
+                optimizer.step()
+
+                # 记录优化器状态（学习率等）
+                if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
+                    current_lr = float(optimizer.param_groups[0]['lr'])
+                    self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
+
+                optimizer.zero_grad()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -682,18 +614,10 @@ class EditFlowManager:
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset)
 
-                # 尝试计算损失，如果包含NaN则跳过该批次
-                try:
-                    loss = self.compute_loss(forward_results, criterion, test_dataset)
-                    if not torch.isnan(loss):
-                        total_loss += loss.item()
-                        num_batches += 1
-                except ValueError as e:
-                    if "批次包含异常值" in str(e):
-                        # 评估时跳过包含NaN的批次，不输出错误信息避免干扰
-                        continue
-                    else:
-                        raise
+                # 计算损失
+                loss = self.compute_loss(forward_results, criterion, test_dataset)
+                total_loss += loss.item()
+                num_batches += 1
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()
