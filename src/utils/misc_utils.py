@@ -3,7 +3,6 @@ import glob
 import torch
 import argparse
 from ..modeling.editflow_transformer import EditFlowConfig
-from ..modeling.llama_editflow import LlamaEditFlowConfig
 
 
 def find_latest_checkpoint(args):
@@ -37,10 +36,10 @@ def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer
         # 添加所有可能的自定义类到安全全局列表
         torch.serialization.add_safe_globals([
             EditFlowConfig,
-            LlamaEditFlowConfig,
             argparse.Namespace
         ])
-        training_config = torch.load(config_path, map_location=device, weights_only=True)
+        # 设置 weights_only=False 以支持加载包含自定义类的旧检查点
+        training_config = torch.load(config_path, map_location=device, weights_only=False)
 
         def adjust_state_dict(state_dict, saved_was_dp, current_model):
             current_is_dp = hasattr(current_model, 'module')

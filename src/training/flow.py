@@ -8,7 +8,7 @@ import os
 import time
 from typing import List, Dict, Tuple, Optional
 from ..symbolic.data_generator import generate_flow_samples
-from ..utils.special_tokens import SpecialTokensManager
+# from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
 
 
 class KappaScheduler:
@@ -42,15 +42,15 @@ def sample_conditional_path(p0: torch.Tensor, p1: torch.Tensor, t: torch.Tensor,
 
 
 
-def remove_gap_tokens(z_t: torch.Tensor, special_tokens_manager: SpecialTokensManager) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def remove_gap_tokens(z_t: torch.Tensor, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """移除gap token并返回处理后的序列
 
     重要：此函数只移除 gap_token，保留 BOS token 和所有其他 tokens
     确保返回的序列格式为 [BOS] + [non_gap_tokens] + [PAD...]
     """
-    pad_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
-    gap_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
-    bos_token_id = special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
+    pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
+    gap_token_id = tokenizer.convert_tokens_to_ids('<gap>')
+    bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
     batch_size, z_seq_len = z_t.shape
     device = z_t.device
 
@@ -114,11 +114,11 @@ class ContinuousFlowLoss:
         self.scheduler = KappaScheduler(scheduler_type)
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
-                           gap_token: int, special_tokens_manager: SpecialTokensManager) -> torch.Tensor:
+                           gap_token: int, tokenizer) -> torch.Tensor:
         batch_size, z_seq_len = z_t.shape
         n_ops = 2 * vocab_size + 1
 
-        pad_token = special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
+        pad_token = tokenizer.convert_tokens_to_ids('<pad>')
 
         z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
         z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq
@@ -133,7 +133,7 @@ class ContinuousFlowLoss:
         return u_mask
 
     def __call__(self, u_cat_x: torch.Tensor, u_z: torch.Tensor, u_mask: torch.Tensor,
-                 t: torch.Tensor, vocab_size: int, accelerator=None, logger=None) -> torch.Tensor:
+                 vocab_size: int, accelerator=None, logger=None) -> torch.Tensor:
         """
         连续流损失计算
 
@@ -141,7 +141,6 @@ class ContinuousFlowLoss:
             u_cat_x: X空间的预测速率 [batch, x_seq_len, 2*vocab_size+1]（原始空间，不含gap）
             u_z: Z空间的预测速率 [batch, z_seq_len, 2*vocab_size+1]（扩展空间，含gap重复）
             u_mask: 操作掩码 [batch, z_seq_len, 2*vocab_size+1]
-            t: 时间步 [batch, 1]
             vocab_size: 词汇表大小
             accelerator: Accelerate加速器
             logger: 日志记录器（可选）
@@ -264,15 +263,12 @@ class FlowDataset(torch.utils.data.Dataset):
         self.max_expr_length = max_expr_length
         self.max_dim = max_dim
         self.preload_to_memory = preload_to_memory
-        self.special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=max_dim)
 
-        # 设置分词器的特殊token属性
-        self.special_tokens_manager.setup_tokenizer_special_tokens(verbose)
-
-        self.vocab_size = len(self.special_tokens_manager.tokenizer.get_vocab())
-        self.pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
-        self.bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
-        self.gap_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
+        # 直接使用tokenizer获取所需信息
+        self.vocab_size = len(tokenizer.get_vocab())
+        self.pad_token = tokenizer.convert_tokens_to_ids('<pad>')
+        self.bos_token = tokenizer.convert_tokens_to_ids('<s>')
+        self.gap_token = tokenizer.convert_tokens_to_ids('<gap>')
 
         # 预加载数据到内存（可选）
         self.data_cache = None
@@ -300,11 +296,8 @@ class FlowDataset(torch.utils.data.Dataset):
 
     def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
         """将token列表转换为token ID列表"""
-        token_ids = []
-        for token in tokens:
-            tokenized = self.special_tokens_manager.tokenize_expression(token)
-            token_ids.extend(tokenized)
-        return token_ids
+        # 直接使用tokenizer转换tokens
+        return self.tokenizer.convert_tokens_to_ids(tokens)
 
     def __getitem__(self, idx):
         # 如果数据已预加载到内存，直接从缓存读取

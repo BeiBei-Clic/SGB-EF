@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 
 
 @dataclass(order=True)
-class BeamCandidate:
+class Candidate:
     """候选表达式
 
     Attributes:
@@ -34,7 +34,7 @@ class BeamCandidate:
     mse_score: Optional[float] = field(default=None, compare=False)
 
     def __repr__(self):
-        return f"BeamCandidate(score={self.score:.4f}, tokens={','.join(self.tokens) if self.tokens else '<blank>'})"
+        return f"Candidate(score={self.score:.4f}, tokens={','.join(self.tokens) if self.tokens else '<blank>'})"
 
 
 @dataclass
@@ -77,7 +77,7 @@ class SimpleSymbolicRegression:
                  model,
                  condition_encoder,
                  tokenizer,
-                 special_tokens_manager,
+                 # special_tokens_manager,  # 已移除：使用小词表后不再需要
                  device,
                  args,
                  logger,
@@ -90,7 +90,6 @@ class SimpleSymbolicRegression:
             model: EditFlow模型
             condition_encoder: 条件编码器
             tokenizer: 分词器
-            special_tokens_manager: 特殊token管理器
             device: 计算设备
             args: 参数配置
             logger: 日志记录器
@@ -101,7 +100,7 @@ class SimpleSymbolicRegression:
         self.model = model
         self.condition_encoder = condition_encoder
         self.tokenizer = tokenizer
-        self.special_tokens_manager = special_tokens_manager
+        # self.special_tokens_manager = special_tokens_manager  # 已移除：使用小词表后不再需要
         self.device = device
         self.args = args
         self.logger = logger
@@ -138,14 +137,14 @@ class SimpleSymbolicRegression:
         start_time = time.time()
 
         # 构建模型输入 - 确保与训练时的序列格式完全一致
-        tokenized_expr = self.special_tokens_manager.tokenize_expression(','.join(current_tokens))
+        tokenized_expr = self.tokenizer.convert_tokens_to_ids(current_tokens)
         max_len = getattr(self.args, 'max_expr_length', 128)
 
         if len(tokenized_expr) > max_len - 1:
             tokenized_expr = tokenized_expr[:max_len-1]
 
-        bos_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
-        pad_token = self.special_tokens_manager.tokenizer.convert_tokens_to_ids('<pad>')
+        bos_token = self.tokenizer.convert_tokens_to_ids('<s>')
+        pad_token = self.tokenizer.convert_tokens_to_ids('<pad>')
 
         # 关键：必须添加 BOS token，与训练时的格式一致 [BOS] + tokens + [PAD]
         tokenized_expr = [bos_token] + tokenized_expr
@@ -156,17 +155,21 @@ class SimpleSymbolicRegression:
 
         input_ids = torch.LongTensor([tokenized_expr]).to(self.device)
         attention_mask = (input_ids != pad_token).float().to(self.device)
-        t_tensor = torch.tensor([[t]], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             model_forward_start = time.time()
-            rates, insert_probs, substitute_probs = self.model(
+            output = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                time_steps=t_tensor,
                 condition=condition
             )
             model_forward_time = (time.time() - model_forward_start) * 1000  # ms
+
+            # 从字典中提取结果
+            ins_rate, del_rate, sub_rate = output['rates']
+            rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
+            insert_probs = output['insert_probs']
+            substitute_probs = output['substitute_probs']
 
             # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
             # 因此索引 0=插入, 1=删除, 2=替换
@@ -204,13 +207,13 @@ class SimpleSymbolicRegression:
             # 调试：打印top-10插入概率和token（仅在第一次调用时）
             if not hasattr(self, '_insert_probs_logged'):
                 if self.logger and self._is_main_process():
-                    self.logger.log_beam_search_separator("插入操作详细预测信息（前3个位置）", level=2)
+                    self.logger.log_greedy_search_separator("插入操作详细预测信息（前3个位置）", level=2)
                     for i in range(min(3, effective_length)):
                         top10 = torch.topk(insert_probs[0, i], 10)
                         tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
                         probs = top10.values.tolist()
-                        self.logger.log_beam_search_insert_probs(i, lambda_ins[i], tokens, probs, level=2)
-                    self.logger.log_beam_search_separator(level=2)
+                        self.logger.log_greedy_search_insert_probs(i, lambda_ins[i], tokens, probs, level=2)
+                    self.logger.log_greedy_search_separator(level=2)
                 self._insert_probs_logged = True
 
             # 生成insert操作提案
@@ -287,7 +290,7 @@ class SimpleSymbolicRegression:
             # 调试：打印top-10替换概率和token（仅在第一次调用时）
             if not hasattr(self, '_substitute_probs_logged'):
                 if self.logger and self._is_main_process():
-                    self.logger.log_beam_search_separator("替换操作详细预测信息（前3个token位置）", level=2)
+                    self.logger.log_greedy_search_separator("替换操作详细预测信息（前3个token位置）", level=2)
                     for idx in range(min(3, len(current_tokens))):
                         pos = idx + 1  # +1因为input_ids[0]是BOS
                         if pos < substitute_probs.shape[1]:
@@ -295,8 +298,8 @@ class SimpleSymbolicRegression:
                             tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
                             probs = top10.values.tolist()
                             current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                            self.logger.log_beam_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=2)
-                    self.logger.log_beam_search_separator(level=2)
+                            self.logger.log_greedy_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=2)
+                    self.logger.log_greedy_search_separator(level=2)
                 self._substitute_probs_logged = True
 
             for pos in range(1, seq_len):
@@ -330,14 +333,14 @@ class SimpleSymbolicRegression:
             # 调试：打印删除速率信息（仅在第一次调用时）
             if not hasattr(self, '_delete_probs_logged'):
                 if self.logger and self._is_main_process():
-                    self.logger.log_beam_search_separator("删除操作详细预测信息（所有token位置）", level=2)
+                    self.logger.log_greedy_search_separator("删除操作详细预测信息（所有token位置）", level=2)
                     for idx in range(len(current_tokens)):
                         pos = idx + 1  # +1因为input_ids[0]是BOS
                         if pos < lambda_del.shape[0]:
                             current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                            self.logger.log_beam_search_delete_probs(idx, current_token, lambda_del[pos],
+                            self.logger.log_greedy_search_delete_probs(idx, current_token, lambda_del[pos],
                                                                     lambda_del[pos] > self.min_action_score, level=2)
-                    self.logger.log_beam_search_separator(level=2)
+                    self.logger.log_greedy_search_separator(level=2)
                 self._delete_probs_logged = True
 
             for pos in range(1, seq_len):
@@ -378,7 +381,7 @@ class SimpleSymbolicRegression:
                 constants = ['constant']
 
                 # 统计插入操作中不同类型的平均概率
-                self.logger.log_beam_search_separator("词汇类型预测统计（基于位置0的插入预测）", level=2)
+                self.logger.log_greedy_search_separator("词汇类型预测统计（基于位置0的插入预测）", level=2)
 
                 if 0 < insert_probs.shape[1]:
                     # 获取位置0的top-20预测
@@ -407,8 +410,8 @@ class SimpleSymbolicRegression:
                             token_categories['其他'].append((token_name, prob.item()))
 
                     # 输出统计结果
-                    self.logger.log_beam_search_token_type_stats(token_categories, level=2)
-                    self.logger.log_beam_search_separator(level=2)
+                    self.logger.log_greedy_search_token_type_stats(token_categories, level=2)
+                    self.logger.log_greedy_search_separator(level=2)
             self._token_type_stats_logged = True
 
         if self.logger and self._is_main_process():
@@ -495,7 +498,7 @@ class SimpleSymbolicRegression:
                       y_data: np.ndarray,
                       x_values: torch.Tensor,
                       n_steps: int,
-                      valid_variables: Optional[List[str]] = None) -> BeamCandidate:
+                      valid_variables: Optional[List[str]] = None) -> Candidate:
         """执行贪婪搜索推理（架构v2.0 - 固定t=0模式）
 
         每一步选择模型预测的最佳操作并执行,不维护多个候选
@@ -533,7 +536,7 @@ class SimpleSymbolicRegression:
             print(f"初始表达式: {','.join(initial_tokens)}")
 
         # 初始化当前候选
-        current_candidate = BeamCandidate(
+        current_candidate = Candidate(
             tokens=initial_tokens.copy(),
             score=0.0,
             condition=initial_condition,
@@ -613,7 +616,7 @@ class SimpleSymbolicRegression:
 
             # 更新当前候选
             # 注意：不重新计算条件嵌入（架构v2.0：条件恒定）
-            current_candidate = BeamCandidate(
+            current_candidate = Candidate(
                 tokens=best_proposal.new_tokens,
                 score=current_candidate.score + best_proposal.score,
                 condition=current_candidate.condition,  # 条件保持恒定

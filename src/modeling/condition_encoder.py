@@ -236,26 +236,4 @@ class SetTransformerConditionEncoder(nn.Module):
 
         return x  # (batch_size, num_seeds, dim_hidden)
 
-
-# 保持向后兼容性，使用新的SetTransformer编码器
-class ConditionEncoder(SetTransformerConditionEncoder):
-    """条件编码器 - 现在使用SetTransformer架构"""
-
-    def __init__(self,
-                 model_name: str = None,  # 保持参数兼容性但不再使用
-                 verbose: bool = False,
-                 max_length: int = None,  # 保持参数兼容性但不再使用
-                 **kwargs):
-        args = kwargs['args']
-        transformer_params = {
-            'max_input_dim': getattr(args, 'condition_max_input_dim', 3),
-            'dim_hidden': getattr(args, 'condition_dim_hidden', 128),
-            'num_heads': getattr(args, 'condition_num_heads', 4),
-            'num_inds': getattr(args, 'condition_num_inds', 32),
-            'num_layers': getattr(args, 'condition_num_layers', 3),
-            'num_seeds': getattr(args, 'condition_num_seeds', 1),
-            'dim_output': getattr(args, 'condition_dim_output', 128),
-            'verbose': verbose
-        }
-
-        super().__init__(**transformer_params)
+# ConditionEncoder 封装类已移除，直接使用 SetTransformerConditionEncoder

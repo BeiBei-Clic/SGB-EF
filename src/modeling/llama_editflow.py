@@ -12,32 +12,6 @@ from transformers import LlamaConfig, LlamaModel
 from typing import Optional, Tuple, Dict
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    """正弦时间编码 - 将标量时间步映射到向量空间"""
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-    def forward(self, t):
-        """
-        Args:
-            t: (batch_size,) 或 (batch_size, 1) 时间步
-        Returns:
-            emb: (batch_size, hidden_dim) 时间嵌入向量
-        """
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-
-        half_dim = self.hidden_dim // 2
-        exponent = torch.arange(half_dim, device=t.device, dtype=t.dtype) * -(math.log(10000.0) / (half_dim - 1))
-        emb = torch.cat([torch.sin(t * exponent), torch.cos(t * exponent)], dim=-1)
-
-        if self.hidden_dim % 2:
-            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-
-        return emb
-
-
 class CrossAttentionConditionInjection(nn.Module):
     """
     交叉注意力条件注入 - 条件信息注入的唯一方式
@@ -152,7 +126,10 @@ class LlamaEditFlowBackbone(nn.Module):
 
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
         self.condition_dim = condition_dim
+        self.dropout = dropout
         self.max_seq_len = max_seq_len
         self.use_condition_injection = use_condition_injection
 
@@ -167,30 +144,21 @@ class LlamaEditFlowBackbone(nn.Module):
         # 2. 基础LLaMA骨干网络
         self.backbone = LlamaModel(self.llama_config)
 
-        # 3. 时间嵌入 (标量t -> hidden_dim)
-        self.time_embedding = nn.Sequential(
-            SinusoidalTimeEmbedding(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # 4. 条件投影 (SetTransformer输出 -> hidden_dim)
+        # 3. 条件投影 (SetTransformer输出 -> hidden_dim)
         # 注意：条件仅通过交叉注意力注入，不再作为前缀token
         if condition_dim != hidden_dim:
             self.cond_proj = nn.Linear(condition_dim, hidden_dim)
         else:
             self.cond_proj = nn.Identity()
 
-        # 5. 交叉注意力条件注入
+        # 4. 交叉注意力条件注入
         if use_condition_injection:
             self.condition_injection = CrossAttentionConditionInjection(hidden_dim, n_heads)
 
-        # 6. 层归一化
-        self.time_layer_norm = nn.LayerNorm(hidden_dim)
+        # 5. 层归一化
         self.condition_layer_norm = nn.LayerNorm(hidden_dim)
 
-        # 7. 编辑流五大输出头 (论文公式13-15)
+        # 6. 编辑流五大输出头 (论文公式13-15)
 
         # 预测速率 (Rates) - 使用softplus确保正值
         self.ins_rate_head = nn.Sequential(
@@ -244,7 +212,6 @@ class LlamaEditFlowBackbone(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        time_steps: Optional[torch.Tensor] = None,
         condition: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -253,7 +220,6 @@ class LlamaEditFlowBackbone(nn.Module):
 
         Args:
             input_ids: (batch_size, seq_len) 输入token IDs
-            time_steps: (batch_size, 1) 或 (batch_size,) 时间步t
             condition: (batch_size, num_cond_tokens, condition_dim) 来自SetTransformer
             attention_mask: (batch_size, seq_len) 注意力掩码
 
@@ -267,12 +233,6 @@ class LlamaEditFlowBackbone(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
-        # 默认时间步
-        if time_steps is None:
-            time_steps = torch.rand(batch_size, 1, device=input_ids.device)
-        elif time_steps.dim() == 1:
-            time_steps = time_steps.unsqueeze(-1)
-
         # 默认条件：空的序列（1个token，全零）
         if condition is None:
             condition = torch.zeros(batch_size, 1, self.condition_dim, device=input_ids.device)
@@ -280,19 +240,14 @@ class LlamaEditFlowBackbone(nn.Module):
         # A. 获取token embedding
         inputs_embeds = self.backbone.embed_tokens(input_ids)  # (batch_size, seq_len, hidden_dim)
 
-        # B. 注入时间信息
-        t_emb = self.time_embedding(time_steps)  # (batch_size, hidden_dim)
-        t_emb = t_emb.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, hidden_dim)
-        inputs_embeds = self.time_layer_norm(inputs_embeds + t_emb)
-
-        # C. 处理条件并投影
+        # B. 处理条件并投影
         if condition.dim() == 2:
             # 旧格式: (batch_size, condition_dim)
             condition = condition.unsqueeze(1)
 
         condition_proj = self.cond_proj(condition)  # (batch_size, num_cond_tokens, hidden_dim)
 
-        # D. 通过LLaMA骨干（使用双向注意力）
+        # C. 通过LLaMA骨干（使用双向注意力）
         # 注意：LLaMA默认使用因果掩码，但EditFlow需要双向注意力
         # 因此我们需要创建全1的attention_mask来禁用因果掩码
         if attention_mask is not None:
@@ -352,78 +307,4 @@ class LlamaEditFlowBackbone(nn.Module):
             'substitute_logits': sub_logits,
             'insert_probs': insert_probs,
             'substitute_probs': substitute_probs,
-        }
-
-
-class LlamaEditFlowConfig:
-    """LlamaEditFlow配置类"""
-    def __init__(
-        self,
-        vocab_size: int = 100,  # 符号回归专用词表
-        hidden_dim: int = 256,
-        n_layers: int = 6,
-        n_heads: int = 8,
-        condition_dim: int = 128,
-        dropout: float = 0.1,
-        max_seq_len: int = 24,
-        use_condition_injection: bool = True,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.condition_dim = condition_dim
-        self.dropout = dropout
-        self.max_seq_len = max_seq_len
-        self.use_condition_injection = use_condition_injection
-
-
-# 为了向后兼容，创建一个包装类
-class EditFlowTransformer(LlamaEditFlowBackbone):
-    """
-    向后兼容的包装类，保持与现有代码的接口一致性
-    """
-    def __init__(self, config, verbose=False):
-        # 保存config以便外部访问
-        self.config = config
-
-        # 从config中提取参数（同时支持新旧两种命名方式）
-        vocab_size = getattr(config, 'vocab_size', 100)
-        hidden_dim = getattr(config, 'hidden_dim', 256)
-        # 支持两种命名：num_layers (旧) 和 n_layers (新LlamaEditFlowConfig)
-        n_layers = getattr(config, 'num_layers', None) or getattr(config, 'n_layers', 6)
-        # 支持两种命名：num_heads (旧) 和 n_heads (新LlamaEditFlowConfig)
-        n_heads = getattr(config, 'num_heads', None) or getattr(config, 'n_heads', 8)
-        condition_dim = getattr(config, 'condition_dim', 128)
-        dropout = getattr(config, 'dropout', 0.1)
-        max_seq_len = getattr(config, 'max_seq_len', 24)
-        use_condition_injection = getattr(config, 'use_condition_injection', True)
-
-        super().__init__(
-            vocab_size=vocab_size,
-            hidden_dim=hidden_dim,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            condition_dim=condition_dim,
-            dropout=dropout,
-            max_seq_len=max_seq_len,
-            use_condition_injection=use_condition_injection,
-            verbose=verbose
-        )
-
-    def forward(self, input_ids, attention_mask=None, time_steps=None, condition=None):
-        """
-        保持与旧版本相同的接口
-
-        Returns:
-            rates: (batch_size, seq_len, 3) 三个速率合并
-            insert_probs: (batch_size, seq_len, vocab_size)
-            substitute_probs: (batch_size, seq_len, vocab_size)
-        """
-        output = super().forward(input_ids, time_steps, condition, attention_mask)
-
-        # 合并三个速率为一个tensor
-        ins_rate, del_rate, sub_rate = output['rates']
-        rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
-
-        return rates, output['insert_probs'], output['substitute_probs']
+ }

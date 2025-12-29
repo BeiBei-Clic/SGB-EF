@@ -1,5 +1,5 @@
 """
-EditFlow连续流训练器 - 实现基于连续时间流匹配的编辑流模型训练
+EditFlow迭代优化训练器 - 实现基于迭代式编辑操作的符号回归模型训练
 使用 Hugging Face Accelerate 进行分布式训练加速
 """
 
@@ -11,30 +11,28 @@ from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from ..utils.special_tokens import SpecialTokensManager
+# from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
 from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
 from .flow import (
-    KappaScheduler, sample_conditional_path,
+    # KappaScheduler, sample_conditional_path,  # 已移除：不再需要时间调度器
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
 )
-from ..modeling.condition_encoder import ConditionEncoder
+from ..modeling.condition_encoder import SetTransformerConditionEncoder
 # 使用新的LLaMA EditFlow模型替代BERT
-from ..modeling.llama_editflow import EditFlowTransformer, LlamaEditFlowConfig
-from ..utils.gpu_monitor import get_gpu_memory_usage_string
+from ..modeling.llama_editflow import LlamaEditFlowBackbone
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
-from .beam_search import BeamCandidate, SimpleSymbolicRegression
+from .greedy_search import Candidate, SimpleSymbolicRegression
 
 
 class EditFlowManager:
     """EditFlow模型管理器 - 支持训练和推理功能
 
-    新增功能：多时间步采样训练
-    - num_timesteps参数控制每个样本采样的时间步数量
-    - 默认值为5（在train.py中定义），可以大幅提升训练数据利用效率
-    - 每个原始样本将生成num_timesteps个训练实例
-    - 在训练过程中会自动进行损失聚合，确保梯度计算正确
+    架构特点：迭代优化模式
+    - 模型直接预测从z0到z1的编辑操作（插入、删除、替换）
+    - 时间步固定为0，学习从起点到目标的直接编辑路径
+    - 使用目标值y_target作为条件（而非残差），保持条件恒定作为"北极星"
     """
 
     # 类常量：训练和推理配置参数
@@ -77,7 +75,6 @@ class EditFlowManager:
             print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
             print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
             print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
-            print(f"时间步采样数: {self.args.num_timesteps} (每个样本生成的时间步训练数量)")
 
             print(f"\nAccelerate 初始化完成")
             print(f"  设备: {self.device}")
@@ -85,16 +82,8 @@ class EditFlowManager:
             print(f"  进程数: {self.accelerator.num_processes}")
             print(f"  混合精度: {self.accelerator.mixed_precision}")
 
-            # 显示GPU信息
-            from ..utils.gpu_monitor import display_gpu_info
-            display_gpu_info()
-
         # 记录训练开始日志
         self.logger.training_start(self.args)
-        self.logger.gpu_memory("初始化完成")
-
-        # 时间调度器
-        self.scheduler = KappaScheduler(scheduler_type='cubic')
 
     def set_seed(self, seed: int):
         """设置随机种子 - 现在使用 Accelerate 的 set_seed"""
@@ -217,14 +206,7 @@ class EditFlowManager:
         # 不再依赖BERT的大词汇表，使用自定义的紧凑词汇表
         from ..utils.special_tokens import SymbolicRegressionTokenizer, SymbolicVocab
 
-        tokenizer = SymbolicRegressionTokenizer(
-            max_dim=self.args.max_dim,
-            unk_token='<unk>',
-            pad_token='<pad>',
-            bos_token='<s>',
-            eos_token='</s>',
-            mask_token='<mask>'
-        )
+        tokenizer = SymbolicRegressionTokenizer(max_dim=self.args.max_dim)
 
         if self.accelerator.is_local_main_process:
             print(f"✓ 符号回归Tokenizer初始化完成")
@@ -235,17 +217,17 @@ class EditFlowManager:
             print(f"  特殊token: {len(SymbolicVocab.SPECIAL_TOKENS)}个")
             print(f"  变量token: x0 ~ x{self.args.max_dim-1} (共{self.args.max_dim}个)")
 
-        # 初始化特殊符号管理器并添加缺失的符号
-        special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=self.args.max_dim)
-        special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
-
         if self.accelerator.is_local_main_process:
             print("初始化条件编码器...")
-        condition_encoder = ConditionEncoder(
-            model_name=self.args.condition_model_name,  # 保持兼容性，但实际不使用
-            verbose=self.accelerator.is_local_main_process,
-            max_length=getattr(self.args, 'condition_max_length', 512),  # 保持兼容性，但实际不使用
-            args=self.args  # 传递args对象以使用SetTransformer参数
+        condition_encoder = SetTransformerConditionEncoder(
+            max_input_dim=getattr(self.args, 'condition_max_input_dim', 3),
+            dim_hidden=getattr(self.args, 'condition_dim_hidden', 128),
+            num_heads=getattr(self.args, 'condition_num_heads', 4),
+            num_inds=getattr(self.args, 'condition_num_inds', 32),
+            num_layers=getattr(self.args, 'condition_num_layers', 3),
+            num_seeds=getattr(self.args, 'condition_num_seeds', 1),
+            dim_output=getattr(self.args, 'condition_dim_output', 128),
+            verbose=self.accelerator.is_local_main_process
         ).to(self.device)
 
         if self.accelerator.is_local_main_process:
@@ -256,8 +238,8 @@ class EditFlowManager:
         # 所以 condition_dim 应该等于 dim_hidden
         condition_hidden_dim = getattr(self.args, 'condition_dim_hidden', 128)
 
-        # 使用LLaMA EditFlow配置（替代BERT）
-        config = LlamaEditFlowConfig(
+        # 直接实例化 LlamaEditFlowBackbone
+        model = LlamaEditFlowBackbone(
             vocab_size=len(tokenizer.get_vocab()),  # 符号回归专用小词表
             hidden_dim=getattr(self.args, 'hidden_dim', 256),  # LLaMA隐藏层维度
             n_layers=getattr(self.args, 'n_layers', 6),  # Transformer层数
@@ -266,8 +248,8 @@ class EditFlowManager:
             dropout=getattr(self.args, 'dropout', 0.1),
             max_seq_len=self.args.max_expr_length,
             use_condition_injection=getattr(self.args, 'use_condition_injection', True),
-        )
-        model = EditFlowTransformer(config, verbose=self.accelerator.is_local_main_process).to(self.device)
+            verbose=self.accelerator.is_local_main_process
+        ).to(self.device)
 
         # 创建优化器和损失函数
         criterion = ContinuousFlowLoss(scheduler_type='cubic')
@@ -305,24 +287,20 @@ class EditFlowManager:
         return model, condition_encoder, criterion, optimizer, tokenizer
 
   
-    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info=None):
+    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info=None):
         """
         修改后的前向传播：移除中间状态插值，直接预测从z0到z1的编辑操作
         这将模型从"连续流匹配"转变为"迭代优化"架构
         """
         batch_size = z0_token_ids.size(0)
 
-        # 设置时间步为0，表示我们在起点（z0状态）
-        # 这样模型学习的是"从当前状态到目标状态的编辑"，而非任意时刻的流速
-        t = torch.zeros(batch_size, 1, device=self.device)
-
         # 直接使用z0作为输入状态（不再插值生成中间状态z_t）
         batch_size, seq_len = z0_token_ids.shape
-        z0_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z0_token_ids.device)
+        z0_probs = torch.zeros(batch_size, seq_len, model.vocab_size, device=z0_token_ids.device)
         z0_probs.scatter_(2, z0_token_ids.unsqueeze(-1), 1.0)
 
         # z1 token序列用于计算目标编辑操作
-        z1_probs = torch.zeros(batch_size, seq_len, config.vocab_size, device=z1_token_ids.device)
+        z1_probs = torch.zeros(batch_size, seq_len, model.vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
         # 记录修改后的训练信息（仅在第一个batch时）
@@ -351,12 +329,12 @@ class EditFlowManager:
         z_t_token_ids = torch.argmax(z_t_probs, dim=-1)  # 2维: (batch_size, seq_len)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z_t_token_ids, dataset.special_tokens_manager
+            z_t_token_ids, dataset.tokenizer
         )
 
         # 调试：验证训练时的序列格式（仅验证第一个批次）
         if not hasattr(self, '_train_sequence_format_logged'):
-            bos_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<s>')
+            bos_token = dataset.tokenizer.convert_tokens_to_ids('<s>')
             sample_idx = 0
             if x_t[sample_idx, 0] == bos_token:
                 if self.accelerator.is_local_main_process:
@@ -367,22 +345,27 @@ class EditFlowManager:
                 self._train_sequence_format_logged = True
 
         attention_mask = (~x_pad_mask).float()
-        pred_rates, pred_ins_probs, pred_sub_probs = model(
-            input_ids=x_t, time_steps=t, condition=condition_embeddings, attention_mask=attention_mask
+
+        # 调用 LlamaEditFlowBackbone，返回字典格式
+        output = model(
+            input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask
         )
+
+        # 合并三个速率为一个tensor（与旧接口保持一致）
+        ins_rate, del_rate, sub_rate = output['rates']
+        pred_rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
 
         return {
             'pred_rates': pred_rates,
-            'pred_ins_probs': pred_ins_probs,
-            'pred_sub_probs': pred_sub_probs,
+            'pred_ins_probs': output['insert_probs'],
+            'pred_sub_probs': output['substitute_probs'],
             'x_t': x_t,
             'z_t': z_t_token_ids,  # 返回token IDs（2维），用于损失计算
             'z1_token_ids': z1_token_ids,
             'z_gap_mask': z_gap_mask,
             'z_pad_mask': z_pad_mask,
-            't': t,
-            'vocab_size': config.vocab_size,
-                    }
+            'vocab_size': model.vocab_size,
+        }
 
     def compute_loss(self, forward_results, criterion, dataset):
         pred_rates = forward_results['pred_rates']
@@ -393,9 +376,8 @@ class EditFlowManager:
         z1_token_ids = forward_results['z1_token_ids']
         z_gap_mask = forward_results['z_gap_mask']
         z_pad_mask = forward_results['z_pad_mask']
-        t = forward_results['t']
         effective_vocab_size = forward_results['vocab_size']
-        gap_token = dataset.special_tokens_manager.tokenizer.convert_tokens_to_ids('<gap>')
+        gap_token = dataset.tokenizer.convert_tokens_to_ids('<gap>')
 
         # 获取时间步采样数量
         num_timesteps = self.args.num_timesteps
@@ -417,12 +399,12 @@ class EditFlowManager:
         # 形状: [batch, z_seq_len, 2*vocab_size+1]
         u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
-        u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.special_tokens_manager)
+        u_mask = criterion.make_ut_mask_from_z(z_t, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer)
 
         # 关键修复：传入 u_cat_x (X空间) 用于正确的 u_total 计算
         # u_z 仍用于 cross_entropy 计算（监督带路径编辑操作）
         # 传入 logger 用于记录详细的损失统计信息
-        loss = criterion(u_cat_x, u_z, u_mask, t, effective_vocab_size,
+        loss = criterion(u_cat_x, u_z, u_mask, effective_vocab_size,
                         accelerator=self.accelerator, logger=self.logger)
 
         return loss
@@ -437,9 +419,6 @@ class EditFlowManager:
         # 显示进度条 - 只在主进程显示
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}",
                           disable=not self.accelerator.is_local_main_process)
-
-        # 处理模型配置
-        config = model.module.config if hasattr(model, 'module') else model.config
 
         # 只在主进程设置初始进度条显示
         if self.accelerator.is_local_main_process:
@@ -460,7 +439,7 @@ class EditFlowManager:
                     self.logger.log("TOKEN_DECODE", f"维度 {dimension} - 第一个batch的token解码信息", level=2)
 
                     # 解码z0_token_ids
-                    vocab = dataset.special_tokens_manager.tokenizer.get_vocab()
+                    vocab = dataset.tokenizer.get_vocab()
                     id_to_token = {v: k for k, v in vocab.items()}
 
                     z0_expressions = []
@@ -504,7 +483,7 @@ class EditFlowManager:
                         'context': f'维度{dimension}'
                     }
 
-                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, config, debug_info)
+                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info)
 
                 # 记录前向传播输出（每个batch都记录，用于调试NaN来源）
                 if self.accelerator.is_local_main_process:
@@ -689,7 +668,6 @@ class EditFlowManager:
 
         total_loss = 0.0
         num_batches = 0
-        config = model.module.config if hasattr(model, 'module') else model.config
 
         with torch.no_grad():
             # === 修改：不再循环 dim，直接遍历 dataloader ===
@@ -702,7 +680,7 @@ class EditFlowManager:
 
                 # 修改：使用y_target而非residuals
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
-                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset, config)
+                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset)
 
                 # 尝试计算损失，如果包含NaN则跳过该批次
                 try:
@@ -733,7 +711,7 @@ class EditFlowManager:
         return avg_loss
 
 
-    def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, config, is_final=False):
+    def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, is_final=False):
         # 等待所有进程同步
         self.accelerator.wait_for_everyone()
 
@@ -752,12 +730,24 @@ class EditFlowManager:
             unwrapped_model = self.accelerator.unwrap_model(model)
             unwrapped_encoder = self.accelerator.unwrap_model(condition_encoder)
 
+            # 从 model 中提取配置信息
+            model_config = {
+                'vocab_size': unwrapped_model.vocab_size,
+                'hidden_dim': unwrapped_model.hidden_dim,
+                'n_layers': unwrapped_model.n_layers,
+                'n_heads': unwrapped_model.n_heads,
+                'condition_dim': unwrapped_model.condition_dim,
+                'dropout': unwrapped_model.dropout,
+                'max_seq_len': unwrapped_model.max_seq_len,
+                'use_condition_injection': unwrapped_model.use_condition_injection,
+            }
+
             config_data = {
                 'epoch': epoch + 1,
                 'model_state_dict': unwrapped_model.state_dict(),
                 'condition_encoder_state_dict': unwrapped_encoder.state_dict(),
                 'loss': loss,
-                'config': config,
+                'model_config': model_config,
                 'args': self.args,
                 'accelerate_config': {
                     'distributed_type': str(self.accelerator.distributed_type),
@@ -795,7 +785,6 @@ class EditFlowManager:
             # 记录训练开始到 training.log
             self.logger.log("TRAINING_START", f"开始训练 | num_epochs={self.args.num_epochs} | model_params={model_params:,} | encoder_params={encoder_params:,}", level=1)
 
-        config = model.module.config if hasattr(model, 'module') else model.config
         eval_every = getattr(self.args, 'eval_every', 5)
 
         for epoch in range(self.args.num_epochs):
@@ -822,7 +811,7 @@ class EditFlowManager:
             # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
                 checkpoint_path = self.save_checkpoint(
-                    model, condition_encoder, optimizer, avg_loss, epoch, config
+                    model, condition_encoder, optimizer, avg_loss, epoch
                 )
                 if self.accelerator.is_local_main_process:
                     print(f"检查点已保存到: {checkpoint_path}")
@@ -831,7 +820,7 @@ class EditFlowManager:
 
         # 保存最终模型
         final_path = self.save_checkpoint(
-            model, condition_encoder, optimizer, avg_loss, self.args.num_epochs - 1, config, is_final=True
+            model, condition_encoder, optimizer, avg_loss, self.args.num_epochs - 1, is_final=True
         )
         if self.accelerator.is_local_main_process:
             print(f"最终模型已保存到: {final_path}")
@@ -861,7 +850,17 @@ class EditFlowManager:
         if checkpoint_path:
             self.logger.log("MODEL_LOAD", f"使用检查点: {checkpoint_path}", "inference", level=1)
         else:
-            self.logger.log("MODEL_LOAD", "未找到检查点，将使用基础模型进行推理", "inference", level=1)
+            if self.accelerator.is_local_main_process:
+                print("\n" + "="*60)
+                print("⚠️  警告：未找到检查点！")
+                print("="*60)
+                print("模型将使用随机初始化的权重进行推理。")
+                print("这会导致推理质量很差，可能陷入无限循环。")
+                print("\n建议操作：")
+                print("1. 先训练模型：python train.py --num_epochs 30")
+                print("2. 或指定已有检查点：python example.py --model_path checkpoints/your_checkpoint")
+                print("="*60 + "\n")
+            self.logger.log("MODEL_LOAD", "⚠️ 未找到检查点，使用随机初始化权重（警告：推理质量会很差）", "inference", level=1)
 
         model, condition_encoder, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
@@ -934,11 +933,6 @@ class EditFlowManager:
         # 使用 x0 - x1 作为初始表达式
         current_tokens = ['x0']
 
-        # 初始化token管理器，确保覆盖数据维度
-        actual_max_dim = max(input_dim, self.args.max_dim) if hasattr(self.args, 'max_dim') else input_dim
-        special_tokens_manager = SpecialTokensManager(tokenizer, max_dim=actual_max_dim)
-        special_tokens_manager.ensure_special_tokens(verbose=self.accelerator.is_local_main_process)
-
         # 创建简单推理器
         self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=1)
 
@@ -946,7 +940,7 @@ class EditFlowManager:
             model=model,
             condition_encoder=condition_encoder,
             tokenizer=tokenizer,
-            special_tokens_manager=special_tokens_manager,
+            # special_tokens_manager=special_tokens_manager,  # 已移除：使用小词表后不再需要
             device=device,
             args=self.args,
             logger=self.logger,

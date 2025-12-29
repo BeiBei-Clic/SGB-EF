@@ -149,7 +149,7 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_25"
+    model_path = None
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用简单推理（贪婪搜索）+ 北极星模式（目标值作为恒定条件）
@@ -158,12 +158,20 @@ def main():
                f"方法: 贪婪搜索 | 架构: 迭代优化（北极星模式）",
                "example")
 
-    predicted_expression = manager.symbolic_regression(
-        model_path=model_path,
-        x_data=x_data_reorganized,  # 使用重新组织后的数据
-        y_data=y_data,
-        n_steps=20      # 推理步数
-    )
+    # 检查是否有训练好的检查点
+    import os
+    if not os.path.exists(model_path):
+        print(f"\n⚠️  检查点不存在: {model_path}")
+        print("跳过推理步骤。请先训练模型：")
+        print("  python train.py --num_samples 10000 --num_epochs 30")
+        predicted_expression = ""
+    else:
+        predicted_expression = manager.symbolic_regression(
+            model_path=model_path,
+            x_data=x_data_reorganized,  # 使用重新组织后的数据
+            y_data=y_data,
+            n_steps=20      # 推理步数
+        )
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
     print(f"\n{'='*60}")

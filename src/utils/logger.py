@@ -124,17 +124,8 @@ class Logger:
         if not self.enabled:
             return
 
-        gpu_info = ""
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            gpu_info = f" | GPUs: {gpu_count}"
-            for i in range(min(gpu_count, 2)):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-                gpu_info += f" | GPU{i}: {gpu_name} ({gpu_memory:.1f}GB)"
-
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        msg = f"{timestamp} TRAINING START | Model: {getattr(args, 'model_name', 'Unknown')}{gpu_info}"
+        msg = f"{timestamp} TRAINING START | Model: {getattr(args, 'model_name', 'Unknown')}"
         self._write(msg, self.TRAIN_LOG)
 
     def training_complete(self, total_epochs, final_loss=None):
@@ -197,28 +188,6 @@ class Logger:
             self._write(msg, self.TRAIN_DEBUG_LOG)
         else:
             self._write(msg, self.INFERENCE_LOG)
-
-    def gpu_memory(self, context=""):
-        """记录GPU内存使用情况
-
-        Args:
-            context (str): 上下文
-        """
-        if not self.enabled or not torch.cuda.is_available():
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        msg = f"{timestamp} GPU_MEMORY"
-        if context:
-            msg += f" [{context}]"
-
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / 1024**3
-            reserved = torch.cuda.memory_reserved(i) / 1024**3
-            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
-            msg += f" | GPU{i}: {allocated:.1f}GB/{total:.1f}GB ({allocated/total*100:.1f}%)"
-
-        self._write(msg, self.TRAIN_LOG)
 
     # ==================== 样本生成日志 ====================
 
@@ -582,7 +551,7 @@ class Logger:
 
     # ==================== 束搜索推理日志 ====================
 
-    def log_beam_search_separator(self, title="", level=2):
+    def log_greedy_search_separator(self, title="", level=2):
         """记录分隔线
 
         Args:
@@ -596,12 +565,12 @@ class Logger:
         if title:
             msg = separator
             self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
-            self.log("BEAM_SEARCH", title, "beam_search", level=level)
+            self.log("GREEDY_SEARCH", title, "greedy_search", level=level)
         else:
             msg = separator
             self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
 
-    def log_beam_search_insert_probs(self, position, lambda_rate, tokens, probs, level=2):
+    def log_greedy_search_insert_probs(self, position, lambda_rate, tokens, probs, level=2):
         """记录插入操作的预测概率
 
         Args:
@@ -618,9 +587,9 @@ class Logger:
         probs_str = [f"{p:.6f}" for p in probs]
         self.log("INSERT_PROBS_DEBUG",
                 f"位置{position}: lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
-                "beam_search", level=level)
+                "greedy_search", level=level)
 
-    def log_beam_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=2):
+    def log_greedy_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=2):
         """记录替换操作的预测概率
 
         Args:
@@ -638,9 +607,9 @@ class Logger:
         probs_str = [f"{p:.6f}" for p in probs]
         self.log("SUBSTITUTE_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
-                "beam_search", level=level)
+                "greedy_search", level=level)
 
-    def log_beam_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=2):
+    def log_greedy_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=2):
         """记录删除操作的预测概率
 
         Args:
@@ -655,9 +624,9 @@ class Logger:
 
         self.log("DELETE_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda_del={lambda_rate:.4f} | above_threshold={above_threshold}",
-                "beam_search", level=level)
+                "greedy_search", level=level)
 
-    def log_beam_search_token_type_stats(self, token_categories, level=2):
+    def log_greedy_search_token_type_stats(self, token_categories, level=2):
         """记录词汇类型的预测统计
 
         Args:
@@ -671,7 +640,7 @@ class Logger:
             if token_probs:
                 # 只显示前5个
                 top_tokens = [(t, f"{p:.6f}") for t, p in token_probs[:5]]
-                self.log("TOKEN_TYPE_STATS", f"{category_name}: {top_tokens}", "beam_search", level=level)
+                self.log("TOKEN_TYPE_STATS", f"{category_name}: {top_tokens}", "greedy_search", level=level)
 
 
     # ==================== 推理详细日志 ====================
