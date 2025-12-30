@@ -88,6 +88,7 @@ def main():
         'cache_dir': "models/huggingface_cache",  # 模型缓存目录
         'use_fp16': False,  # 推理时关闭混合精度
         'gradient_accumulation_steps': 1,  # 推理时不需要梯度累积
+        'log_with': None,  # 不使用外部日志工具（如tensorboard、wandb等）
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'max_dim': 3,  # 支持的最大输入维度
