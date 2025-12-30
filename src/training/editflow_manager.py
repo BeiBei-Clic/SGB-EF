@@ -59,6 +59,9 @@ class EditFlowManager:
         # 设置随机种子
         set_seed(args.seed)
 
+        # 保存debug模式标志
+        self.debug_mode = getattr(args, 'debug', False)
+
         # 初始化统一日志管理器
         self.logger = Logger(self.accelerator, enabled=True)
 
@@ -84,6 +87,7 @@ class EditFlowManager:
             print(f"  分布式训练: {self.accelerator.distributed_type}")
             print(f"  进程数: {self.accelerator.num_processes}")
             print(f"  混合精度: {self.accelerator.mixed_precision}")
+            print(f"  调试模式: {'启用' if self.debug_mode else '禁用'}")
 
         # 记录训练开始日志
         self.logger.training_start(self.args)
@@ -255,7 +259,7 @@ class EditFlowManager:
         ).to(self.device)
 
         # 创建优化器和损失函数
-        criterion = ContinuousFlowLoss()
+        criterion = ContinuousFlowLoss(debug_mode=self.debug_mode)
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate * self.LEARNING_RATE_SCALE,
@@ -309,8 +313,8 @@ class EditFlowManager:
         z1_probs = torch.zeros(batch_size, seq_len, vocab_size, device=z1_token_ids.device)
         z1_probs.scatter_(2, z1_token_ids.unsqueeze(-1), 1.0)
 
-        # 记录输入变量的完整值（每个batch都记录）
-        if debug_info and self.accelerator.is_local_main_process:
+        # 记录输入变量的完整值（仅在debug模式下记录）
+        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
             context = debug_info.get('context', '')
             batch_idx = debug_info.get('batch_idx', 0)
             sample_idx = 0
@@ -331,8 +335,8 @@ class EditFlowManager:
             z0_token_ids, dataset.tokenizer
         )
 
-        # 记录x_t的完整值（每个batch都记录）
-        if debug_info and self.accelerator.is_local_main_process:
+        # 记录x_t的完整值（仅在debug模式下记录）
+        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
             context = debug_info.get('context', '')
             batch_idx = debug_info.get('batch_idx', 0)
             self.logger.tensor_values(f"x_t_batch{batch_idx}", x_t[0],
@@ -340,8 +344,8 @@ class EditFlowManager:
 
         attention_mask = (~x_pad_mask).float()
 
-        # 记录attention_mask的完整值（每个batch都记录）
-        if debug_info and self.accelerator.is_local_main_process:
+        # 记录attention_mask的完整值（仅在debug模式下记录）
+        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
             context = debug_info.get('context', '')
             batch_idx = debug_info.get('batch_idx', 0)
             self.logger.tensor_values(f"attention_mask_batch{batch_idx}", attention_mask[0],
@@ -356,8 +360,8 @@ class EditFlowManager:
         ins_rate, del_rate, sub_rate = output['rates']
         pred_rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
 
-        # 记录模型输出的完整值（每个batch都记录）
-        if debug_info and self.accelerator.is_local_main_process:
+        # 记录模型输出的完整值（仅在debug模式下记录）
+        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
             context = debug_info.get('context', '')
             batch_idx = debug_info.get('batch_idx', 0)
             sample_idx = 0
@@ -420,8 +424,8 @@ class EditFlowManager:
         # 在Z空间（z0）遍历，映射到X空间（x_t）的编辑操作
         u_mask = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer, x_t)
 
-        # 记录损失计算中的关键变量值（每个batch都记录）
-        if self.accelerator.is_local_main_process:
+        # 记录损失计算中的关键变量值（仅在debug模式下记录）
+        if self.accelerator.is_local_main_process and self.debug_mode:
             context = debug_info.get('context', '') if debug_info else ''
             batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
             sample_idx = 0
@@ -492,7 +496,7 @@ class EditFlowManager:
 
             # 使用 Accelerate 的梯度累积上下文管理器
             # 自动处理梯度同步、累积步数判断、优化器更新
-            if self.accelerator.is_local_main_process:
+            if self.accelerator.is_local_main_process and self.debug_mode:
                 self.logger.log("BATCH_START", f"开始处理 Batch {batch_idx} | timestamp={time.time():.2f}",
                                 f"维度{dimension}_batch{batch_idx}", level=2)
 
@@ -505,9 +509,9 @@ class EditFlowManager:
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
                 data_load_time = time.time() - data_load_start
 
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("DATA_LOAD", f"数据加载完成 | 耗时={data_load_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 # 移除过度的token解码日志以提高性能
 
@@ -518,12 +522,12 @@ class EditFlowManager:
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
                 condition_time = time.time() - condition_start
 
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("CONDITION_ENCODE", f"条件编码完成 | 耗时={condition_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
-                # 记录输入数据的完整值（每个batch都记录）
-                if self.accelerator.is_local_main_process:
+                # 记录输入数据的完整值（仅在debug模式下记录）
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     context = f'维度{dimension}'
                     self.logger.tensor_values(f"x_values_batch{batch_idx}", x_values[0],
                                              context=context, level=2, max_elements=50)
@@ -540,9 +544,9 @@ class EditFlowManager:
                 forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info)
                 forward_time = time.time() - forward_start
 
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("FORWARD_PASS", f"前向传播完成 | 耗时={forward_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 # 分布式健康检查：记录前向传播中的NaN（仅用于监控）
                 nan_check_start = time.time()
@@ -564,24 +568,24 @@ class EditFlowManager:
                 loss = self.compute_loss(forward_results, criterion, dataset, debug_info)
                 loss_compute_time = time.time() - loss_compute_start
 
-                # 记录损失值（每个batch都记录）
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                # 记录损失值（仅在debug模式下记录详细信息）
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f} | 耗时={loss_compute_time:.3f}s | NaN检查耗时={nan_check_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 grad_norm = 0.0
                 # 使用 Accelerate 的 backward 而不是直接调用 loss.backward()
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("BACKWARD_START", f"开始反向传播 | loss={loss.item():.6f} | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 backward_start = time.time()
                 try:
                     self.accelerator.backward(loss)
                     backward_time = time.time() - backward_start
-                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    if self.accelerator.is_local_main_process and self.debug_mode:
                         self.logger.log("BACKWARD_SUCCESS", f"反向传播成功 | 耗时={backward_time:.3f}s",
-                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
                 except Exception as e:
                     # 记录反向传播崩溃信息
                     self.logger.log_crash(
@@ -599,16 +603,16 @@ class EditFlowManager:
                 # 使用Accelerate的梯度裁剪（会自动处理混合精度）
                 # ⚠️ 关键修复：只在梯度完全同步时才执行裁剪和优化器更新
                 # 这确保在梯度累积期间不会在未同步的梯度上进行操作
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("SYNC_GRADIENTS_CHECK",
                                     f"检查是否需要同步梯度 | sync_gradients={self.accelerator.sync_gradients} | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 if self.accelerator.sync_gradients:
                     sync_start = time.time()
-                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    if self.accelerator.is_local_main_process and self.debug_mode:
                         self.logger.log("SYNC_GRADIENTS_START", f"开始梯度同步和裁剪 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
                     # ⚠️ 移除梯度NaN/Inf检查以避免分布式同步问题
                     # 原因：这个检查在分布式训练中会导致进程不同步和死锁
@@ -630,10 +634,10 @@ class EditFlowManager:
                         clip_duration = time.time() - clip_start
                         sync_time = time.time() - sync_start
 
-                        if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        if self.accelerator.is_local_main_process and self.debug_mode:
                             self.logger.log("SYNC_GRADIENTS_SUCCESS",
                                             f"梯度裁剪已禁用 | grad_norm={grad_norm:.4f} | 计算耗时={clip_duration:.3f}s | 总耗时={sync_time:.3f}s | ⚠️ 警告：梯度未裁剪",
-                                            f"维度{dimension}_batch{batch_idx}", level=1)
+                                            f"维度{dimension}_batch{batch_idx}", level=2)
                     except Exception as e:
                         if self.accelerator.is_local_main_process:
                             self.logger.error("GRAD_NORM_COMPUTE_ERROR",
@@ -643,17 +647,17 @@ class EditFlowManager:
 
 
                     # ✅ 只在梯度同步时更新参数
-                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    if self.accelerator.is_local_main_process and self.debug_mode:
                         self.logger.log("OPTIMIZER_STEP_START", f"准备执行优化器更新 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
                     optimizer_step_start = time.time()
                     try:
                         optimizer.step()
                         optimizer_step_time = time.time() - optimizer_step_start
-                        if self.accelerator.is_local_main_process and batch_idx >= 530:
+                        if self.accelerator.is_local_main_process and self.debug_mode:
                             self.logger.log("OPTIMIZER_STEP_SUCCESS", f"优化器更新成功 | 耗时={optimizer_step_time:.3f}s",
-                                            f"维度{dimension}_batch{batch_idx}", level=1)
+                                            f"维度{dimension}_batch{batch_idx}", level=2)
                     except Exception as e:
                         # 记录优化器步骤崩溃信息
                         self.logger.log_crash(
@@ -668,15 +672,15 @@ class EditFlowManager:
                     zero_grad_start = time.time()
                     optimizer.zero_grad()
                     zero_grad_time = time.time() - zero_grad_start
-                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    if self.accelerator.is_local_main_process and self.debug_mode:
                         self.logger.log("ZERO_GRAD", f"梯度清零完成 | 耗时={zero_grad_time:.3f}s",
-                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
                 else:
                     # 梯度累积期间：不执行优化器更新，保持 grad_norm 为 0
                     grad_norm = 0.0
-                    if self.accelerator.is_local_main_process and batch_idx >= 530:
+                    if self.accelerator.is_local_main_process and self.debug_mode:
                         self.logger.log("GRADIENT_ACCUMULATION", f"梯度累积中，跳过优化器更新 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=1)
+                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -688,14 +692,14 @@ class EditFlowManager:
                     postfix_dict = {
                         'loss': f'{loss.item():.4f}',
                         'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm:.3f}',
-                        'time': f'{batch_total_time:.2f}s' if batch_idx >= 530 else ''
+                        'time': f'{batch_total_time:.2f}s' if self.debug_mode else ''
                     }
                     progress_bar.set_postfix(postfix_dict)
 
                 # accumulate 上下文管理器即将退出，记录batch完成
-                if self.accelerator.is_local_main_process and batch_idx >= 530:
+                if self.accelerator.is_local_main_process and self.debug_mode:
                     self.logger.log("BATCH_COMPLETE", f"Batch {batch_idx} 完成 | 总耗时={batch_total_time:.3f}s | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=1)
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
         # 等待所有进程完成
         self.accelerator.wait_for_everyone()

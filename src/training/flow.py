@@ -78,8 +78,8 @@ def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z
 class ContinuousFlowLoss:
     """连续时间流匹配损失函数（架构v2.0 - 固定t=0，不再需要调度器）"""
 
-    def __init__(self):
-        pass
+    def __init__(self, debug_mode=False):
+        self.debug_mode = debug_mode
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
                            gap_token: int, tokenizer, x_t: torch.Tensor) -> torch.Tensor:
@@ -260,8 +260,8 @@ class ContinuousFlowLoss:
         loss_is_nan = bool(torch.isnan(loss).item())
         loss_is_inf = bool(torch.isinf(loss).item())
 
-        # 记录所有统计信息到日志
-        if logger is not None:
+        # 记录所有统计信息到日志（仅在debug模式下）
+        if logger is not None and self.debug_mode:
             logger.log(f"LOSS_STATS",
                       f"u_z: min={u_z_min:.6f}, max={u_z_max:.6f}, mean={u_z_mean:.6f}, std={u_z_std:.6f} | "
                       f"zeros={u_z_num_zeros}, near_zero={u_z_has_near_zero}, negative={u_z_has_negative} | "
