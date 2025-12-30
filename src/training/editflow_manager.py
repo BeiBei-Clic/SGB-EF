@@ -52,15 +52,15 @@ class EditFlowManager:
         # 注意：mixed_precision 由 accelerate launch 命令行参数控制
         # 不要在代码中硬编码，否则会覆盖命令行的 --mixed_precision=bf16 设置
         self.accelerator = Accelerator(
-            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
-            log_with=getattr(args, 'log_with', None)
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            log_with=args.log_with
         )
 
         # 设置随机种子
         set_seed(args.seed)
 
         # 保存debug模式标志
-        self.debug_mode = getattr(args, 'debug', False)
+        self.debug_mode = args.debug
 
         # 初始化统一日志管理器
         self.logger = Logger(self.accelerator, enabled=True)
@@ -69,18 +69,18 @@ class EditFlowManager:
         self.device = self.accelerator.device
         if self.accelerator.is_local_main_process:
             print("=== EditFlow符号回归预训练 (使用 Accelerate 加速) ===")
-            print(f"样本数: {getattr(self.args, 'num_samples', 'N/A')}")
-            print(f"最大维度: {getattr(self.args, 'max_dim', 'N/A')}")
-            print(f"表达式最大长度: {getattr(self.args, 'max_expr_length', 'N/A')}")
-            print(f"批次大小: {getattr(self.args, 'batch_size', 'N/A')}")
-            print(f"训练轮数: {getattr(self.args, 'num_epochs', 'N/A')}")
-            print(f"学习率: {getattr(self.args, 'learning_rate', 'N/A')}")
-            print(f"测试集比例: {getattr(self.args, 'test_split', 'N/A')}")
-            print(f"评估频率: 每{getattr(self.args, 'eval_every', 'N/A')}轮")
-            print(f"LLaMA模型配置: hidden_dim={getattr(self.args, 'hidden_dim', 256)}, n_layers={getattr(self.args, 'n_layers', 6)}, n_heads={getattr(self.args, 'n_heads', 8)}")
-            print(f"条件嵌入模型: {getattr(self.args, 'condition_model_name', 'N/A')}")
-            print(f"梯度累积步数: {getattr(self.args, 'gradient_accumulation_steps', 'N/A')}")
-            print(f"FP16混合精度: {getattr(self.args, 'use_fp16', 'N/A')}")
+            print(f"样本数: {self.args.num_samples}")
+            print(f"最大维度: {self.args.max_dim}")
+            print(f"表达式最大长度: {self.args.max_expr_length}")
+            print(f"批次大小: {self.args.batch_size}")
+            print(f"训练轮数: {self.args.num_epochs}")
+            print(f"学习率: {self.args.learning_rate}")
+            print(f"测试集比例: {self.args.test_split}")
+            print(f"评估频率: 每{self.args.eval_every}轮")
+            print(f"LLaMA模型配置: hidden_dim={self.args.hidden_dim}, n_layers={self.args.n_layers}, n_heads={self.args.n_heads}")
+            print(f"条件嵌入模型: {self.args.condition_model_name}")
+            print(f"梯度累积步数: {self.args.gradient_accumulation_steps}")
+            print(f"FP16混合精度: {self.args.use_fp16}")
 
             print(f"\nAccelerate 初始化完成")
             print(f"  设备: {self.device}")
@@ -107,8 +107,7 @@ class EditFlowManager:
             print(f"准备连续流训练数据 (单进程生成模式)...")
 
             # 获取对齐方法配置
-            alignment_method = getattr(self.args, 'alignment_method', 'randomized')
-            print(f"使用对齐方法: {alignment_method}")
+            print(f"使用对齐方法: {self.args.alignment_method}")
 
             # 调用数据生成函数
             generate_flow_samples(
@@ -118,7 +117,7 @@ class EditFlowManager:
                 max_depth=self.args.max_depth,
                 max_expr_length=self.args.max_expr_length,
                 verbose=True,  # 显示详细日志
-                alignment_method=alignment_method,
+                alignment_method=self.args.alignment_method,
             )
         else:
             # 非主进程跳过数据生成，等待主进程完成
@@ -140,12 +139,11 @@ class EditFlowManager:
         # === 修改开始：合并所有维度的位置索引 ===
         all_train_positions = []
         all_test_positions = []
-        test_split = getattr(self.args, 'test_split', 0.2)
 
         for dim, positions in dimension_samples.items():
             # 这里的 shuffle 配合 set_seed 保证所有进程打乱顺序一致
             np.random.shuffle(positions)
-            split_idx = int(len(positions) * (1 - test_split))
+            split_idx = int(len(positions) * (1 - self.args.test_split))
 
             all_train_positions.extend(positions[:split_idx])
             all_test_positions.extend(positions[split_idx:])
@@ -171,7 +169,7 @@ class EditFlowManager:
             train_dataset,
             batch_size=self.args.batch_size,
             shuffle=True,
-            num_workers=4,  # 恢复多进程数据加载
+            num_workers=self.args.num_workers,
             collate_fn=custom_collate_fn,
             drop_last=True, # 防止尾部batch不齐导致的死锁
             pin_memory=True
@@ -181,7 +179,7 @@ class EditFlowManager:
             test_dataset,
             batch_size=self.args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=self.args.num_workers,
             collate_fn=custom_collate_fn,
             drop_last=False # 测试集通常不需要 drop_last，除非 evaluate 也有同步逻辑
         )
@@ -227,13 +225,13 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print("初始化条件编码器...")
         condition_encoder = SetTransformerConditionEncoder(
-            max_input_dim=getattr(self.args, 'condition_max_input_dim', 3),
-            dim_hidden=getattr(self.args, 'condition_dim_hidden', 128),
-            num_heads=getattr(self.args, 'condition_num_heads', 4),
-            num_inds=getattr(self.args, 'condition_num_inds', 32),
-            num_layers=getattr(self.args, 'condition_num_layers', 3),
-            num_seeds=getattr(self.args, 'condition_num_seeds', 1),
-            dim_output=getattr(self.args, 'condition_dim_output', 128),
+            max_input_dim=self.args.condition_max_input_dim,
+            dim_hidden=self.args.condition_dim_hidden,
+            num_heads=self.args.condition_num_heads,
+            num_inds=self.args.condition_num_inds,
+            num_layers=self.args.condition_num_layers,
+            num_seeds=self.args.condition_num_seeds,
+            dim_output=self.args.condition_dim_output,
             verbose=self.accelerator.is_local_main_process
         ).to(self.device)
 
@@ -243,18 +241,18 @@ class EditFlowManager:
         # 获取条件编码器的隐藏层维度
         # 现在条件编码器输出 (batch_size, num_seeds, dim_hidden) 格式
         # 所以 condition_dim 应该等于 dim_hidden
-        condition_hidden_dim = getattr(self.args, 'condition_dim_hidden', 128)
+        condition_hidden_dim = self.args.condition_dim_hidden
 
         # 直接实例化 LlamaEditFlowBackbone
         model = LlamaEditFlowBackbone(
             vocab_size=len(tokenizer.get_vocab()),  # 符号回归专用小词表
-            hidden_dim=getattr(self.args, 'hidden_dim', 256),  # LLaMA隐藏层维度
-            n_layers=getattr(self.args, 'n_layers', 6),  # Transformer层数
-            n_heads=getattr(self.args, 'n_heads', 8),  # 注意力头数
+            hidden_dim=self.args.hidden_dim,  # LLaMA隐藏层维度
+            n_layers=self.args.n_layers,  # Transformer层数
+            n_heads=self.args.n_heads,  # 注意力头数
             condition_dim=condition_hidden_dim,
-            dropout=getattr(self.args, 'dropout', 0.1),
+            dropout=self.args.dropout,
             max_seq_len=self.args.max_expr_length,
-            use_condition_injection=getattr(self.args, 'use_condition_injection', True),
+            use_condition_injection=self.args.use_condition_injection,
             verbose=self.accelerator.is_local_main_process
         ).to(self.device)
 
@@ -830,7 +828,7 @@ class EditFlowManager:
             # 记录训练开始到 training.log
             self.logger.log("TRAINING_START", f"开始训练 | num_epochs={self.args.num_epochs} | model_params={model_params:,} | encoder_params={encoder_params:,}", level=1)
 
-        eval_every = getattr(self.args, 'eval_every', 5)
+        eval_every = self.args.eval_every
 
         for epoch in range(self.args.num_epochs):
             # === 修改开始：不再循环 dim，直接传整个 dataloader ===
@@ -1008,7 +1006,7 @@ class EditFlowManager:
 
         if best_candidate and self.accelerator.is_local_main_process:
             # 记录MSE分数
-            mse_score = getattr(best_candidate, 'mse_score', None)
+            mse_score = best_candidate.mse_score
             mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
             self.logger.log("SIMPLE_SEARCH_RESULT",
                            f"MSE分数: {mse_str} | "

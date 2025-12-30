@@ -75,7 +75,7 @@ accelerate launch \
     --num_epochs 50 \
     --num_timesteps 10 \
     --num_samples 1000000\
-    --batch_size 48
+    --batch_size 960
 
 # 将会话挂到后台
 Ctrl + B, D
