@@ -93,6 +93,20 @@ def main():
         'max_dim': 3,  # 支持的最大输入维度
         'max_expr_length': 24,  # 最大表达式长度
         "num_timesteps": 1,  # 已弃用：新架构固定t=0，不需要多时间步采样
+        # 训练相关参数（推理时也需要，用于兼容性）
+        'num_samples': 10000,  # 训练样本数（推理时不使用）
+        'batch_size': 32,  # 批次大小（推理时不使用）
+        'num_epochs': 30,  # 训练轮数（推理时不使用）
+        'test_split': 0.2,  # 测试集比例（推理时不使用）
+        'eval_every': 5,  # 评估频率（推理时不使用）
+        'save_every': 5,  # 保存频率（推理时不使用）
+        'n_points': 100,  # 每个样本的点数（推理时不使用）
+        'max_depth': 5,  # 最大表达式深度（推理时不使用）
+        'alignment_method': 'tree_edit_distance',  # 对齐方法（推理时不使用）
+        'cache_size': 1000,  # 数据缓存大小（推理时不使用）
+        'num_workers': 4,  # 数据加载工作进程数（推理时不使用）
+        'save_dir': 'checkpoints',  # 模型保存目录（推理时不使用）
+        'debug': False,  # 是否启用调试模式
         # LLaMA模型架构参数
         'hidden_dim': 512,  # LLaMA隐藏层维度 (匹配checkpoint)
         'n_layers': 8,  # LLaMA Transformer层数 (匹配checkpoint)
