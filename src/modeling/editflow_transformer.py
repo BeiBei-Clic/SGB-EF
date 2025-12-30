@@ -231,7 +231,7 @@ class EditFlowTransformer(nn.Module):
             )
 
         # 生成输出
-        rates = F.softplus(self.rates_head(hidden_states))
+        rates = F.softmax(self.rates_head(hidden_states), dim=-1)  # 三种操作归一化概率
         insert_logits = self.insert_logits_head(hidden_states)
         substitute_logits = self.substitute_logits_head(hidden_states)
 
