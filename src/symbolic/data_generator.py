@@ -341,15 +341,14 @@ def generate_flow_samples(
     # 2. 分批生成数据样本，支持断点续传
     total_dimension_count = {}
 
-    # 重试机制：最多重试3次
-    MAX_RETRIES = 3
+    # 重试机制：持续重试直到所有批次都成功
     retry_count = 0
     all_success = False
 
-    while retry_count < MAX_RETRIES and not all_success:
+    while not all_success:
         if retry_count > 0:
             if verbose:
-                print(f"\n=== 第 {retry_count} 次重试，回到阶段2重新检查缺失批次 ===")
+                print(f"\n=== 第 {retry_count} 次重试，检查并生成缺失的批次 ===")
 
         # 收集需要处理的批次
         batch_tasks = []
@@ -385,88 +384,130 @@ def generate_flow_samples(
                 print(f"开始处理 {len(batch_tasks)} 个批次任务...")
 
             try:
-                # 使用map方法确保所有任务同步完成，避免BrokenPipeError
+                # 使用imap_unordered来避免阻塞，可以实时处理完成的结果
+                # 这样即使某个worker卡住，已经完成的结果也能被处理
+                if verbose:
+                    print(f"使用进程池处理 {len(batch_tasks)} 个批次任务 (进程数={num_processes})...")
+
                 with multiprocessing.Pool(processes=num_processes) as pool:
-                    results = pool.map(generate_batch_worker, batch_tasks)
+                    # 使用imap_unordered以获得更好的响应性和容错性
+                    # 添加chunksize参数以优化性能
+                    chunksize = max(1, len(batch_tasks) // (num_processes * 4))
+                    results_iter = pool.imap_unordered(
+                        generate_batch_worker,
+                        batch_tasks,
+                        chunksize=chunksize
+                    )
 
-                # 处理所有结果（在pool已完全关闭后）
-                failed_batches = []
-                for batch_idx, sample_count, dimension_count in results:
-                    if sample_count == -1:
-                        # 批次失败，记录并删除可能存在的部分文件
-                        failed_batches.append(batch_idx)
-                        batch_filename = batch_filenames[batch_idx]
-                        if os.path.exists(batch_filename):
-                            os.remove(batch_filename)
-                            if verbose:
-                                print(f"\n删除批次 {batch_idx + 1} 的不完整文件")
-                    else:
-                        # 批次成功
+                    # 实时处理结果
+                    failed_batches = []
+                    completed_count = 0
+
+                    for result in results_iter:
+                        batch_idx, sample_count, dimension_count = result
+                        completed_count += 1
+
                         if verbose:
-                            print(f"\r批次 {batch_idx + 1} 完成 (生成{sample_count}个样本)", end='', flush=True)
+                            print(f"\r进度: {completed_count}/{len(batch_tasks)} 批次完成", end='', flush=True)
 
-                        # 累积维度统计
-                        for dim, count in dimension_count.items():
-                            total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
+                        if sample_count == -1:
+                            # 批次失败，记录并删除可能存在的部分文件
+                            failed_batches.append(batch_idx)
+                            batch_filename = batch_filenames[batch_idx]
+                            if os.path.exists(batch_filename):
+                                os.remove(batch_filename)
+                                if verbose:
+                                    print(f"\n删除批次 {batch_idx + 1} 的不完整文件")
+                        else:
+                            # 批次成功
+                            if verbose:
+                                print(f"\r批次 {batch_idx + 1} 完成 (生成{sample_count}个样本)", end='', flush=True)
+
+                            # 累积维度统计
+                            for dim, count in dimension_count.items():
+                                total_dimension_count[dim] = total_dimension_count.get(dim, 0) + count
+
+                if verbose:
+                    print(f"\n所有 {len(batch_tasks)} 个批次任务处理完成")
 
                 if failed_batches:
-                    # 有失败的批次，需要重试
+                    # 有失败的批次，记录并继续下一轮重试
                     retry_count += 1
                     if verbose:
-                        print(f"\n发现 {len(failed_batches)} 个失败的批次: {failed_batches}")
-                        print(f"将回到阶段2重新生成这些批次...")
-
-                    if retry_count >= MAX_RETRIES:
-                        # 达到最大重试次数
-                        if verbose:
-                            print(f"\n错误: 已达到最大重试次数 ({MAX_RETRIES})，以下批次仍然失败:")
-                            for batch_idx in failed_batches:
-                                print(f"  批次 {batch_idx + 1}")
-                        raise RuntimeError(f"有 {len(failed_batches)} 个批次在重试 {MAX_RETRIES} 次后仍然失败")
+                        print(f"\n发现 {len(failed_batches)} 个失败的批次: {[b + 1 for b in failed_batches]}")
+                        print(f"将在下一轮重试中重新生成这些批次...")
+                    # 不设置all_success，让循环继续
                 else:
                     # 所有批次都成功
                     all_success = True
                     if verbose:
                         print(f"\n所有 {len(batch_tasks)} 个批次并行处理完成")
 
-            except (BrokenPipeError, KeyboardInterrupt) as e:
+            except (BrokenPipeError, KeyboardInterrupt, Exception) as e:
                 if verbose:
-                    print(f"\n检测到进程通信中断: {type(e).__name__}")
-                raise
-            except RuntimeError as e:
-                if "批次在重试" in str(e):
+                    print(f"\n检测到异常: {type(e).__name__}: {str(e)}")
+                    print(f"已完成 {completed_count}/{len(batch_tasks)} 个批次")
+
+                # 检查是否有批次文件已经生成
+                existing_batches = sum(1 for bf in batch_filenames if os.path.exists(bf))
+                if verbose:
+                    print(f"已生成 {existing_batches}/{num_batches} 个批次文件")
+
+                # 如果是特定异常，重新抛出
+                if isinstance(e, (BrokenPipeError, KeyboardInterrupt)):
                     raise
                 else:
-                    # 其他 RuntimeError，直接抛出
-                    raise
+                    # 对于其他异常（包括批次失败），记录后进入下一轮重试
+                    import traceback
+                    if verbose:
+                        print(f"\n详细错误信息:")
+                        print(traceback.format_exc())
+                    # 增加重试计数，让循环继续
+                    retry_count += 1
+                    # 不重新抛出异常，继续下一轮
 
+        # === 在循环内验证批次完整性 ===
+        if verbose:
+            print(f"\n验证所有批次文件是否完整生成...")
+        missing_batches = []
+        for batch_idx, batch_filename in enumerate(batch_filenames):
+            if not os.path.exists(batch_filename):
+                missing_batches.append(batch_idx)
+
+        if missing_batches:
+            # 有缺失批次，记录并继续下一轮循环
+            if verbose:
+                print(f"发现 {len(missing_batches)} 个缺失的批次: {[b + 1 for b in missing_batches]}")
+                print(f"将重新生成这些批次...")
+            # 增加重试计数，让循环继续
+            retry_count += 1
+            # 不设置all_success，循环将继续
+        else:
+            # 所有批次都成功生成
+            all_success = True
+            if verbose:
+                print(f"验证通过: 所有 {num_batches} 个批次文件都已成功生成")
+            # 退出循环
+            break
+
+    # 循环结束：所有批次都成功生成
     if verbose and total_dimension_count:
         print(f"\n已完成批次的维度分布:")
         for dim, count in sorted(total_dimension_count.items()):
             print(f"{dim}维: {count} 个样本")
 
-    # === 最终验证：确保所有批次文件都成功生成 ===
-    if verbose:
-        print(f"\n验证所有批次文件是否完整生成...")
-    missing_batches = []
-    for batch_idx, batch_filename in enumerate(batch_filenames):
-        if not os.path.exists(batch_filename):
-            missing_batches.append(batch_idx)
-
-    if missing_batches:
-        error_msg = f"严重错误: 以下批次文件缺失，无法进行合并: {missing_batches}"
-        print(f"\n{error_msg}")
-        raise RuntimeError(error_msg)
-
-    if verbose:
-        print(f"验证通过: 所有 {num_batches} 个批次文件都已成功生成")
-
     # === 合并批次文件 ===
     if verbose:
-        print(f"\n按批次顺序合并所有批次文件到主文件...")
+        print(f"\n{'='*60}")
+        print(f"开始合并所有批次文件到主文件...")
+        print(f"{'='*60}")
     merge_batches_to_main_file(filename, batch_filenames, num_batches, total_dimension_count)
     if verbose:
-        print(f"所有数据已保存到: {filename}")
+        print(f"\n{'='*60}")
+        print(f"✓ 数据生成完成!")
+        print(f"  主文件: {filename}")
+        print(f"  总样本数: {num_samples}")
+        print(f"{'='*60}\n")
 
 
 def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_batches: int, total_dimension_count: Dict = None):
@@ -499,11 +540,13 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
         print(f"已加载 {len(dimension_samples)} 个维度的索引信息")
 
     with open(filename, 'a', encoding='utf-8') as main_file:
+        merged_count = 0
         for batch_idx in range(num_batches):
             batch_filename = batch_filenames[batch_idx]
             if os.path.exists(batch_filename):
                 # 读取批次样本并记录位置
-                print(f"从 {batch_filename} 加载数据...")
+                merged_count += 1
+                print(f"[{merged_count}/{num_batches}] 从 {os.path.basename(batch_filename)} 加载数据...")
                 batch_samples = []
                 with open(batch_filename, 'r', encoding='utf-8') as f:
                     for line in f:
@@ -511,7 +554,9 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
                         if line:
                             sample = json.loads(line)
                             batch_samples.append(sample)
-                print(f"已加载 {len(batch_samples)} 个样本")
+                print(f"  已加载 {len(batch_samples)} 个样本")
+
+                # 写入主文件并记录位置
                 for sample in batch_samples:
                     # 记录当前位置（即将写入的位置）
                     pos = main_file.tell()
@@ -526,7 +571,9 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
 
                 # 删除批次文件
                 os.remove(batch_filename)
-                print(f"已合并并删除批次文件: {batch_filename}")
+                print(f"  ✓ 已合并并删除批次文件")
+            else:
+                print(f"[{batch_idx+1}/{num_batches}] 跳过不存在的批次文件: {os.path.basename(batch_filename)}")
 
     # 保存完整的维度索引文件（包含已有数据和新数据）
     os.makedirs(os.path.dirname(index_filename), exist_ok=True)

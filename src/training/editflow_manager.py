@@ -593,51 +593,8 @@ class EditFlowManager:
                     )
                     raise  # 重新抛出异常以终止训练
 
-                # 记录梯度统计信息（每个batch都记录，用于调试NaN来源）
                 # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
                 all_params = list(model.parameters()) + list(condition_encoder.parameters())
-
-                # 只在每10个batch或第一个batch记录详细梯度统计，减少日志量
-                if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
-                    grad_max = 0.0
-                    grad_min = float('inf')
-                    grad_mean = 0.0
-                    grad_std = 0.0
-                    grad_has_nan = False
-                    grad_has_inf = False
-                    grad_num_zero = 0
-                    grad_num_params = 0
-
-                    for param in all_params:
-                        if param.grad is not None:
-                            grad_num_params += 1
-                            grad_data = param.grad.data
-
-                            # 检查NaN和Inf
-                            if torch.isnan(grad_data).any():
-                                grad_has_nan = True
-                            if torch.isinf(grad_data).any():
-                                grad_has_inf = True
-
-                            # 统计梯度值
-                            grad_abs = grad_data.abs()
-                            grad_max = max(grad_max, float(grad_abs.max().item()))
-                            grad_min = min(grad_min, float(grad_abs.min().item()))
-                            grad_mean += float(grad_abs.mean().item())
-                            grad_std += float(grad_abs.std().item())
-                            grad_num_zero += int((grad_data == 0).sum().item())
-
-                    # 计算平均值
-                    if grad_num_params > 0:
-                        grad_mean = float(grad_mean / grad_num_params)
-                        grad_std = float(grad_std / grad_num_params)
-
-                    # 记录详细的梯度统计
-                    self.logger.log("GRAD_STATS",
-                                    f"params={grad_num_params} | max={grad_max:.6f} min={grad_min:.6f} "
-                                    f"mean={grad_mean:.6f} std={grad_std:.6f} | zeros={grad_num_zero} "
-                                    f"has_nan={grad_has_nan} has_inf={grad_has_inf}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
 
                 # 使用Accelerate的梯度裁剪（会自动处理混合精度）
                 # ⚠️ 关键修复：只在梯度完全同步时才执行裁剪和优化器更新
@@ -684,26 +641,6 @@ class EditFlowManager:
                                             f"维度{dimension}_batch{batch_idx}")
                         grad_norm = 0.0
 
-                    # 记录梯度范数和参数统计（只在每10个batch记录）
-                    if batch_idx % 10 == 0 and self.accelerator.is_local_main_process:
-                        # 统计参数范数
-                        param_norm = 0.0
-                        param_max = 0.0
-                        param_mean = 0.0
-                        param_count = 0
-                        for param in all_params:
-                            if param.data is not None:
-                                param_count += 1
-                                param_norm += float(param.data.norm().item() ** 2)
-                                param_max = max(param_max, float(param.data.abs().max().item()))
-                                param_mean += float(param.data.abs().mean().item())
-                        param_norm = float(param_norm ** 0.5)
-                        param_mean = float(param_mean / param_count if param_count > 0 else 0.0)
-
-                        self.logger.log("GRAD_NORM",
-                                        f"grad_norm={grad_norm:.4f} | param_norm={param_norm:.4f} "
-                                        f"param_max={param_max:.4f} param_mean={param_mean:.4f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
                     # ✅ 只在梯度同步时更新参数
                     if self.accelerator.is_local_main_process and batch_idx >= 530:
@@ -727,12 +664,6 @@ class EditFlowManager:
                             extra_info=f"grad_norm={grad_norm:.4f}"
                         )
                         raise  # 重新抛出异常以终止训练
-
-                    # 记录优化器状态（学习率等）
-                    if self.accelerator.is_local_main_process and batch_idx % 10 == 0:
-                        current_lr = float(optimizer.param_groups[0]['lr'])
-                        self.logger.log("OPTIMIZER_STATE", f"lr={current_lr:.6f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
 
                     zero_grad_start = time.time()
                     optimizer.zero_grad()
@@ -1032,9 +963,6 @@ class EditFlowManager:
         self.logger.log("INITIAL_CONDITION_VALUES",
                        f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
                        "inference", level=1)
-
-        self.logger.tensor("initial_condition", condition, level=1, context="inference")
-        self.logger.tensor("initial_residuals", residuals, level=1, context="inference")
 
         # 构建初始前缀表达式（与训练格式一致）
         # 统一处理：对于n维，需要(n-1)个add + n个变量

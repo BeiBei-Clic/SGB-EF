@@ -154,42 +154,6 @@ class Logger:
 
     # ==================== 张量和GPU日志 ====================
 
-    def tensor(self, tensor_name, tensor, context="", level=2):
-        """记录张量信息
-
-        Args:
-            tensor_name (str): 张量名称
-            tensor: 张量对象
-            context (str): 上下文
-            level (int): 日志级别
-        """
-        if not self.enabled:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        msg = f"{timestamp} TENSOR {tensor_name}"
-        if context:
-            msg += f" [{context}]"
-
-        if isinstance(tensor, torch.Tensor):
-            msg += f" | shape={list(tensor.shape)} | dtype={tensor.dtype} | device={tensor.device}"
-            if tensor.numel() > 0:
-                msg += f" | min={tensor.min().item():.6f} | max={tensor.max().item():.6f} | mean={tensor.float().mean().item():.6f}"
-                if torch.isnan(tensor).any():
-                    msg += " | HAS_NAN"
-                if torch.isinf(tensor).any():
-                    msg += " | HAS_INF"
-        else:
-            msg += f" | type={type(tensor)} | value={tensor}"
-
-        # 根据级别选择日志文件
-        if level == 1:
-            self._write(msg, self.TRAIN_LOG)
-        elif level == 2:
-            self._write(msg, self.TRAIN_DEBUG_LOG)
-        else:
-            self._write(msg, self.INFERENCE_LOG)
-
     def tensor_values(self, tensor_name, tensor, context="", level=2,
                       max_elements=100, sample_first_n=5, sample_last_n=5):
         """记录张量的完整内容（直接输出变量值）
@@ -813,99 +777,6 @@ class Logger:
 
     # ==================== 推理详细日志 ====================
 
-    def log_residuals_stats(self, step, residuals, context="greedy_search", level=3):
-        """记录残差的详细统计信息
-
-        Args:
-            step: 推理步数
-            residuals: 残差数组 (numpy array)
-            context: 上下文标识
-            level: 日志级别
-        """
-        if not self.enabled or residuals is None:
-            return
-
-        import numpy as np
-
-        # 基本统计信息
-        self.log("RESIDUAL_STATS",
-                f"step={step} | "
-                f"shape={residuals.shape} | "
-                f"min={residuals.min():.6f} | max={residuals.max():.6f} | "
-                f"mean={residuals.mean():.6f} | std={residuals.std():.6f} | "
-                f"median={np.median(residuals):.6f} | "
-                f"l2_norm={np.linalg.norm(residuals):.6f}",
-                context, level=level)
-
-        # 分位数统计
-        percentiles = [10, 25, 50, 75, 90]
-        percentile_values = [np.percentile(residuals, p) for p in percentiles]
-        percentile_str = " | ".join([f"p{p}={v:.6f}" for p, v in zip(percentiles, percentile_values)])
-        self.log("RESIDUAL_DISTRIBUTION",
-                f"step={step} | {percentile_str}",
-                context, level=level)
-
-        # 异常值检测
-        threshold = 3 * residuals.std()
-        outliers_mask = np.abs(residuals) > threshold
-        n_outliers = int(outliers_mask.sum())
-        if n_outliers > 0:
-            outlier_max = np.abs(residuals[outliers_mask]).max()
-            outlier_mean = np.abs(residuals[outliers_mask]).mean()
-            self.log("RESIDUAL_OUTLIERS",
-                    f"step={step} | n_outliers={n_outliers}/{len(residuals)} | "
-                    f"threshold={threshold:.6f} | max_outlier={outlier_max:.6f} | "
-                    f"mean_outlier={outlier_mean:.6f}",
-                    context, level=level)
-
-    def log_condition_stats(self, step, condition, context="greedy_search", level=3):
-        """记录条件嵌入的详细统计信息
-
-        Args:
-            step: 推理步数
-            condition: 条件嵌入张量 (torch.Tensor)
-            context: 上下文标识
-            level: 日志级别
-        """
-        if not self.enabled or condition is None:
-            return
-
-        import numpy as np
-
-        # 处理不同维度的条件嵌入
-        if isinstance(condition, torch.Tensor):
-            # 处理序列格式 (batch, num_seeds, dim_hidden) 或 (batch, dim_hidden)
-            condition_cpu = condition.detach().cpu()
-
-            if condition_cpu.dim() == 3:
-                # (batch, num_seeds, dim_hidden)
-                condition_flat = condition_cpu.squeeze(0).flatten().numpy()
-                shape_info = f"{list(condition.shape)} (序列格式)"
-            elif condition_cpu.dim() == 2:
-                # (batch, dim_hidden)
-                condition_flat = condition_cpu.squeeze(0).numpy()
-                shape_info = f"{list(condition.shape)} (向量格式)"
-            else:
-                condition_flat = condition_cpu.flatten().numpy()
-                shape_info = f"{list(condition.shape)}"
-
-            # 基本统计信息
-            self.log("CONDITION_STATS",
-                    f"step={step} | "
-                    f"shape={shape_info} | "
-                    f"min={condition_flat.min():.6f} | max={condition_flat.max():.6f} | "
-                    f"mean={condition_flat.mean():.6f} | std={condition_flat.std():.6f} | "
-                    f"l2_norm={np.linalg.norm(condition_flat):.6f}",
-                    context, level=level)
-
-            # 分位数统计
-            percentiles = [10, 25, 50, 75, 90]
-            percentile_values = [np.percentile(condition_flat, p) for p in percentiles]
-            percentile_str = " | ".join([f"p{p}={v:.6f}" for p, v in zip(percentiles, percentile_values)])
-            self.log("CONDITION_DISTRIBUTION",
-                    f"step={step} | {percentile_str}",
-                    context, level=level)
-
     def log_inference_step(self, step, total_steps, current_tokens, t,
                           residuals=None, condition=None,
                           model_pred_time=None, total_time=None,
@@ -940,63 +811,6 @@ class Logger:
                 f"expr='{expr_short}' | "
                 f"len={len(current_tokens)}{timing_info}",
                 context, level=2)
-
-    def log_residuals_evolution(self, steps_list, residuals_list, context="greedy_search"):
-        """记录残差演化趋势
-
-        Args:
-            steps_list: 步骤列表
-            residuals_list: 对应的残差列表
-            context: 上下文标识
-        """
-        if not self.enabled or not steps_list or not residuals_list:
-            return
-
-        import numpy as np
-
-        evolution_lines = []
-        evolution_lines.append(f"残差演化趋势 (共{len(steps_list)}步):")
-        evolution_lines.append(f"{'步骤':<6} {'L2范数':<12} {'均值':<12} {'标准差':<12} {'最大值':<12}")
-        evolution_lines.append("-" * 60)
-
-        for step, residuals in zip(steps_list, residuals_list):
-            if residuals is not None:
-                l2_norm = np.linalg.norm(residuals)
-                mean_val = residuals.mean()
-                std_val = residuals.std()
-                max_val = np.abs(residuals).max()
-                evolution_lines.append(f"{step:<6} {l2_norm:<12.6f} {mean_val:<12.6f} {std_val:<12.6f} {max_val:<12.6f}")
-
-        evolution_str = "\n".join(evolution_lines)
-        self.log("RESIDUALS_EVOLUTION", evolution_str, context, level=2)
-
-    def log_model_prediction_stats(self, step, pred_rates, context="greedy_search", level=3):
-        """记录模型预测的统计信息
-
-        Args:
-            step: 推理步数
-            pred_rates: 预测的速率张量 [batch, seq_len, 3]
-            context: 上下文标识
-            level: 日志级别
-        """
-        if not self.enabled or pred_rates is None:
-            return
-
-        import torch
-
-        # pred_rates: [batch, seq_len, 3] -> [ins_rate, del_rate, sub_rate]
-        rates_cpu = pred_rates[0].cpu().numpy()  # 去掉batch维度
-
-        lambda_ins = rates_cpu[:, 0]  # 插入速率
-        lambda_del = rates_cpu[:, 1]  # 删除速率
-        lambda_sub = rates_cpu[:, 2]  # 替换速率
-
-        self.log("MODEL_PREDICTION_STATS",
-                f"step={step} | "
-                f"ins_rate: mean={lambda_ins.mean():.4f} max={lambda_ins.max():.4f} | "
-                f"del_rate: mean={lambda_del.mean():.4f} max={lambda_del.max():.4f} | "
-                f"sub_rate: mean={lambda_sub.mean():.4f} max={lambda_sub.max():.4f}",
-                context, level=level)
 
     def log_crash(self, step_name, batch_idx, dimension, error, extra_info=None):
         """记录训练崩溃信息到专门的crash日志文件
