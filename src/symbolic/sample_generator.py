@@ -193,7 +193,19 @@ def generate_single_sample(
             if not success:
                 continue
 
-            # 转换为token序列
+            # 计算 residuals 并检查数值范围（提前检查以避免不必要的token转换）
+            residuals = y_target - y_curr
+            # 记录原始 residuals 统计
+            _sample_logger.residuals_before_clip(sample_id, i+1, residuals.min(), residuals.max(), residuals.mean())
+
+            # 检查 residuals 是否超过阈值,如果超过则跳过样本
+            THRESHOLD = 100.0  # 阈值设为100,确保数值稳定
+            max_residual = np.max(np.abs(residuals))
+            if max_residual > THRESHOLD:
+                _sample_logger.skip_clipped(sample_id, i+1, max_residual, len(residuals), THRESHOLD)
+                continue
+
+            # 转换为token序列（只有通过residuals检查后才执行）
             _sample_logger.sample_step(sample_id, f"转换为token序列 {i+1}")
             tree_start = time.time()
             target_tree = expr_to_tree(target_expr)
@@ -214,18 +226,6 @@ def generate_single_sample(
             align_time = (time.time() - align_start) * 1000
             _sample_logger.levenshtein_alignment(sample_id, i+1, len(z0_tokens), len(z1_tokens), align_time)
 
-            # 计算 residuals 并检查数值范围
-            residuals = y_target - y_curr
-            # 记录原始 residuals 统计
-            _sample_logger.residuals_before_clip(sample_id, i+1, residuals.min(), residuals.max(), residuals.mean())
-
-            # 检查 residuals 是否超过阈值,如果超过则跳过样本
-            THRESHOLD = 100.0  # 阈值设为100,确保数值稳定
-            max_residual = np.max(np.abs(residuals))
-            if max_residual > THRESHOLD:
-                _sample_logger.skip_clipped(sample_id, i+1, max_residual, len(residuals), THRESHOLD)
-                continue
-
             batch_samples.append({
                 "input_dimension": dim,
                 "x_values": x_values,  # 保持与原代码一致的字段名
@@ -241,6 +241,49 @@ def generate_single_sample(
                 "z0_tokens": z0_tokens,
                 "z1_tokens": z1_tokens
             })
+
+            # 生成对称样本：交换 target 和 curr
+            # 这样可以复用已验证的表达式对，提高数据生成效率
+            _sample_logger.sample_step(sample_id, f"生成对称样本 {i+1}")
+            sym_align_start = time.time()
+
+            # 交换角色：原 curr_expr 成为新 target，原 target_expr 成为新 curr
+            sym_target_expr = curr_expr
+            sym_curr_expr = target_expr
+            sym_y_target = y_curr
+            sym_y_curr = y_target
+            sym_residuals = -residuals  # 取反残差
+
+            # 转换为 token 序列
+            sym_target_tree = expr_to_tree(sym_target_expr)
+            sym_curr_tree = expr_to_tree(sym_curr_expr)
+            sym_target_tokens = sym_target_tree.split(',')
+            sym_curr_tokens = sym_curr_tree.split(',')
+
+            # 对齐到Z空间（方向相反）
+            if _alignment_method == 'randomized':
+                sym_z0_tokens, sym_z1_tokens = randomized_alignment_with_gap(sym_curr_tokens, sym_target_tokens)
+            else:  # 'levenshtein'
+                sym_z0_tokens, sym_z1_tokens = levenshtein_alignment_with_gap(sym_curr_tokens, sym_target_tokens)
+
+            sym_align_time = (time.time() - sym_align_start) * 1000
+
+            batch_samples.append({
+                "input_dimension": dim,
+                "x_values": x_values,
+                "y_target": sym_y_target.tolist(),
+                "y_curr": sym_y_curr.tolist(),
+                "residuals": sym_residuals.tolist(),
+                "tree_gt": sym_target_tree,
+                "exp_gt": str(sym_target_expr),
+                "tree_cur1": sym_curr_tree,
+                "exp_cur1": str(sym_curr_expr),
+                "curr_tokens": sym_curr_tokens,
+                "target_tokens": sym_target_tokens,
+                "z0_tokens": sym_z0_tokens,
+                "z1_tokens": sym_z1_tokens
+            })
+            _sample_logger.levenshtein_alignment(sample_id, f"{i+1}-sym", len(sym_z0_tokens), len(sym_z1_tokens), sym_align_time)
 
         _sample_logger.sample_success(sample_id)
         return batch_samples
