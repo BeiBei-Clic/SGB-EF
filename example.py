@@ -164,7 +164,7 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_5"
+    model_path = "checkpoints/checkpoint_epoch_10"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用简单推理（贪婪搜索）+ 北极星模式（目标值作为恒定条件）

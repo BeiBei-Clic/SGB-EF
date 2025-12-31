@@ -600,6 +600,121 @@ class Logger:
 
     # ==================== 编辑操作日志 ====================
 
+    def log_u_mask_split(self, tensor_name, u_mask, x_t, vocab_size, context="", level=2):
+        """按语义拆分记录u_mask（INSERT/SUBSTITUTE/DELETE三个独立张量），按位置分行输出
+
+        Args:
+            tensor_name (str): 张量名称
+            u_mask: [batch, x_seq_len, 2*vocab_size+1] 的编辑操作掩码
+            x_t: [batch, x_seq_len] 的当前序列token IDs
+            vocab_size: 词汇表大小
+            context: 上下文标识
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        batch_size, x_seq_len, mask_dim = u_mask.shape
+
+        # 按样本分别记录
+        for batch_idx in range(batch_size):
+            msg = f"{timestamp} TENSOR_VALUES {tensor_name}_batch{batch_idx}"
+            if context:
+                msg += f" [{context}]"
+            msg += f" | shape=[{x_seq_len}, {mask_dim}] | dtype={u_mask.dtype} | device={u_mask.device}"
+
+            # 对每个位置分别输出
+            for pos in range(x_seq_len):
+                if x_t[batch_idx, pos].item() == 0:  # pad token
+                    break
+
+                # INSERT部分：前vocab_size维
+                ins_vals = u_mask[batch_idx, pos, :vocab_size].cpu().numpy()
+                ins_str = ", ".join([f"{v:.0f}" for v in ins_vals])
+
+                # SUBSTITUTE部分：中间vocab_size维
+                sub_vals = u_mask[batch_idx, pos, vocab_size:2*vocab_size].cpu().numpy()
+                sub_str = ", ".join([f"{v:.0f}" for v in sub_vals])
+
+                # DELETE部分：最后1维
+                del_val = u_mask[batch_idx, pos, -1].cpu().item()
+
+                msg += f"\n  pos{pos}(x_t={x_t[batch_idx, pos].item()}):"
+                msg += f"\n    INSERT:    [{ins_str}]"
+                msg += f"\n    SUBSTITUTE: [{sub_str}]"
+                msg += f"\n    DELETE:    {del_val:.0f}"
+
+            # 根据级别选择日志文件
+            if level == 1:
+                self._write(msg, self.TRAIN_LOG)
+            elif level == 2:
+                self._write(msg, self.TRAIN_DEBUG_LOG)
+            else:
+                self._write(msg, self.INFERENCE_LOG)
+
+    def log_u_mask_detailed(self, tensor_name, u_mask, x_t, vocab_size, context="", level=2):
+        """详细记录u_mask标签的完整结构（按位置和操作类型分解）
+
+        Args:
+            tensor_name (str): 张量名称
+            u_mask: [batch, x_seq_len, 2*vocab_size+1] 的编辑操作掩码
+            x_t: [batch, x_seq_len] 的当前序列token IDs
+            vocab_size: 词汇表大小
+            context: 上下文标识
+            level: 日志级别
+        """
+        if not self.enabled:
+            return
+
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        batch_size, x_seq_len, mask_dim = u_mask.shape
+
+        msg = f"{timestamp} TENSOR_VALUES_DETAILED {tensor_name}"
+        if context:
+            msg += f" [{context}]"
+        msg += f" | shape={list(u_mask.shape)} | vocab_size={vocab_size}"
+
+        # 对每个样本、每个位置进行详细记录
+        for batch_idx in range(batch_size):
+            msg += f"\n  Batch {batch_idx}:"
+
+            for pos in range(x_seq_len):
+                # 跳过pad位置
+                if x_t[batch_idx, pos].item() == 0:
+                    msg += f"\n    Position {pos}: [PAD] stop"
+                    break
+
+                # 提取三个部分
+                ins_part = u_mask[batch_idx, pos, :vocab_size]  # 插入部分 [vocab_size]
+                sub_part = u_mask[batch_idx, pos, vocab_size:2*vocab_size]  # 替换部分 [vocab_size]
+                del_part = u_mask[batch_idx, pos, -1]  # 删除部分 [1]
+
+                # 找出非零位置
+                ins_nonzero = ins_part.nonzero(as_tuple=False).squeeze(-1)
+                sub_nonzero = sub_part.nonzero(as_tuple=False).squeeze(-1)
+
+                # 处理空tensor的情况
+                ins_count = ins_nonzero.numel() if len(ins_nonzero.shape) > 0 else 0
+                sub_count = sub_nonzero.numel() if len(sub_nonzero.shape) > 0 else 0
+
+                msg += f"\n    Position {pos}:"
+                msg += f"\n      INSERT[{ins_count}]: " + (
+                    f"ids={[int(t.item()) for t in ins_nonzero]}" if ins_count > 0 else "[]"
+                )
+                msg += f"\n      SUBSTITUTE[{sub_count}]: " + (
+                    f"ids={[int(t.item()) for t in sub_nonzero]}" if sub_count > 0 else "[]"
+                )
+                msg += f"\n      DELETE: {float(del_part.item()):.1f}"
+
+        # 根据级别选择日志文件
+        if level == 1:
+            self._write(msg, self.TRAIN_LOG)
+        elif level == 2:
+            self._write(msg, self.TRAIN_DEBUG_LOG)
+        else:
+            self._write(msg, self.INFERENCE_LOG)
+
     def log_edit_operations(self, u_mask_sample, x_t_sample, vocab_size,
                            context="", level=2, max_ops=20):
         """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）

@@ -231,7 +231,17 @@ class EditFlowTransformer(nn.Module):
             )
 
         # 生成输出
-        rates = F.softmax(self.rates_head(hidden_states), dim=-1)  # 三种操作归一化概率
+        raw_rates = self.rates_head(hidden_states)
+        rates = F.softmax(raw_rates, dim=-1)  # 三种操作归一化概率
+
+        # DEBUG: 验证归一化（每个batch都打印一次）
+        if hasattr(self, '_debug_printed') == False:
+            self._debug_printed = True
+            print(f"[DEBUG] First forward pass:")
+            print(f"  raw_rates[0, 0] = {raw_rates[0, 0].detach().cpu()}")
+            print(f"  rates[0, 0] = {rates[0, 0].detach().cpu()}")
+            print(f"  rates[0, 0].sum() = {rates[0, 0].sum().detach().cpu().item():.6f}")
+
         insert_logits = self.insert_logits_head(hidden_states)
         substitute_logits = self.substitute_logits_head(hidden_states)
 

@@ -160,24 +160,12 @@ class LlamaEditFlowBackbone(nn.Module):
 
         # 6. 编辑流五大输出头 (论文公式13-15)
 
-        # 预测速率 (Rates) - 使用softplus确保正值
-        self.ins_rate_head = nn.Sequential(
+        # 预测操作类型概率 (Rates) - 使用softmax归一化，确保三种操作互斥
+        self.rates_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        self.del_rate_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        self.sub_rate_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 3)  # 输出3维：[ins_logit, del_logit, sub_logit]
         )
 
         # 预测分布 (Distributions)
@@ -262,10 +250,14 @@ class LlamaEditFlowBackbone(nn.Module):
 
         # H. 计算五大输出
 
-        # 速率预测（使用softplus确保正值）
-        ins_rate = F.softplus(self.ins_rate_head(hidden_states))
-        del_rate = F.softplus(self.del_rate_head(hidden_states))
-        sub_rate = F.softplus(self.sub_rate_head(hidden_states))
+        # 操作类型预测（使用softmax归一化，确保互斥）
+        rates_logits = self.rates_head(hidden_states)  # (batch_size, seq_len, 3)
+        rates_probs = F.softmax(rates_logits, dim=-1)   # (batch_size, seq_len, 3)
+
+        # 分解为三个操作的概率（每个都是batch_size, seq_len, 1）
+        ins_rate = rates_probs[:, :, 0:1]  # 插入概率
+        del_rate = rates_probs[:, :, 1:2]  # 删除概率
+        sub_rate = rates_probs[:, :, 2:3]  # 替换概率
 
         # 词汇分布预测
         ins_logits = self.ins_vocab_head(hidden_states)

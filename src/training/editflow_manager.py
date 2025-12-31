@@ -428,10 +428,12 @@ class EditFlowManager:
             batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
             sample_idx = 0
 
-            # 记录标准答案：z0和z1的token序列
+            # 记录标准答案：z0、z1和x_t的token序列
             self.logger.tensor_values(f"GT_z0_batch{batch_idx}", z0[sample_idx],
                                      context=context, level=2, max_elements=50)
             self.logger.tensor_values(f"GT_z1_batch{batch_idx}", z1_token_ids[sample_idx],
+                                     context=context, level=2, max_elements=50)
+            self.logger.tensor_values(f"GT_x_t_batch{batch_idx}", x_t[sample_idx],
                                      context=context, level=2, max_elements=50)
 
             # 记录分解后的速率（模型预测）
@@ -449,8 +451,9 @@ class EditFlowManager:
                                      context=context, level=2, max_elements=100)
 
             # 记录标准答案：u_mask（真实编辑操作标签，one-hot编码）
-            self.logger.tensor_values(f"GT_u_mask_batch{batch_idx}", u_mask[sample_idx],
-                                     context=context, level=2, max_elements=100)
+            # 使用专门的日志方法按语义拆分记录
+            self.logger.log_u_mask_split(f"GT_u_mask", u_mask[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
+                                        effective_vocab_size, context=context, level=2)
 
             # 解码并记录Ground Truth编辑操作（可读格式，使用ID）
             self.logger.log_edit_operations(
