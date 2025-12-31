@@ -53,19 +53,43 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     np.random.seed(seed_val)
 
     # 设置日志进程标识
-    process_prefix = f"[B{batch_idx+1}]"  # 使用批次号作为唯一标识
+    process_prefix = f"[B{batch_idx+1}]"
 
-    # 批次开始信息通过进度条显示，避免额外print输出
+    # 【调试日志】为每个worker创建独立的日志文件
+    debug_log_path = f"logs/worker_batch_{batch_idx+1}_pid_{os.getpid()}.log"
+    os.makedirs("logs", exist_ok=True)
+
+    def debug_log(msg):
+        """写入调试日志"""
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        with open(debug_log_path, "a") as f:
+            f.write(f"{timestamp} {msg}\n")
+
+    debug_log(f"=== 批次{batch_idx+1}开始 === | seed_val={seed_val} | PID={os.getpid()} | target={current_batch_size} samples")
 
     batch_samples = []
     dimension_count = {}
     sample_count = 0
+    attempt_count = 0  # 总尝试次数
+    fail_count = 0  # 失败次数
+    consecutive_fails = 0  # 连续失败次数
+    last_log_time = time.time()
 
     SAMPLE_TIMEOUT = 10.0  # 单个样本生成超时时间（秒）
 
     # 移除进度条，避免多进程显示混乱
 
     while sample_count < current_batch_size:
+        # 【调试日志】每100次尝试或每30秒输出一次进度
+        current_time = time.time()
+        if attempt_count % 100 == 0 and attempt_count > 0:
+            debug_log(f"进度: 尝试{attempt_count}次 | 成功{sample_count}个 | 失败{fail_count}次 | 连续失败{consecutive_fails}次")
+        elif current_time - last_log_time > 30:
+            debug_log(f"心跳: 尝试{attempt_count}次 | 成功{sample_count}个 | 已运行{int(current_time - last_log_time)}秒")
+            last_log_time = current_time
+
+        attempt_count += 1
+        consecutive_fails += 1
         # 生成更随机的样本ID，避免重复
         unique_factor = random.randint(0, 999999)
         sample_id = f"{process_prefix}_sample{sample_count}_{os.getpid()}_{unique_factor}"
@@ -87,6 +111,10 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
             # 如果成功生成样本，添加到批次中
             if generated_samples:
+                # 【调试日志】成功生成样本
+                if sample_count % 1000 == 0 and sample_count > 0:
+                    debug_log(f"成功样本 | sample_count={sample_count} | attempt={attempt_count} | dim={dim}")
+
                 # 获取维度信息用于统计
                 dim = generated_samples[0]["input_dimension"]
 
@@ -98,18 +126,25 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
 
                     sample_count += 1
                     dimension_count[dim] = dimension_count.get(dim, 0) + 1
+                consecutive_fails = 0  # 重置连续失败计数
             else:
                 # 样本生成失败，记录并继续（不增加sample_count）
+                fail_count += 1
+                if fail_count % 100 == 0:
+                    debug_log(f"样本失败 | fail_count={fail_count} | consecutive_fails={consecutive_fails} | attempt={attempt_count}")
                 _sample_logger.sample_failed(sample_id, "No samples generated")
                 continue
 
         except TimeoutError:
             # 超时处理（不增加sample_count）
+            fail_count += 1
+            debug_log(f"超时 | fail_count={fail_count} | consecutive_fails={consecutive_fails} | TIMEOUT={SAMPLE_TIMEOUT}s")
             _sample_logger.sample_timeout(sample_id, SAMPLE_TIMEOUT)
             continue
 
         except Exception as e:
             # 其他异常处理（不增加sample_count）
+            debug_log(f"异常 | {type(e).__name__}: {str(e)[:100]} | sample_count={sample_count}")
             _sample_logger.sample_error(sample_id, type(e).__name__, str(e))
 
             # 保存当前已生成的样本（如果有的话）
@@ -120,15 +155,18 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                         for sample in batch_samples:
                             sample_line = json.dumps(sample, ensure_ascii=False)
                             f.write(sample_line + '\n')
-                    print(f"\n{process_prefix} 异常发生，已保存部分数据 ({len(batch_samples)} 个样本) 到 {batch_filename}")
+                    debug_log(f"异常保存 | 已保存{len(batch_samples)}个样本到{batch_filename}")
                 except Exception as save_error:
-                    print(f"\n{process_prefix} 保存部分数据失败: {save_error}")
+                    debug_log(f"保存失败 | {save_error}")
 
             # 返回失败标记 (-1 表示失败)
-            print(f"\n{process_prefix} 批次失败: {type(e).__name__}: {str(e)}")
+            debug_log(f"批次失败 | {type(e).__name__}: {str(e)[:100]}")
             return batch_idx, -1, {}
 
     # 批次完成，无需关闭进度条
+
+    # 【调试日志】批次完成摘要
+    debug_log(f"=== 批次完成 === | 成功{sample_count}个样本 | 尝试{attempt_count}次 | 失败{fail_count}次")
 
     # 立即保存当前批次到文件
     if batch_samples:
@@ -143,6 +181,8 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             print(f"{process_prefix} 批次维度分布:")
             for dim, count in sorted(dimension_count.items()):
                 print(f"  {dim}维: {count} 个样本")
+
+        debug_log(f"保存成功 | 文件={batch_filename} | 样本数={len(batch_samples)} | 维度分布={dimension_count}")
 
     return batch_idx, len(batch_samples), dimension_count
 
@@ -560,6 +600,21 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
                 # 删除批次文件
                 os.remove(batch_filename)
                 print(f"  ✓ 已合并并删除批次文件")
+
+                # 删除对应的worker日志文件
+                batch_number = batch_idx + 1  # 批次号从1开始
+                import glob
+                worker_log_pattern = f"logs/worker_batch_{batch_number}_pid_*.log"
+                deleted_log_count = 0
+                for log_file in glob.glob(worker_log_pattern):
+                    try:
+                        os.remove(log_file)
+                        deleted_log_count += 1
+                    except Exception as e:
+                        print(f"  ⚠ 删除worker日志失败: {e}")
+
+                if deleted_log_count > 0:
+                    print(f"  ✓ 已删除 {deleted_log_count} 个worker日志文件")
             else:
                 print(f"[{batch_idx+1}/{num_batches}] 跳过不存在的批次文件: {os.path.basename(batch_filename)}")
 

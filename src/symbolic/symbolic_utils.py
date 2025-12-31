@@ -82,7 +82,7 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
         message = f"[GENERATE_RANDOM_EXPR] {step}"
         if details:
             message += f" | {details}"
-        _logger.write(f"{timestamp} {message}")
+        _logger._write(f"{timestamp} {message}", _logger.SAMPLE_LOG)
 
     log_debug("开始", f"input_dimension={input_dimension}, max_depth={max_depth}")
 
