@@ -13,6 +13,7 @@ import argparse
 import os
 import numpy as np
 import torch
+from datetime import timedelta
 
 # 设置环境变量来抑制transformers的警告输出 - 这是最有效的方法
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,6 +22,12 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 # 设置NCCL超时时间为无穷大，避免数据生成时的等待超时
 os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
 os.environ["NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
+# 额外的NCCL超时设置，确保无限等待
+os.environ["NCCL_P2P_DISABLE"] = "1"     # 禁用P2P以避免某些通信问题
+os.environ["NCCL_IB_DISABLE"] = "1"      # 禁用InfiniBand（如果不是必需的）
+
+# 设置PyTorch分布式默认超时为无限（1年）
+torch.distributed.default_timeout = timedelta(seconds=31536000)
 
 from src.training.editflow_manager import EditFlowManager
 
@@ -66,7 +73,7 @@ def main():
     parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
     parser.add_argument("--debug", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否启用调试模式（记录详细的训练日志）")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载进程数（DataLoader的num_workers参数）")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载进程数（DataLoader的num_workers参数）")
 
     # 多时间步采样参数（已弃用 - v2.0架构固定t=0）
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量（已弃用：新架构固定t=0，无需多时间步）")

@@ -2,7 +2,6 @@ import os
 import glob
 import torch
 import argparse
-from ..modeling.editflow_transformer import EditFlowConfig
 
 
 def find_latest_checkpoint(args):
@@ -35,7 +34,6 @@ def load_checkpoint(checkpoint_path, model, condition_encoder, device, optimizer
     if os.path.exists(config_path):
         # 添加所有可能的自定义类到安全全局列表
         torch.serialization.add_safe_globals([
-            EditFlowConfig,
             argparse.Namespace
         ])
         # 设置 weights_only=False 以支持加载包含自定义类的旧检查点
