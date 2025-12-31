@@ -83,7 +83,8 @@ class SimpleSymbolicRegression:
                  logger,
                  min_action_score=0.01,
                  max_expression_length=50,
-                 numerical_clip_threshold=1e6):
+                 numerical_clip_threshold=1e6,
+                 action_thresholds=None):
         """初始化简单推理器
 
         Args:
@@ -93,9 +94,12 @@ class SimpleSymbolicRegression:
             device: 计算设备
             args: 参数配置
             logger: 日志记录器
-            min_action_score: 最小操作分数阈值
+            min_action_score: 最小操作分数阈值（用于过滤低分操作）
             max_expression_length: 表达式最大长度
             numerical_clip_threshold: 数值裁剪阈值
+            action_thresholds: 操作采纳阈值列表，用于多阈值推理
+                              例如: [0.1, 0.05, 0.01] 表示采纳分数>0.1, >0.05, >0.01的所有操作
+                              如果为None,则使用传统的单最佳操作模式
         """
         self.model = model
         self.condition_encoder = condition_encoder
@@ -107,6 +111,16 @@ class SimpleSymbolicRegression:
         self.min_action_score = min_action_score
         self.max_expression_length = max_expression_length
         self.numerical_clip_threshold = numerical_clip_threshold
+
+        # 多阈值推理配置
+        if action_thresholds is None:
+            # 默认使用单最佳操作模式（向后兼容）
+            self.action_thresholds = []
+            self.use_multi_threshold = False
+        else:
+            # 确保阈值是排序的（从高到低）
+            self.action_thresholds = sorted(action_thresholds, reverse=True)
+            self.use_multi_threshold = True
 
     def generate_action_proposals(self,
                                   current_tokens: List[str],
@@ -364,6 +378,100 @@ class SimpleSymbolicRegression:
 
         return proposals
 
+    def select_actions_by_threshold(self,
+                                     proposals: List[ActionProposal],
+                                     threshold: float) -> List[ActionProposal]:
+        """基于阈值选择操作提案
+
+        Args:
+            proposals: 所有操作提案列表（已按分数降序排序）
+            threshold: 操作采纳阈值（采纳分数>=threshold的所有操作）
+
+        Returns:
+            选中的操作提案列表
+        """
+        # 选择分数大于等于阈值的操作
+        selected = [p for p in proposals if p.score >= threshold]
+
+        # 如果没有操作满足阈值,返回空列表
+        if not selected:
+            return []
+
+        # 记录选择信息
+        if self.logger and self._is_main_process():
+            self.logger.log("THRESHOLD_SELECTION",
+                           f"threshold={threshold:.4f} | "
+                           f"total_proposals={len(proposals)} | "
+                           f"selected={len(selected)} | "
+                           f"score_range=[{proposals[0].score:.4f}, {proposals[-1].score:.4f}]",
+                           "multi_threshold", level=3)
+
+        return selected
+
+    def apply_multiple_actions(self,
+                               current_tokens: List[str],
+                               actions: List[ActionProposal]) -> List[str]:
+        """同时应用多个操作到表达式，智能处理操作间的位置依赖关系
+
+        核心思路：
+        1. 操作按原始位置从前往后应用
+        2. 每次操作后，动态更新后续操作的位置
+        3. 插入操作使后续位置+1，删除操作使后续位置-1
+
+        Args:
+            current_tokens: 当前token列表
+            actions: 要应用的操作列表（应该已经按阈值过滤）
+
+        Returns:
+            应用所有操作后的新token列表
+        """
+        if not actions:
+            return current_tokens.copy()
+
+        if len(actions) == 1:
+            # 单个操作，直接返回
+            return actions[0].new_tokens.copy()
+
+        # 多个操作：需要智能处理位置依赖
+        # 策略：从前往后应用，每次操作后更新后续操作的位置
+
+        # 1. 按位置升序排序（从前往后应用）
+        sorted_actions = sorted(actions, key=lambda a: a.position)
+
+        # 2. 初始化：从当前表达式开始
+        result_tokens = current_tokens.copy()
+
+        # 3. 用于追踪位置偏移量
+        # 偏移量 = 已应用的插入数 - 已应用的删除数
+        position_offset = 0
+
+        # 4. 从前往后应用操作
+        for action in sorted_actions:
+            # 计算应用偏移后的实际位置
+            actual_position = action.position + position_offset
+
+            # 确保位置在有效范围内
+            actual_position = max(0, min(actual_position, len(result_tokens)))
+
+            if action.action_type == 'delete':
+                # 删除操作
+                if 0 <= actual_position < len(result_tokens) and len(result_tokens) > 1:
+                    del result_tokens[actual_position]
+                    position_offset -= 1  # 后续位置前移
+
+            elif action.action_type == 'insert':
+                # 插入操作：在actual_position之前插入
+                if action.token is not None:
+                    result_tokens.insert(actual_position, action.token)
+                    position_offset += 1  # 后续位置后移
+
+            elif action.action_type == 'substitute':
+                # 替换操作：不影响位置偏移
+                if 0 <= actual_position < len(result_tokens) and action.token is not None:
+                    result_tokens[actual_position] = action.token
+
+        return result_tokens
+
     def evaluate_candidate(self,
                           tokens: List[str],
                           x_data: np.ndarray,
@@ -592,6 +700,224 @@ class SimpleSymbolicRegression:
                                "inference", level=1)
 
         return current_candidate
+
+    def multi_threshold_search(self,
+                               initial_tokens: List[str],
+                               initial_condition: torch.Tensor,
+                               initial_residuals: np.ndarray,
+                               x_data: np.ndarray,
+                               y_data: np.ndarray,
+                               x_values: torch.Tensor,
+                               n_steps: int,
+                               valid_variables: Optional[List[str]] = None) -> dict:
+        """执行多阈值推理（为每个阈值维护独立的推理路径）
+
+        对每个阈值维护一个独立的候选路径,在每一步中:
+        1. 生成所有操作提案
+        2. 根据每个阈值选择操作
+        3. 对每个阈值,选中所有满足阈值的操作
+        4. 同时应用所有选中的操作
+
+        Args:
+            initial_tokens: 初始token列表
+            initial_condition: 初始条件嵌入（使用y_target生成，恒定不变）
+            initial_residuals: 初始残差（仅用于日志，不作为条件）
+            x_data: 输入x数据
+            y_data: 目标y数据
+            x_values: 输入x的tensor形式
+            n_steps: 推理步数
+            valid_variables: 有效的变量token列表（如 ['x0', 'x1']），如果为None则从x_data推断
+
+        Returns:
+            字典,键为阈值,值为对应的最终候选
+        """
+        # 如果没有提供有效变量列表，从x_data推断
+        if valid_variables is None:
+            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
+            valid_variables = [f'x{i}' for i in range(input_dim)]
+
+        # 检查是否启用了多阈值模式
+        if not self.use_multi_threshold or not self.action_thresholds:
+            # 如果未启用,回退到单阈值模式
+            if self.logger and self._is_main_process():
+                print(f"\n未启用多阈值模式,回退到单最佳操作模式")
+            single_result = self.greedy_search(
+                initial_tokens=initial_tokens,
+                initial_condition=initial_condition,
+                initial_residuals=initial_residuals,
+                x_data=x_data,
+                y_data=y_data,
+                x_values=x_values,
+                n_steps=n_steps,
+                valid_variables=valid_variables
+            )
+            return {"single_best": single_result}
+
+        # 为每个阈值初始化候选
+        threshold_candidates = {
+            threshold: Candidate(
+                tokens=initial_tokens.copy(),
+                score=0.0,
+                condition=initial_condition,
+                residuals=initial_residuals,
+                history=[]
+            )
+            for threshold in self.action_thresholds
+        }
+
+        # 记录初始信息
+        if self.logger and self._is_main_process():
+            print(f"\n开始多阈值推理 (共{n_steps}步)")
+            print(f"阈值配置: {self.action_thresholds}")
+            print(f"初始表达式: {','.join(initial_tokens)}")
+            self.logger.log("MULTI_THRESHOLD_START",
+                           f"thresholds={self.action_thresholds} | n_steps={n_steps} | "
+                           f"initial_tokens={','.join(initial_tokens)}",
+                           "multi_threshold", level=1)
+
+        # 对每个推理步骤
+        for step in range(n_steps):
+            if self.logger and self._is_main_process():
+                print(f"\n{'='*60}")
+                print(f"步骤 {step + 1}/{n_steps}")
+                print(f"{'='*60}")
+
+            # 为每个阈值生成操作提案并执行
+            for threshold in self.action_thresholds:
+                current_candidate = threshold_candidates[threshold]
+
+                if self.logger and self._is_main_process():
+                    print(f"\n[阈值 {threshold:.4f}]")
+                    print(f"当前表达式: {','.join(current_candidate.tokens)}")
+
+                # 生成操作提案
+                proposals = self.generate_action_proposals(
+                    current_tokens=current_candidate.tokens,
+                    condition=current_candidate.condition,
+                    x_values=x_values,
+                    top_k=None,
+                    valid_variables=valid_variables,
+                    step=step
+                )
+
+                if not proposals:
+                    if self.logger and self._is_main_process():
+                        print(f"  没有找到有效操作,停止此阈值的推理")
+                    continue
+
+                # 基于阈值选择操作
+                selected_actions = self.select_actions_by_threshold(
+                    proposals=proposals,
+                    threshold=threshold
+                )
+
+                if not selected_actions:
+                    if self.logger and self._is_main_process():
+                        print(f"  没有操作满足阈值 {threshold:.4f},停止此阈值的推理")
+                    continue
+
+                # 同时应用所有选中的操作
+                # 使用智能的位置处理逻辑，考虑操作间的依赖关系
+                new_tokens = self.apply_multiple_actions(
+                    current_tokens=current_candidate.tokens,
+                    actions=selected_actions
+                )
+
+                # 构建操作描述
+                action_descs = []
+                for action in selected_actions:
+                    desc = f"{action.action_type}@{action.position}"
+                    if action.token:
+                        desc += f":{action.token}"
+                    desc += f"({action.score:.4f})"
+                    action_descs.append(desc)
+
+                if self.logger and self._is_main_process():
+                    print(f"  同时应用 {len(selected_actions)} 个操作:")
+                    for desc in action_descs:
+                        print(f"    - {desc}")
+                    print(f"  新表达式: {','.join(new_tokens)}")
+
+                # 计算累积分数（所有操作分数之和）
+                total_score = sum(action.score for action in selected_actions)
+                combined_action_desc = f"[{len(selected_actions)} ops] total_score={total_score:.4f}"
+
+                # 更新候选
+                current_candidate.history.append(combined_action_desc)
+                threshold_candidates[threshold] = Candidate(
+                    tokens=new_tokens,
+                    score=current_candidate.score + total_score,
+                    condition=current_candidate.condition,
+                    residuals=current_candidate.residuals,
+                    history=current_candidate.history.copy()
+                )
+
+        # 评估所有阈值的最终结果
+        if self.logger and self._is_main_process():
+            print(f"\n{'='*60}")
+            print(f"多阈值推理完成,评估所有候选表达式")
+            print(f"{'='*60}\n")
+
+        results = {}
+        for threshold, candidate in threshold_candidates.items():
+            # 评估MSE
+            success, expr_mse_score, _ = self.evaluate_candidate(
+                tokens=candidate.tokens,
+                x_data=x_data,
+                y_data=y_data,
+                step=n_steps,
+                candidate_id=f"threshold_{threshold:.4f}"
+            )
+
+            if success:
+                candidate.mse_score = -expr_mse_score  # 转换为正MSE
+                results[threshold] = candidate
+
+                if self.logger and self._is_main_process():
+                    print(f"阈值 {threshold:.4f}:")
+                    print(f"  表达式: {','.join(candidate.tokens)}")
+                    print(f"  MSE: {candidate.mse_score:.6f}")
+                    print(f"  操作数: {len(candidate.history)}")
+                    print()
+            else:
+                if self.logger and self._is_main_process():
+                    print(f"阈值 {threshold:.4f}: 评估失败")
+                    print()
+
+                # 仍然包含在结果中,但MSE为None
+                candidate.mse_score = None
+                results[threshold] = candidate
+
+        # 按MSE排序并输出总结
+        if self.logger and self._is_main_process():
+            print(f"{'='*60}")
+            print(f"多阈值推理结果总结")
+            print(f"{'='*60}\n")
+
+            # 按MSE排序(忽略评估失败的候选)
+            valid_results = [(t, c) for t, c in results.items() if c.mse_score is not None]
+            valid_results.sort(key=lambda x: x[1].mse_score)
+
+            for rank, (threshold, candidate) in enumerate(valid_results, 1):
+                print(f"排名 {rank}: 阈值 {threshold:.4f}")
+                print(f"  表达式: {','.join(candidate.tokens)}")
+                print(f"  MSE: {candidate.mse_score:.6f}")
+                print(f"  操作数: {len(candidate.history)}")
+                print()
+
+            # 记录最佳MSE（如果有有效结果）
+            if valid_results:
+                best_mse_str = f"{valid_results[0][1].mse_score:.6f}"
+            else:
+                best_mse_str = 'N/A'
+
+            self.logger.log("MULTI_THRESHOLD_COMPLETE",
+                           f"thresholds={self.action_thresholds} | "
+                           f"valid_results={len(valid_results)} | "
+                           f"best_mse={best_mse_str}",
+                           "multi_threshold", level=1)
+
+        return results
 
     def _is_main_process(self):
         """检查是否为主进程"""

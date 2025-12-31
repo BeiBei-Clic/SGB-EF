@@ -972,12 +972,27 @@ class EditFlowManager:
         # 构建初始前缀表达式（与训练格式一致）
         # 统一处理：对于n维，需要(n-1)个add + n个变量
         # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
-        # current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
-        # 使用 x0 - x1 作为初始表达式
-        current_tokens = ['x0']
+        current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
 
         # 创建简单推理器
         self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
+
+        # 解析action_thresholds参数
+        action_thresholds = None
+        if hasattr(self.args, 'action_thresholds') and self.args.action_thresholds:
+            try:
+                action_thresholds = [float(x.strip()) for x in self.args.action_thresholds.split(',')]
+                self.logger.log("ACTION_THRESHOLDS_CONFIG",
+                               f"使用多阈值推理模式 | thresholds={action_thresholds}",
+                               "inference", level=1)
+                if self.accelerator.is_local_main_process:
+                    print(f"\n使用多阈值推理模式，阈值: {action_thresholds}")
+            except (ValueError, AttributeError) as e:
+                self.logger.log("ACTION_THRESHOLDS_PARSE_ERROR",
+                               f"无法解析action_thresholds参数: {self.args.action_thresholds} | error={e}",
+                               "inference", level=1)
+                if self.accelerator.is_local_main_process:
+                    print(f"\n⚠️ 警告: 无法解析action_thresholds参数 '{self.args.action_thresholds}'，回退到单最佳操作模式")
 
         simple_searcher = SimpleSymbolicRegression(
             model=model,
@@ -989,33 +1004,72 @@ class EditFlowManager:
             logger=self.logger,
             min_action_score=self.MIN_ACTION_SCORE,
             max_expression_length=self.MAX_EXPRESSION_LENGTH,
-            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
+            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD,
+            action_thresholds=action_thresholds
         )
 
-        # 执行贪婪搜索
+        # 执行推理（单阈值或多阈值模式）
         initial_residuals_np = residuals.cpu().squeeze(0).numpy()
-        best_candidate = simple_searcher.greedy_search(
-            initial_tokens=current_tokens,
-            initial_condition=condition,
-            initial_residuals=initial_residuals_np,
-            x_data=x_data,
-            y_data=y_data,
-            x_values=x_values,
-            n_steps=n_steps
-        )
 
-        # 返回最佳候选的表达式
-        final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
+        # 根据是否启用多阈值模式选择推理方法
+        if simple_searcher.use_multi_threshold:
+            # 多阈值推理模式
+            if self.accelerator.is_local_main_process:
+                print(f"\n执行多阈值推理...")
 
-        if best_candidate and self.accelerator.is_local_main_process:
-            # 记录MSE分数
-            mse_score = best_candidate.mse_score
-            mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
-            self.logger.log("SIMPLE_SEARCH_RESULT",
-                           f"MSE分数: {mse_str} | "
-                           f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
-                           "inference", level=3)
+            results_dict = simple_searcher.multi_threshold_search(
+                initial_tokens=current_tokens,
+                initial_condition=condition,
+                initial_residuals=initial_residuals_np,
+                x_data=x_data,
+                y_data=y_data,
+                x_values=x_values,
+                n_steps=n_steps
+            )
 
-        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
-        return final_expression
+            # 返回所有结果的表达式字典
+            if self.accelerator.is_local_main_process:
+                print(f"\n多阈值推理完成，返回 {len(results_dict)} 个候选结果")
+
+                # 记录所有结果到日志
+                for threshold, candidate in results_dict.items():
+                    expr_str = ','.join(candidate.tokens) if candidate and candidate.tokens else ""
+                    mse_str = f'{candidate.mse_score:.6f}' if candidate.mse_score is not None else 'N/A'
+                    self.logger.log("MULTI_THRESHOLD_RESULT",
+                                   f"threshold={threshold} | expression={expr_str} | MSE={mse_str}",
+                                   "inference", level=1)
+
+            # 返回字典格式的结果：{threshold: expression}
+            return {threshold: ','.join(candidate.tokens) if candidate and candidate.tokens else ""
+                    for threshold, candidate in results_dict.items()}
+
+        else:
+            # 单最佳操作模式（原有逻辑）
+            if self.accelerator.is_local_main_process:
+                print(f"\n执行单最佳操作推理...")
+
+            best_candidate = simple_searcher.greedy_search(
+                initial_tokens=current_tokens,
+                initial_condition=condition,
+                initial_residuals=initial_residuals_np,
+                x_data=x_data,
+                y_data=y_data,
+                x_values=x_values,
+                n_steps=n_steps
+            )
+
+            # 返回最佳候选的表达式
+            final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
+
+            if best_candidate and self.accelerator.is_local_main_process:
+                # 记录MSE分数
+                mse_score = best_candidate.mse_score
+                mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
+                self.logger.log("SIMPLE_SEARCH_RESULT",
+                               f"MSE分数: {mse_str} | "
+                               f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
+                               "inference", level=3)
+
+            self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
+            return final_expression
 

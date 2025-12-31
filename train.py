@@ -75,6 +75,12 @@ def main():
     parser.add_argument("--debug", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否启用调试模式（记录详细的训练日志）")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载进程数（DataLoader的num_workers参数）")
 
+    # 多阈值推理参数（用于推理时）
+    parser.add_argument("--action_thresholds", type=str, default=None,
+                       help="多阈值推理的操作采纳阈值，逗号分隔，例如: '0.1,0.05,0.01'。"
+                            "如果为None，使用单最佳操作模式。"
+                            "例如: '0.1,0.05,0.01' 表示采纳分数>=0.1, >=0.05, >=0.01的所有操作")
+
     # 多时间步采样参数（已弃用 - v2.0架构固定t=0）
     parser.add_argument("--num_timesteps", type=int, default=1, help="每个样本的时间步采样数量（已弃用：新架构固定t=0，无需多时间步）")
 
