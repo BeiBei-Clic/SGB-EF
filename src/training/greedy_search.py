@@ -199,18 +199,18 @@ class SimpleSymbolicRegression:
                     base_length,
                     effective_length,
                     current_tokens[:3],
-                    level=2
+                    level=3
                 )
 
             # 调试：打印top-10插入概率和token
             if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("插入操作详细预测信息（前3个位置）", level=2)
+                self.logger.log_greedy_search_separator("插入操作详细预测信息（前3个位置）", level=3)
                 for i in range(min(3, effective_length)):
                     top10 = torch.topk(insert_probs[0, i], 10)
                     tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
                     probs = top10.values.tolist()
-                    self.logger.log_greedy_search_insert_probs(i, lambda_ins[i], tokens, probs, level=2)
-                self.logger.log_greedy_search_separator(level=2)
+                    self.logger.log_greedy_search_insert_probs(i, lambda_ins[i], tokens, probs, level=3)
+                self.logger.log_greedy_search_separator(level=3)
 
             seq_len = min(effective_length, lambda_ins.shape[0])
 
@@ -276,7 +276,7 @@ class SimpleSymbolicRegression:
 
             # 调试：打印top-10替换概率和token
             if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("替换操作详细预测信息（前3个token位置）", level=2)
+                self.logger.log_greedy_search_separator("替换操作详细预测信息（前3个token位置）", level=3)
                 for idx in range(min(3, len(current_tokens))):
                     pos = idx + 1  # +1因为input_ids[0]是BOS
                     if pos < substitute_probs.shape[1]:
@@ -284,8 +284,8 @@ class SimpleSymbolicRegression:
                         tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
                         probs = top10.values.tolist()
                         current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                        self.logger.log_greedy_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=2)
-                self.logger.log_greedy_search_separator(level=2)
+                        self.logger.log_greedy_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=3)
+                self.logger.log_greedy_search_separator(level=3)
 
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
@@ -317,14 +317,14 @@ class SimpleSymbolicRegression:
 
             # 调试：打印删除速率信息（每次调用都打印）
             if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("删除操作详细预测信息（所有token位置）", level=2)
+                self.logger.log_greedy_search_separator("删除操作详细预测信息（所有token位置）", level=3)
                 for idx in range(len(current_tokens)):
                     pos = idx + 1  # +1因为input_ids[0]是BOS
                     if pos < lambda_del.shape[0]:
                         current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
                         self.logger.log_greedy_search_delete_probs(idx, current_token, lambda_del[pos],
-                                                                lambda_del[pos] > self.min_action_score, level=2)
-                self.logger.log_greedy_search_separator(level=2)
+                                                                lambda_del[pos] > self.min_action_score, level=3)
+                self.logger.log_greedy_search_separator(level=3)
 
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
@@ -468,7 +468,7 @@ class SimpleSymbolicRegression:
             self.logger.log("VALID_VARIABLES",
                            f"贪婪搜索初始化 | input_dim={input_dim if len(x_data.shape) > 1 else 1} | "
                            f"valid_variables={valid_variables}",
-                           "greedy_search", level=1)
+                           "greedy_search", level=3)
             print(f"\n开始贪婪搜索推理 (共{n_steps}步)")
             print(f"初始表达式: {','.join(initial_tokens)}")
 
@@ -496,7 +496,7 @@ class SimpleSymbolicRegression:
                                    f"residuals: mean={residuals.mean():.6f}, std={residuals.std():.6f}, "
                                    f"min={residuals.min():.6f}, max={residuals.max():.6f}, "
                                    f"l2_norm={np.linalg.norm(residuals):.6f}",
-                                   "greedy_search", level=2)
+                                   "greedy_search", level=3)
 
                 # 记录条件嵌入信息
                 if current_candidate.condition is not None:
@@ -510,7 +510,7 @@ class SimpleSymbolicRegression:
                                    f"condition: shape={list(condition.shape)}, "
                                    f"mean={cond_flat.mean():.6f}, std={cond_flat.std():.6f}, "
                                    f"min={cond_flat.min():.6f}, max={cond_flat.max():.6f}",
-                                   "greedy_search", level=2)
+                                   "greedy_search", level=3)
 
             # 为当前候选生成操作提案
             proposals = self.generate_action_proposals(

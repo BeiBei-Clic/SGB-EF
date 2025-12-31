@@ -62,8 +62,8 @@ class EditFlowManager:
         # 保存debug模式标志
         self.debug_mode = args.debug
 
-        # 初始化统一日志管理器
-        self.logger = Logger(self.accelerator, enabled=True)
+        # 初始化统一日志管理器，传入debug_mode参数
+        self.logger = Logger(self.accelerator, enabled=True, debug_mode=self.debug_mode)
 
         # 设备信息
         self.device = self.accelerator.device
@@ -894,7 +894,7 @@ class EditFlowManager:
         # 加载模型
         checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
         if checkpoint_path:
-            self.logger.log("MODEL_LOAD", f"使用检查点: {checkpoint_path}", "inference", level=1)
+            self.logger.log("MODEL_LOAD", f"使用检查点: {checkpoint_path}", "inference", level=3)
         else:
             if self.accelerator.is_local_main_process:
                 print("\n" + "="*60)
@@ -906,7 +906,7 @@ class EditFlowManager:
                 print("1. 先训练模型：python train.py --num_epochs 30")
                 print("2. 或指定已有检查点：python example.py --model_path checkpoints/your_checkpoint")
                 print("="*60 + "\n")
-            self.logger.log("MODEL_LOAD", "⚠️ 未找到检查点，使用随机初始化权重（警告：推理质量会很差）", "inference", level=1)
+            self.logger.log("MODEL_LOAD", "⚠️ 未找到检查点，使用随机初始化权重（警告：推理质量会很差）", "inference", level=3)
 
         model, condition_encoder, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
@@ -977,7 +977,7 @@ class EditFlowManager:
         current_tokens = ['x0']
 
         # 创建简单推理器
-        self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=1)
+        self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
 
         simple_searcher = SimpleSymbolicRegression(
             model=model,
@@ -1014,8 +1014,8 @@ class EditFlowManager:
             self.logger.log("SIMPLE_SEARCH_RESULT",
                            f"MSE分数: {mse_str} | "
                            f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
-                           "inference", level=1)
+                           "inference", level=3)
 
-        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=1)
+        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
         return final_expression
 

@@ -8,15 +8,15 @@ class Logger:
     """统一的日志管理类
 
     支持多种日志场景：
-    - 训练日志 (training.log)
-    - 训练调试日志 (training_debug.log)
-    - 推理日志 (inference.log)
-    - 样本生成日志 (sample_generation.log)
+    - 训练日志 (training.log) - 不受debug控制
+    - 训练调试日志 (training_debug.log) - 受debug控制
+    - 推理日志 (inference.log) - 受debug控制
+    - 样本生成日志 (sample_generation.log) - 不受debug控制
 
     日志级别说明：
-    - level <= 1: 训练主日志
-    - level == 2: 训练调试日志
-    - level >= 3: 推理详细日志
+    - level = 1: 训练主日志（training.log，不受debug控制）
+    - level = 2: 训练调试日志（training_debug.log，受debug控制）
+    - level = 3: 推理详细日志（inference.log，受debug控制）
     """
 
     # 日志文件路径
@@ -29,15 +29,17 @@ class Logger:
     MAX_LOG_LINES = 100000
     _log_line_count = {}
 
-    def __init__(self, accelerator=None, enabled=True):
+    def __init__(self, accelerator=None, enabled=True, debug_mode=False):
         """初始化日志管理器
 
         Args:
             accelerator: Accelerate 对象（可选）
             enabled (bool): 是否启用日志
+            debug_mode (bool): 是否启用调试模式
         """
         self.accelerator = accelerator
         self.enabled = enabled
+        self.debug_mode = debug_mode
         if accelerator:
             self.enabled = enabled and accelerator.is_local_main_process
 
@@ -45,12 +47,7 @@ class Logger:
         os.makedirs("logs", exist_ok=True)
 
     def _write(self, msg, filename):
-        """内部方法：写入日志到文件，支持自动轮转
-
-        Args:
-            msg (str): 日志消息
-            filename (str): 目标文件路径
-        """
+        """内部方法：写入日志到文件，支持自动轮转"""
         if filename not in self._log_line_count:
             self._log_line_count[filename] = sum(1 for _ in open(filename, 'r', errors='ignore')) if os.path.exists(filename) else 0
 
@@ -75,9 +72,15 @@ class Logger:
             step_type (str): 步骤类型/标签
             details (str): 详细信息
             context (str): 上下文
-            level (int): 日志级别 (1=主日志, 2=调试, 3=推理)
+            level (int): 日志级别 (1=训练主日志, 2=训练调试日志, 3=推理日志)
         """
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -88,11 +91,11 @@ class Logger:
             msg += f" | {details}"
 
         # 根据级别选择日志文件
-        if level <= 1:
+        if level == 1:
             self._write(msg, self.TRAIN_LOG)
         elif level == 2:
             self._write(msg, self.TRAIN_DEBUG_LOG)
-        else:
+        elif level == 3:
             self._write(msg, self.INFERENCE_LOG)
 
         # 推理步骤时同时打印到控制台
@@ -100,13 +103,7 @@ class Logger:
             print(details)
 
     def error(self, error_type, error_msg, context=""):
-        """记录错误信息
-
-        Args:
-            error_type (str): 错误类型
-            error_msg (str): 错误消息
-            context (str): 上下文
-        """
+        """记录错误信息"""
         if not self.enabled:
             return
 
@@ -129,29 +126,6 @@ class Logger:
         msg = f"{timestamp} TRAINING START | Model: {getattr(args, 'model_name', 'Unknown')}"
         self._write(msg, self.TRAIN_LOG)
 
-    def training_complete(self, total_epochs, final_loss=None):
-        """记录训练完成"""
-        if not self.enabled:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        msg = f"{timestamp} TRAINING COMPLETE | Total epochs: {total_epochs}"
-        if final_loss is not None:
-            msg += f" | Final loss: {final_loss:.6f}"
-        self._write(msg, self.TRAIN_LOG)
-
-    def model_info(self, model):
-        """记录模型信息"""
-        if not self.enabled:
-            return
-
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        msg = f"{timestamp} MODEL_INFO | Total params: {total_params:,} | Trainable: {trainable_params:,}"
-        self._write(msg, self.TRAIN_LOG)
-
     # ==================== 张量和GPU日志 ====================
 
     def tensor_values(self, tensor_name, tensor, context="", level=2,
@@ -162,12 +136,18 @@ class Logger:
             tensor_name (str): 张量名称
             tensor: 张量对象
             context (str): 上下文
-            level (int): 日志级别
+            level (int): 日志级别 (1=训练主日志, 2=训练调试日志, 3=推理日志)
             max_elements (int): 最大元素数量，超过则采样显示
             sample_first_n (int): 当元素过多时，显示前N个
             sample_last_n (int): 当元素过多时，显示后N个
         """
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -235,102 +215,13 @@ class Logger:
             self._write(msg, self.TRAIN_LOG)
         elif level == 2:
             self._write(msg, self.TRAIN_DEBUG_LOG)
-        else:
+        elif level == 3:
             self._write(msg, self.INFERENCE_LOG)
 
     # ==================== 样本生成日志 ====================
 
-    def sample_step(self, sample_id, step, info=""):
-        """记录样本步骤（跳过常规步骤）
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤描述
-            info: 额外信息
-        """
-        if not self.enabled:
-            return
-
-        # 跳过一些常规步骤，减少日志量
-        if not info and any(step.startswith(s) for s in ["生成数据点", "计算", "处理删减", "生成当前", "生成删减"]):
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        msg = f"{timestamp} [{sample_id}] {step}" + (f" - {info}" if info else "")
-        self._write(msg, self.SAMPLE_LOG)
-
-    def expression_eval(self, sample_id, expr_str, eval_time_ms, success=True, error_msg=""):
-        """记录表达式评估结果
-
-        Args:
-            sample_id: 样本ID
-            expr_str: 表达式字符串
-            eval_time_ms: 评估耗时（毫秒）
-            success: 是否成功
-            error_msg: 错误信息
-        """
-        if not self.enabled:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        status = "OK" if success else f"FAIL: {error_msg}"
-        msg = f"{timestamp} [{sample_id}] EVAL {status} {eval_time_ms:.1f}ms"
-        self._write(msg, self.SAMPLE_LOG)
-
-    def write(self, msg, filename=None):
-        """直接写入日志（用于样本生成等特殊场景）
-
-        Args:
-            msg: 日志消息
-            filename: 目标文件，默认为 SAMPLE_LOG
-        """
-        if filename is None:
-            filename = self.SAMPLE_LOG
-        self._write(msg, filename)
-
-    # ==================== 数据生成相关日志 ====================
-
-    def batch_start(self, batch_idx, total_batches, process_id=""):
-        """记录批次开始
-
-        Args:
-            batch_idx: 批次索引
-            total_batches: 总批次数
-            process_id: 进程标识
-        """
-        if not self.enabled:
-            return
-        prefix = f"[B{batch_idx+1}]" if not process_id else f"[{process_id}]"
-        self.log("BATCH_START", f"批次 {batch_idx+1}/{total_batches}", prefix, level=1)
-
-    def batch_complete(self, batch_idx, sample_count, dimension_count=None):
-        """记录批次完成
-
-        Args:
-            batch_idx: 批次索引
-            sample_count: 样本数量
-            dimension_count: 维度统计字典
-        """
-        if not self.enabled:
-            return
-
-        prefix = f"[B{batch_idx+1}]"
-        msg = f"完成 (生成{sample_count}个样本)"
-        if dimension_count:
-            dim_info = ", ".join([f"{dim}维:{count}" for dim, count in sorted(dimension_count.items())])
-            msg += f" | 维度分布: {dim_info}"
-
-        self.log("BATCH_COMPLETE", msg, prefix, level=1)
-
     def sample_step(self, sample_id, step, details="", info_only=False):
-        """记录样本生成步骤
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤描述
-            details: 详细信息
-            info_only: 是否仅记录重要信息（跳过常规步骤）
-        """
+        """记录样本生成步骤"""
         if not self.enabled:
             return
 
@@ -343,13 +234,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def expression_generate(self, sample_id, expr_str, gen_time_ms):
-        """记录表达式生成
-
-        Args:
-            sample_id: 样本ID
-            expr_str: 表达式字符串
-            gen_time_ms: 生成耗时（毫秒）
-        """
+        """记录表达式生成"""
         if not self.enabled:
             return
 
@@ -358,14 +243,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def expression_validation(self, sample_id, expr_str, expr_len, token_count):
-        """记录表达式验证通过
-
-        Args:
-            sample_id: 样本ID
-            expr_str: 表达式字符串
-            expr_len: 表达式长度
-            token_count: token数量
-        """
+        """记录表达式验证通过"""
         if not self.enabled:
             return
 
@@ -374,13 +252,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def expression_convert(self, sample_id, token_count, convert_time_ms):
-        """记录表达式转换
-
-        Args:
-            sample_id: 样本ID
-            token_count: token数量
-            convert_time_ms: 转换耗时（毫秒）
-        """
+        """记录表达式转换"""
         if not self.enabled:
             return
 
@@ -389,13 +261,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def reduction_sequence(self, sample_id, step_count, time_ms):
-        """记录删减序列生成
-
-        Args:
-            sample_id: 样本ID
-            step_count: 步骤数量
-            time_ms: 耗时（毫秒）
-        """
+        """记录删减序列生成"""
         if not self.enabled:
             return
 
@@ -404,15 +270,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def corrupt_expression(self, sample_id, step, orig_expr, corrupt_expr, time_ms):
-        """记录表达式破坏
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            orig_expr: 原始表达式
-            corrupt_expr: 破坏后表达式
-            time_ms: 耗时（毫秒）
-        """
+        """记录表达式破坏"""
         if not self.enabled:
             return
 
@@ -423,12 +281,7 @@ class Logger:
         self._write(msg2, self.SAMPLE_LOG)
 
     def skip_duplicate(self, sample_id, step):
-        """记录跳过重复表达式
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-        """
+        """记录跳过重复表达式"""
         if not self.enabled:
             return
 
@@ -437,13 +290,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def skip_complex(self, sample_id, step, expr_str):
-        """记录跳过复数表达式
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            expr_str: 表达式字符串
-        """
+        """记录跳过复数表达式"""
         if not self.enabled:
             return
 
@@ -452,15 +299,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def eval_curr_expression(self, sample_id, step, success, time_ms, expr_str=""):
-        """记录当前表达式评估
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            success: 是否成功
-            time_ms: 耗时（毫秒）
-            expr_str: 表达式字符串
-        """
+        """记录当前表达式评估"""
         if not self.enabled:
             return
 
@@ -470,15 +309,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def convert_to_trees(self, sample_id, step, target_tokens, curr_tokens, time_ms):
-        """记录转换为树
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            target_tokens: 目标token数
-            curr_tokens: 当前token数
-            time_ms: 耗时（毫秒）
-        """
+        """记录转换为树"""
         if not self.enabled:
             return
 
@@ -487,15 +318,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def levenshtein_alignment(self, sample_id, step, z0_len, z1_len, time_ms):
-        """记录对齐操作
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            z0_len: z0长度
-            z1_len: z1长度
-            time_ms: 耗时（毫秒）
-        """
+        """记录对齐操作"""
         if not self.enabled:
             return
 
@@ -504,15 +327,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def residuals_before_clip(self, sample_id, step, min_val, max_val, mean_val):
-        """记录裁剪前的residuals统计
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            min_val: 最小值
-            max_val: 最大值
-            mean_val: 平均值
-        """
+        """记录裁剪前的residuals统计"""
         if not self.enabled:
             return
 
@@ -521,15 +336,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def skip_clipped(self, sample_id, step, clip_count, total_count, threshold):
-        """记录跳过裁剪的样本
-
-        Args:
-            sample_id: 样本ID
-            step: 步骤编号
-            clip_count: 裁剪数量
-            total_count: 总数量
-            threshold: 阈值
-        """
+        """记录跳过裁剪的样本"""
         if not self.enabled:
             return
 
@@ -538,11 +345,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def sample_success(self, sample_id):
-        """记录样本生成成功
-
-        Args:
-            sample_id: 样本ID
-        """
+        """记录样本生成成功"""
         if not self.enabled:
             return
 
@@ -551,14 +354,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def sample_error(self, sample_id, error_type, error_msg, duration=None):
-        """记录样本生成错误
-
-        Args:
-            sample_id: 样本ID
-            error_type: 错误类型
-            error_msg: 错误消息
-            duration: 持续时间（秒）
-        """
+        """记录样本生成错误"""
         if not self.enabled:
             return
 
@@ -571,12 +367,7 @@ class Logger:
             self._write(stuck_msg, self.SAMPLE_LOG)
 
     def sample_failed(self, sample_id, reason):
-        """记录样本生成失败
-
-        Args:
-            sample_id: 样本ID
-            reason: 失败原因
-        """
+        """记录样本生成失败"""
         if not self.enabled:
             return
 
@@ -585,12 +376,7 @@ class Logger:
         self._write(msg, self.SAMPLE_LOG)
 
     def sample_timeout(self, sample_id, timeout_seconds):
-        """记录样本生成超时
-
-        Args:
-            sample_id: 样本ID
-            timeout_seconds: 超时时间（秒）
-        """
+        """记录样本生成超时"""
         if not self.enabled:
             return
 
@@ -598,20 +384,27 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] TIMEOUT: Sample generation exceeded {timeout_seconds}s"
         self._write(msg, self.SAMPLE_LOG)
 
+    def expression_eval(self, sample_id, expr_str, eval_time_ms, success=True, error_msg=""):
+        """记录表达式评估结果"""
+        if not self.enabled:
+            return
+
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        status = "OK" if success else f"FAIL: {error_msg}"
+        msg = f"{timestamp} [{sample_id}] EVAL {status} {eval_time_ms:.1f}ms"
+        self._write(msg, self.SAMPLE_LOG)
+
     # ==================== 编辑操作日志 ====================
 
-    def log_u_mask_split(self, tensor_name, u_mask, x_t, vocab_size, context="", level=2):
-        """按语义拆分记录u_mask（INSERT/SUBSTITUTE/DELETE三个独立张量），按位置分行输出
-
-        Args:
-            tensor_name (str): 张量名称
-            u_mask: [batch, x_seq_len, 2*vocab_size+1] 的编辑操作掩码
-            x_t: [batch, x_seq_len] 的当前序列token IDs
-            vocab_size: 词汇表大小
-            context: 上下文标识
-            level: 日志级别
-        """
+    def log_u_mask_split(self, tensor_name, u_mask, x_t, vocab_size, context="", level=3):
+        """按语义拆分记录u_mask（INSERT/SUBSTITUTE/DELETE三个独立张量），按位置分行输出"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -650,21 +443,18 @@ class Logger:
                 self._write(msg, self.TRAIN_LOG)
             elif level == 2:
                 self._write(msg, self.TRAIN_DEBUG_LOG)
-            else:
+            elif level == 3:
                 self._write(msg, self.INFERENCE_LOG)
 
-    def log_u_mask_detailed(self, tensor_name, u_mask, x_t, vocab_size, context="", level=2):
-        """详细记录u_mask标签的完整结构（按位置和操作类型分解）
-
-        Args:
-            tensor_name (str): 张量名称
-            u_mask: [batch, x_seq_len, 2*vocab_size+1] 的编辑操作掩码
-            x_t: [batch, x_seq_len] 的当前序列token IDs
-            vocab_size: 词汇表大小
-            context: 上下文标识
-            level: 日志级别
-        """
+    def log_u_mask_detailed(self, tensor_name, u_mask, x_t, vocab_size, context="", level=3):
+        """详细记录u_mask标签的完整结构（按位置和操作类型分解）"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -712,22 +502,19 @@ class Logger:
             self._write(msg, self.TRAIN_LOG)
         elif level == 2:
             self._write(msg, self.TRAIN_DEBUG_LOG)
-        else:
+        elif level == 3:
             self._write(msg, self.INFERENCE_LOG)
 
     def log_edit_operations(self, u_mask_sample, x_t_sample, vocab_size,
-                           context="", level=2, max_ops=20):
-        """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）
-
-        Args:
-            u_mask_sample: [x_seq_len, 2*vocab_size+1] 的one-hot掩码
-            x_t_sample: [x_seq_len] 的当前序列token IDs
-            vocab_size: 词汇表大小
-            context: 上下文标识
-            level: 日志级别
-            max_ops: 最多显示的操作数量
-        """
+                           context="", level=3, max_ops=20):
+        """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         ops = []
@@ -778,14 +565,15 @@ class Logger:
 
     # ==================== 束搜索推理日志 ====================
 
-    def log_greedy_search_separator(self, title="", level=2):
-        """记录分隔线
-
-        Args:
-            title: 标题
-            level: 日志级别
-        """
+    def log_greedy_search_separator(self, title="", level=3):
+        """记录分隔线"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         separator = "=" * 80
@@ -798,17 +586,15 @@ class Logger:
             self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
 
     def log_greedy_search_sequence_format(self, input_ids_head, base_length,
-                                         effective_length, current_tokens_head, level=2):
-        """记录推理序列格式信息
-
-        Args:
-            input_ids_head: input_ids的前几个token
-            base_length: 基础序列长度
-            effective_length: 有效序列长度
-            current_tokens_head: current_tokens的前几个token
-            level: 日志级别
-        """
+                                         effective_length, current_tokens_head, level=3):
+        """记录推理序列格式信息"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         self.log("SEQUENCE_FORMAT",
@@ -817,17 +603,15 @@ class Logger:
                 f"current_tokens={current_tokens_head}",
                 "simple_search", level=level)
 
-    def log_greedy_search_insert_probs(self, position, lambda_rate, tokens, probs, level=2):
-        """记录插入操作的预测概率
-
-        Args:
-            position: 位置索引
-            lambda_rate: 插入速率
-            tokens: token列表
-            probs: 概率列表
-            level: 日志级别
-        """
+    def log_greedy_search_insert_probs(self, position, lambda_rate, tokens, probs, level=3):
+        """记录插入操作的预测概率"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         tokens_str = str(tokens)
@@ -836,18 +620,15 @@ class Logger:
                 f"位置{position}: lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
                 "greedy_search", level=level)
 
-    def log_greedy_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=2):
-        """记录替换操作的预测概率
-
-        Args:
-            position: 位置索引
-            current_token: 当前token
-            lambda_rate: 替换速率
-            tokens: token列表
-            probs: 概率列表
-            level: 日志级别
-        """
+    def log_greedy_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=3):
+        """记录替换操作的预测概率"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         tokens_str = str(tokens)
@@ -856,87 +637,25 @@ class Logger:
                 f"位置{position}(当前={current_token}): lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
                 "greedy_search", level=level)
 
-    def log_greedy_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=2):
-        """记录删除操作的预测概率
-
-        Args:
-            position: 位置索引
-            current_token: 当前token
-            lambda_rate: 删除速率
-            above_threshold: 是否超过阈值
-            level: 日志级别
-        """
+    def log_greedy_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=3):
+        """记录删除操作的预测概率"""
         if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
             return
 
         self.log("DELETE_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda_del={lambda_rate:.4f} | above_threshold={above_threshold}",
                 "greedy_search", level=level)
 
-    def log_greedy_search_token_type_stats(self, token_categories, level=2):
-        """记录词汇类型的预测统计
-
-        Args:
-            token_categories: 字典，键为类型名，值为[(token, prob), ...]列表
-            level: 日志级别
-        """
-        if not self.enabled:
-            return
-
-        for category_name, token_probs in token_categories.items():
-            if token_probs:
-                # 只显示前5个
-                top_tokens = [(t, f"{p:.6f}") for t, p in token_probs[:5]]
-                self.log("TOKEN_TYPE_STATS", f"{category_name}: {top_tokens}", "greedy_search", level=level)
-
-
-    # ==================== 推理详细日志 ====================
-
-    def log_inference_step(self, step, total_steps, current_tokens, t,
-                          residuals=None, condition=None,
-                          model_pred_time=None, total_time=None,
-                          context="greedy_search"):
-        """记录推理步骤的综合信息
-
-        Args:
-            step: 当前步骤
-            total_steps: 总步骤数
-            current_tokens: 当前token列表
-            t: 时间步
-            residuals: 残差数组（可选）
-            condition: 条件嵌入（可选）
-            model_pred_time: 模型预测时间（毫秒）
-            total_time: 总时间（毫秒）
-            context: 上下文标识
-        """
-        if not self.enabled:
-            return
-
-        expr_str = ','.join(current_tokens) if current_tokens else '<blank>'
-        expr_short = expr_str if len(expr_str) <= 30 else expr_str[:30] + '...'
-
-        timing_info = ""
-        if model_pred_time is not None:
-            timing_info += f" model_time={model_pred_time:.1f}ms"
-        if total_time is not None:
-            timing_info += f" total_time={total_time:.1f}ms"
-
-        self.log("INFERENCE_STEP",
-                f"step={step}/{total_steps} | t={t:.4f} | "
-                f"expr='{expr_short}' | "
-                f"len={len(current_tokens)}{timing_info}",
-                context, level=2)
+    # ==================== 崩溃日志 ====================
 
     def log_crash(self, step_name, batch_idx, dimension, error, extra_info=None):
-        """记录训练崩溃信息到专门的crash日志文件
-
-        Args:
-            step_name (str): 崩溃发生的步骤名称（如 "BACKWARD", "OPTIMIZER_STEP"）
-            batch_idx (int): 崩溃时的批次索引
-            dimension (str): 崩溃时的维度
-            error (Exception): 捕获的异常对象
-            extra_info (str): 额外的诊断信息（可选）
-        """
+        """记录训练崩溃信息到专门的crash日志文件"""
         import traceback
         import sys
 

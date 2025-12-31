@@ -72,14 +72,6 @@ def reorganize_data_by_used_variables(expression_str, x_data, y_data):
 
 
 def main():
-    # 创建 Logger 实例
-    logger = Logger(enabled=True)
-
-    print("=== 符号回归实例 ===")
-
-    # 记录开始日志
-    logger.log("INFERENCE_START", "开始符号回归实例", "example")
-
     # 设置参数
     args = type('Args', (), {
         'seed': 42,
@@ -125,11 +117,19 @@ def main():
         'condition_input_normalization': False,  # 是否对输入进行归一化
     })()
 
+    # 创建 Logger 实例，传入debug_mode参数
+    logger = Logger(enabled=True, debug_mode=args.debug)
+
+    print("=== 符号回归实例 ===")
+
+    # 记录开始日志（使用level=3表示推理日志，受debug控制）
+    logger.log("INFERENCE_START", "开始符号回归实例", "example", level=3)
+
     manager = EditFlowManager(args)
 
     # 生成测试数据 - 使用 x1*x2 作为目标表达式
     print("生成测试数据...")
-    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: x1*x2)", "example")
+    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: x1*x2)", "example", level=3)
 
     # 直接构造 x1*x2 的数据
     np.random.seed(42)
@@ -143,7 +143,7 @@ def main():
     # 目标表达式字符串
     target_expr = "x1*x2"
 
-    logger.log("DATA_INFO", f"目标表达式: {target_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example")
+    logger.log("DATA_INFO", f"目标表达式: {target_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example", level=3)
 
     print(f"\n数据信息:")
     print(f"目标表达式: {target_expr}")
@@ -164,14 +164,14 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_10"
+    model_path = "checkpoints/checkpoint_epoch_5"
 
     # 执行符号回归（使用重新组织后的数据）
     # 使用简单推理（贪婪搜索）+ 北极星模式（目标值作为恒定条件）
     logger.log("INFERENCE_START",
                f"开始符号回归推理 | 模型路径: {model_path} | 推理步数: {20} | "
                f"方法: 贪婪搜索 | 架构: 迭代优化（北极星模式）",
-               "example")
+               "example", level=3)
 
     # 检查是否有训练好的检查点
     import os
@@ -188,7 +188,7 @@ def main():
             n_steps=20      # 推理步数
         )
 
-    logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example")
+    logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression}", "example", level=3)
     print(f"\n{'='*60}")
     print(f"最终结果对比 (架构v2.0 - 迭代优化模式)")
     print(f"{'='*60}")

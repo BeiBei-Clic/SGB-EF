@@ -74,16 +74,6 @@ def generate_single_sample(
     """
     sample_start_time = time.time()
 
-    # 记录函数入口和参数
-    import inspect
-    _sample_logger.log("FUNC_ENTRY", f"generate_single_sample 被调用", f"sample_id={sample_id}", level=1)
-    _sample_logger.log("FUNC_PARAMS",
-                      f"max_dim={max_dim}, n_points={n_points}, max_depth={max_depth}, max_expr_length={max_expr_length}",
-                      f"batch_idx={batch_idx}, current_batch_size={current_batch_size}, current_sample_count={current_sample_count}",
-                      level=1)
-    _sample_logger.log("FUNC_PARAM_COUNT", f"接收到的参数数量: {len(inspect.signature(generate_single_sample).parameters)}", level=1)
-    _sample_logger.log("FUNC_LOCALS", f"局部变量:", f"{locals()}", level=1)
-
     try:
         # 随机选择维度
         dim = random.randint(1, max_dim)
