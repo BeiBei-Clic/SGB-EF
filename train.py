@@ -62,7 +62,7 @@ def main():
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
+    parser.add_argument("--learning_rate", type=float, default=3e-3, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--condition_num_layers", type=int, default=3, help="SetTransformer层数")
     parser.add_argument("--condition_num_seeds", type=int, default=32, help="SetTransformer种子数（输出序列长度，特征向量数量）")
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度（已弃用：现在输出序列而非单个向量）")
-    parser.add_argument("--condition_input_normalization", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否对输入进行标准化")
+    parser.add_argument("--condition_input_normalization", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否对输入进行标准化")
 
     # 保持向后兼容性，但现在不再使用的参数
     parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")

@@ -419,6 +419,9 @@ class Logger:
 
             # 对每个位置分别输出
             for pos in range(x_seq_len):
+                # 边界检查：确保pos在x_t的范围内
+                if pos >= x_t.shape[1]:
+                    break
                 if x_t[batch_idx, pos].item() == 0:  # pad token
                     break
 

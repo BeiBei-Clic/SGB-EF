@@ -39,7 +39,7 @@ class EditFlowManager:
     """
 
     # 类常量：训练和推理配置参数
-    GRADIENT_CLIP_NORM = 5.0  # 提高到5.0以适应6750万参数的大模型
+    GRADIENT_CLIP_NORM = 10.0  # 提高到10.0，避免过度裁剪
     NUMERICAL_CLIP_THRESHOLD = 1e6
     MAX_EXPRESSION_LENGTH = 50
     MIN_ACTION_SCORE = 0.01  # 最小操作分数阈值
@@ -134,7 +134,8 @@ class EditFlowManager:
 
         # 4. 使用 Hugging Face datasets 加载数据
         # 设置stream参数：默认使用流式加载以节省内存
-        use_stream = getattr(self.args, 'dataset_stream', True)
+        # 🔧 临时修复：强制禁用stream模式以测试数据迭代器问题
+        use_stream = False  # getattr(self.args, 'dataset_stream', True)
         num_proc = getattr(self.args, 'dataset_num_proc', None)
 
         if self.accelerator.is_local_main_process:
@@ -336,7 +337,16 @@ class EditFlowManager:
             list(model.parameters()) + list(condition_encoder.parameters()),
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay,
-            eps=1e-8  # 增加数值稳定性
+            eps=1e-8,  # 增加数值稳定性
+            betas=(0.9, 0.999)  # 使用默认的beta值
+        )
+
+        # 添加学习率调度器（余弦退火）
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=self.args.num_epochs,
+            eta_min=1e-6  # 最小学习率
         )
 
         # 如果提供了检查点路径，加载预训练模型
@@ -363,7 +373,10 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"✓ LLaMA EditFlow模型参数数量: {total_params:,}")
 
-        return model, condition_encoder, criterion, optimizer, tokenizer
+        # 保存tokenizer引用供后续使用
+        self.tokenizer = tokenizer
+
+        return model, condition_encoder, criterion, optimizer, scheduler, tokenizer
 
   
     def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info=None):
@@ -373,8 +386,8 @@ class EditFlowManager:
         """
         batch_size = z0_token_ids.size(0)
 
-        # 获取 vocab_size（从tokenizer获取，避免访问被DDP包装的model属性）
-        vocab_size = dataset.tokenizer.vocab_size
+        # 获取 vocab_size（使用self.tokenizer，避免Subset对象没有tokenizer属性的问题）
+        vocab_size = self.tokenizer.vocab_size
 
         # 迭代优化模式：使用z0作为当前状态的输入（z0 -> z1的编辑操作）
         batch_size, seq_len = z0_token_ids.shape
@@ -404,7 +417,7 @@ class EditFlowManager:
         # 迭代优化模式：直接使用z0作为当前状态，不再进行时间插值
         # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z0_token_ids, dataset.tokenizer
+            z0_token_ids, self.tokenizer
         )
 
         # 记录x_t的完整值（仅在debug模式下记录）
@@ -442,35 +455,35 @@ class EditFlowManager:
             self.logger.tensor_values(f"pred_rates_batch{batch_idx}", pred_rates[sample_idx],
                                      context=context, level=2, max_elements=100)
 
-            # 记录第一个样本的insert_probs和substitute_probs完整值
-            self.logger.tensor_values(f"insert_probs_batch{batch_idx}", output['insert_probs'][sample_idx],
+            # 记录第一个样本的insert_logits和substitute_logits完整值
+            self.logger.tensor_values(f"insert_logits_batch{batch_idx}", output['insert_logits'][sample_idx],
                                      context=context, level=2, max_elements=100)
-            self.logger.tensor_values(f"substitute_probs_batch{batch_idx}", output['substitute_probs'][sample_idx],
+            self.logger.tensor_values(f"substitute_logits_batch{batch_idx}", output['substitute_logits'][sample_idx],
                                      context=context, level=2, max_elements=100)
 
         return {
             'pred_rates': pred_rates,
-            'pred_ins_probs': output['insert_probs'],
-            'pred_sub_probs': output['substitute_probs'],
+            'pred_ins_logits': output['insert_logits'],  # 返回logits而不是概率
+            'pred_sub_logits': output['substitute_logits'],  # 返回logits而不是概率
             'x_t': x_t,
-            'z0': z0_token_ids,  # 当前状态（起点），用于损失计算
-            'z1_token_ids': z1_token_ids,  # 目标状态（终点）
+            'z0': z0_token_ids,
+            'z1_token_ids': z1_token_ids,
             'z_gap_mask': z_gap_mask,
             'z_pad_mask': z_pad_mask,
+            'attention_mask': attention_mask,  # 返回attention_mask用于屏蔽无效位置
             'vocab_size': vocab_size,
         }
 
     def compute_loss(self, forward_results, criterion, dataset, debug_info=None):
         pred_rates = forward_results['pred_rates']
-        pred_ins_probs = forward_results['pred_ins_probs']
-        pred_sub_probs = forward_results['pred_sub_probs']
         x_t = forward_results['x_t']
         z0 = forward_results['z0']  # 当前状态（起点）
         z1_token_ids = forward_results['z1_token_ids']  # 目标状态（终点）
         z_gap_mask = forward_results['z_gap_mask']
         z_pad_mask = forward_results['z_pad_mask']
         effective_vocab_size = forward_results['vocab_size']
-        gap_token = dataset.tokenizer.convert_tokens_to_ids('<gap>')
+        gap_token = self.tokenizer.convert_tokens_to_ids('<gap>')
+        attention_mask = forward_results.get('attention_mask', None)  # 获取attention_mask
 
         # 获取时间步采样数量
         num_timesteps = self.args.num_timesteps
@@ -478,15 +491,28 @@ class EditFlowManager:
         # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
         # 因此索引 0=插入, 1=删除, 2=替换
         lambda_ins = pred_rates[:, :, 0:1]  # 插入速率
-        lambda_del = pred_rates[:, :, 1:2]  # 删除速率（修复：原来是 lambda_sub）
-        lambda_sub = pred_rates[:, :, 2:3]  # 替换速率（修复：原来是 lambda_del）
+        lambda_del = pred_rates[:, :, 1:2]  # 删除速率
+        lambda_sub = pred_rates[:, :, 2:3]  # 替换速率
 
-        ins_probs = lambda_ins * pred_ins_probs
-        sub_probs = lambda_sub * pred_sub_probs
+        # 关键修复：直接使用logits而不是概率
+        # 将速率作为log空间加到logits上，然后做log_softmax
+        ins_logits = forward_results['pred_ins_logits'] + torch.log(lambda_ins.clamp(min=1e-8))
+        sub_logits = forward_results['pred_sub_logits'] + torch.log(lambda_sub.clamp(min=1e-8))
+        del_logits = torch.log(lambda_del.clamp(min=1e-8))
 
-        # u_cat_x 是 X 空间（原始序列空间）的预测速率
+        # 🔧 关键修复：将attention_mask=0的位置的logits设为一个非常大的负数
+        # 这样log_softmax后这些位置的概率接近0，不影响梯度
+        LARGE_NEG = -1e9  # 足够大的负数，exp后接近0
+        if attention_mask is not None:
+            attention_mask_full = attention_mask.unsqueeze(-1)  # [batch, x_seq_len, 1]
+            mask_large_neg = (1.0 - attention_mask_full) * LARGE_NEG
+            ins_logits = ins_logits + mask_large_neg.expand(-1, -1, ins_logits.shape[-1])
+            sub_logits = sub_logits + mask_large_neg.expand(-1, -1, sub_logits.shape[-1])
+            del_logits = del_logits + mask_large_neg
+
+        # u_cat_x 现在是logits而不是概率
         # 形状: [batch, x_seq_len, 2*vocab_size+1]
-        u_cat_x = torch.cat([ins_probs, sub_probs, lambda_del], dim=-1)
+        u_cat_x = torch.cat([ins_logits, sub_logits, del_logits], dim=-1)
 
         # u_z 是 Z 空间（扩展空间，含gap重复）的预测速率
         # 形状: [batch, z_seq_len, 2*vocab_size+1]
@@ -495,7 +521,7 @@ class EditFlowManager:
         # 生成编辑操作掩码：使用双索引追踪逻辑
         # 在Z空间（z0）遍历，映射到X空间（x_t）的编辑操作
         # u_mask在X空间生成: [batch, x_seq_len, 2*vocab_size+1]
-        u_mask_x = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer, x_t)
+        u_mask_x = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, self.tokenizer, x_t)
 
         # ⚠️ 关键修复：将u_mask扩展到Z空间以匹配log_u_z的维度
         # 使用fill_gap_tokens_with_repeats将X空间的mask扩展到Z空间
@@ -522,12 +548,6 @@ class EditFlowManager:
                                      context=context, level=2, max_elements=50)
             self.logger.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx],
                                      context=context, level=2, max_elements=50)
-
-            # 记录计算后的概率（模型预测）
-            self.logger.tensor_values(f"pred_ins_probs_batch{batch_idx}", ins_probs[sample_idx],
-                                     context=context, level=2, max_elements=100)
-            self.logger.tensor_values(f"pred_sub_probs_batch{batch_idx}", sub_probs[sample_idx],
-                                     context=context, level=2, max_elements=100)
 
             # 记录标准答案：u_mask（真实编辑操作标签，one-hot编码）
             # 使用专门的日志方法按语义拆分记录
@@ -680,87 +700,25 @@ class EditFlowManager:
                 # 不再需要判断是否是最后一步，因为 accumulate 会自动处理
                 all_params = list(model.parameters()) + list(condition_encoder.parameters())
 
-                # 使用Accelerate的梯度裁剪（会自动处理混合精度）
-                # ⚠️ 关键修复：只在梯度完全同步时才执行裁剪和优化器更新
-                # 这确保在梯度累积期间不会在未同步的梯度上进行操作
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("SYNC_GRADIENTS_CHECK",
-                                    f"检查是否需要同步梯度 | sync_gradients={self.accelerator.sync_gradients} | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
+                # 🔧 修复：遵循 Accelerate 官方文档，在 accumulate 内无条件调用 optimizer
+                # 参考: https://huggingface.co/docs/accelerate/usage_guides/gradient_accumulation
+                # Accelerate 会自动在正确的时机（基于 gradient_accumulation_steps）执行更新
+                # 我们不需要手动检查 sync_gradients
 
-                if self.accelerator.sync_gradients:
-                    sync_start = time.time()
-                    if self.accelerator.is_local_main_process and self.debug_mode:
-                        self.logger.log("SYNC_GRADIENTS_START", f"开始梯度同步和裁剪 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
+                # 应用梯度裁剪（防止梯度爆炸和消失）
+                # ⚠️ 关键修复：在optimizer.step()之前裁剪梯度
+                self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
 
-                    # ⚠️ 移除梯度NaN/Inf检查以避免分布式同步问题
-                    # 原因：这个检查在分布式训练中会导致进程不同步和死锁
-                    # 解决方案：完全移除此检查（训练过程中不需要）
+                # 计算梯度范数（用于监控，不影响训练）
+                grad_norm = 0.0
+                for param in all_params:
+                    if param.grad is not None:
+                        grad_norm += float(param.grad.data.norm().item() ** 2)
+                grad_norm = float(grad_norm ** 0.5)
 
-                    # ⚠️ 临时禁用梯度裁剪以绕过 Accelerate 的分布式同步卡死问题
-                    # 原因：accelerator.clip_grad_norm_() 在某些情况下会卡在分布式同步
-                    # 解决方案：手动计算梯度范数，不进行裁剪
-                    try:
-                        clip_start = time.time()
-
-                        # 手动计算梯度范数（不裁剪）
-                        grad_norm = 0.0
-                        for param in all_params:
-                            if param.grad is not None:
-                                grad_norm += float(param.grad.data.norm().item() ** 2)
-                        grad_norm = float(grad_norm ** 0.5)
-
-                        clip_duration = time.time() - clip_start
-                        sync_time = time.time() - sync_start
-
-                        if self.accelerator.is_local_main_process and self.debug_mode:
-                            self.logger.log("SYNC_GRADIENTS_SUCCESS",
-                                            f"梯度裁剪已禁用 | grad_norm={grad_norm:.4f} | 计算耗时={clip_duration:.3f}s | 总耗时={sync_time:.3f}s | ⚠️ 警告：梯度未裁剪",
-                                            f"维度{dimension}_batch{batch_idx}", level=2)
-                    except Exception as e:
-                        if self.accelerator.is_local_main_process:
-                            self.logger.error("GRAD_NORM_COMPUTE_ERROR",
-                                            f"梯度范数计算失败: {type(e).__name__}: {str(e)}",
-                                            f"维度{dimension}_batch{batch_idx}")
-                        grad_norm = 0.0
-
-
-                    # ✅ 只在梯度同步时更新参数
-                    if self.accelerator.is_local_main_process and self.debug_mode:
-                        self.logger.log("OPTIMIZER_STEP_START", f"准备执行优化器更新 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
-
-                    optimizer_step_start = time.time()
-                    try:
-                        optimizer.step()
-                        optimizer_step_time = time.time() - optimizer_step_start
-                        if self.accelerator.is_local_main_process and self.debug_mode:
-                            self.logger.log("OPTIMIZER_STEP_SUCCESS", f"优化器更新成功 | 耗时={optimizer_step_time:.3f}s",
-                                            f"维度{dimension}_batch{batch_idx}", level=2)
-                    except Exception as e:
-                        # 记录优化器步骤崩溃信息
-                        self.logger.log_crash(
-                            step_name="OPTIMIZER_STEP",
-                            batch_idx=batch_idx,
-                            dimension=dimension,
-                            error=e,
-                            extra_info=f"grad_norm={grad_norm:.4f}"
-                        )
-                        raise  # 重新抛出异常以终止训练
-
-                    zero_grad_start = time.time()
-                    optimizer.zero_grad()
-                    zero_grad_time = time.time() - zero_grad_start
-                    if self.accelerator.is_local_main_process and self.debug_mode:
-                        self.logger.log("ZERO_GRAD", f"梯度清零完成 | 耗时={zero_grad_time:.3f}s",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
-                else:
-                    # 梯度累积期间：不执行优化器更新，保持 grad_norm 为 0
-                    grad_norm = 0.0
-                    if self.accelerator.is_local_main_process and self.debug_mode:
-                        self.logger.log("GRADIENT_ACCUMULATION", f"梯度累积中，跳过优化器更新 | timestamp={time.time():.2f}",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
+                # 无条件执行优化器更新（Accumulate 会自动处理）
+                optimizer.step()
+                optimizer.zero_grad()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -897,7 +855,7 @@ class EditFlowManager:
             print(f"使用设备: {self.device}")
             print(f"{'找到检查点' if checkpoint_path else '未找到检查点，将从基础模型开始训练'}: {checkpoint_path or ''}")
 
-        model, condition_encoder, criterion, optimizer, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+        model, condition_encoder, criterion, optimizer, scheduler, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 注意这里接收返回值的变化
         train_dataloader, train_dataset, test_dataloader, test_dataset = self.prepare_data(tokenizer)
@@ -921,9 +879,14 @@ class EditFlowManager:
             )
 
             if self.accelerator.is_local_main_process:
-                print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}")
+                # 获取当前学习率
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}, 学习率: {current_lr:.2e}")
                 # 记录训练成果到 training.log
-                self.logger.log("EPOCH_COMPLETE", f"Epoch {epoch+1}/{self.args.num_epochs} | train_loss={avg_loss:.4f} | batches={num_batches}", level=1)
+                self.logger.log("EPOCH_COMPLETE", f"Epoch {epoch+1}/{self.args.num_epochs} | train_loss={avg_loss:.4f} | lr={current_lr:.2e} | batches={num_batches}", level=1)
+
+            # 更新学习率
+            scheduler.step()
 
             # 修改 evaluate 调用，传入单个 dataloader
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:

@@ -99,6 +99,7 @@ class ContinuousFlowLoss:
 
         Returns:
             u_mask: 编辑操作掩码 [batch, x_seq_len, 2*vocab_size+1]
+                    使用one-hot编码：u_mask[b, pos, op_id] = 1 表示在位置pos执行操作op_id
                     每个位置对应：[vocab_size个插入操作, vocab_size个替换操作, 1个删除操作]
         """
         batch_size, z_seq_len = z_t.shape
@@ -108,8 +109,8 @@ class ContinuousFlowLoss:
         pad_token = tokenizer.convert_tokens_to_ids('<pad>')
 
         # 初始化输出掩码（在X空间）
-        # ⚠️ 关键修复：使用整数类型而非布尔值，以支持重复操作
-        # 例如：在同一个位置插入2个sin，u_mask[b, pos, sin_token_id] = 2
+        # ✅ 使用one-hot编码：u_mask[b, pos, op_id] = 1 表示在位置pos执行操作op_id
+        # 即使需要多次插入同一token，也只标记一次（因为这是操作类型，不是数量）
         u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.int, device=z_t.device)
 
         # 对每个样本进行双索引遍历（论文Fig. 13的核心逻辑）
@@ -151,13 +152,13 @@ class ContinuousFlowLoss:
                     # z_t[i]是gap，z_1[i]是有效token
                     # 意味着需要在gap位置插入token_1
                     #
-                    # ⚠️ 关键修复：处理序列开头的gap + 支持重复插入
-                    # 使用 += 而非 = 来支持在同一个位置多次插入相同token
-                    # 例如：[<gap>, <gap>, constant] -> [sin, sin, constant]
-                    #      应该在constant位置标记: u_mask[b, pos, sin_token_id] = 2
+                    # ✅ 修复：使用one-hot编码而非累加计数
+                    # 即使需要多次插入相同token，也只标记一次
+                    # 因为模型只需要知道"在这个位置执行插入sin操作"
+                    # 而不是"插入2次sin"（后者是编辑操作的定义，不是损失的一部分）
                     insert_pos = max(x_t_index, first_valid_index)
                     if insert_pos >= 0 and insert_pos < x_seq_len:
-                        u_mask[b, insert_pos, token_1] += 1  # 累加计数（支持重复）
+                        u_mask[b, insert_pos, token_1] = 1  # one-hot编码（只标记操作类型）
 
                 elif token_t != gap_token and token_1 == gap_token:
                     # 删除操作：
@@ -165,7 +166,7 @@ class ContinuousFlowLoss:
                     # 意味着需要删除当前token
                     # 删除操作直接标记在x_t_index位置（当前token的位置）
                     if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, -1] += 1  # 累加计数（通常为1）
+                        u_mask[b, x_t_index, -1] = 1  # one-hot编码
 
                 elif token_t != gap_token and token_1 != gap_token and token_t != token_1:
                     # 替换操作：
@@ -173,7 +174,7 @@ class ContinuousFlowLoss:
                     # 意味着需要将token_t替换为token_1
                     # 替换操作标记在x_t_index位置（偏移vocab_size以区分插入和替换）
                     if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, token_1 + vocab_size] += 1  # 累加计数（通常为1）
+                        u_mask[b, x_t_index, token_1 + vocab_size] = 1  # one-hot编码
 
         return u_mask
 
@@ -227,18 +228,16 @@ class ContinuousFlowLoss:
                         f"Z空间NaN={nan_count_z}, Inf={inf_count_z}, 分布式检测={has_nan_or_inf}",
                         "compute_loss", level=1)
 
-        # 关键修复：u_total 在 X 空间计算（原始序列空间，无gap重复）
-        # u_cat_x 形状: [batch, x_seq_len, 2*vocab_size+1]
-        # 这确保了每个位置的速率只被计算一次，不会因gap重复而被重复计数
-        u_total = u_cat_x.sum(dim=(1, 2))
+        # 关键修复：u_total 需要在概率空间计算
+        # 从logits转换为概率
+        u_cat_x_probs = torch.exp(u_cat_x.clamp(max=10))  # 防止溢出
+        u_total = u_cat_x_probs.sum(dim=(1, 2))
 
         # 归一化 u_z 使其成为有效的概率分布
+        # u_z 现在是logits（从u_cat_x扩展而来）
         # u_z 形状: [batch, z_seq_len, 2*vocab_size+1]
-        # 使用 logsumexp 技巧提高数值稳定性
-        u_z_max_for_softmax = u_z.max(dim=-1, keepdim=True)[0]  # [batch, z_seq_len, 1]
-        u_z_stable = u_z - u_z_max_for_softmax  # 减去最大值防止溢出
-        u_z_sum_stable = torch.exp(u_z_stable).sum(dim=-1, keepdim=True) + 1e-8
-        log_u_z = u_z_stable - torch.log(u_z_sum_stable)  # log_softmax
+        # 使用 log_softmax（因为u_cat_x已经是logits了）
+        log_u_z = torch.log_softmax(u_z, dim=-1)
 
         # 统计信息：log_u_z（应该在负无穷到0之间）
         log_u_z_min = float(log_u_z.min().item())
@@ -256,7 +255,13 @@ class ContinuousFlowLoss:
         # u_mask 标记了正确的操作位置（one-hot编码）
         # 只在 u_mask=True 的位置累加（其他位置不影响损失）
         masked_log_u_z = log_u_z * u_mask.float()
-        cross_entropy = masked_log_u_z.sum(dim=(1, 2))
+
+        # 🔧 修复：计算每个样本的有效操作数量（用于归一化）
+        # 这确保不同长度的序列对损失的贡献是公平的
+        valid_ops_per_sample = u_mask.sum(dim=(1, 2)).clamp(min=1)  # 至少为1避免除0
+
+        # 计算每个样本的平均负对数似然（对序列长度归一化）
+        cross_entropy = masked_log_u_z.sum(dim=(1, 2)) / valid_ops_per_sample
 
         # 统计信息：cross_entropy（负对数似然，应该是负数）
         cross_entropy_min = float(cross_entropy.min().item())
@@ -264,23 +269,47 @@ class ContinuousFlowLoss:
         cross_entropy_mean = float(cross_entropy.mean().item())
         cross_entropy_std = float(cross_entropy.std().item() if cross_entropy.numel() > 1 else 0.0)
 
-        # 最终损失：负对数似然（要最小化）
-        # 不再使用 u_total 和 sched_coeff
-        loss = -cross_entropy.mean()
+        # 最终损失：负对数似然 + u_total正则化
+        # cross_entropy: 惩罚"在需要编辑的位置预测错误"
+        # u_total: 惩罚"预测过高的总操作速率"（鼓励稀疏性）
+        # 这样模型同时学习两个目标：
+        # 1. 在需要编辑的位置预测正确的编辑操作
+        # 2. 在所有位置保持低操作速率（稀疏预测）
+
+        # u_total已经在前面计算：u_total = u_cat_x.sum(dim=(1, 2))
+        # shape: [batch]，每个样本的总操作速率
+
+        # 🔧 测试：完全移除正则化，看能否过拟合
+        reg_coeff = 0.0  # 移除所有正则化
+
+        # 最终损失 = 负对数似然 + u_total正则化
+        ce_loss = -cross_entropy.mean()
+        u_total_loss = u_total.mean()
+        loss = ce_loss + reg_coeff * u_total_loss
 
         # 统计信息：loss
         loss_value = float(loss.item())
         loss_is_nan = bool(torch.isnan(loss).item())
         loss_is_inf = bool(torch.isinf(loss).item())
 
+        # 额外统计：分解损失项
+        ce_loss_value = float(ce_loss.item())
+        u_total_loss_value = float(u_total_loss.item())
+
         # 记录所有统计信息到日志（仅在debug模式下）
         if logger is not None and self.debug_mode:
+            # 添加归一化相关的统计信息
+            valid_ops_min = int(valid_ops_per_sample.min().item())
+            valid_ops_max = int(valid_ops_per_sample.max().item())
+            valid_ops_mean = float(valid_ops_per_sample.float().mean().item())
+
             logger.log(f"LOSS_STATS",
                       f"u_z: min={u_z_min:.6f}, max={u_z_max:.6f}, mean={u_z_mean:.6f}, std={u_z_std:.6f} | "
                       f"zeros={u_z_num_zeros}, near_zero={u_z_has_near_zero}, negative={u_z_has_negative} | "
                       f"log_u_z: min={log_u_z_min:.6f}, max={log_u_z_max:.6f}, mean={log_u_z_mean:.6f} | "
                       f"has_inf={log_u_z_has_inf}, has_nan={log_u_z_has_nan} | "
                       f"u_mask: {u_mask_num_true}/{u_mask_total} ({(1-u_mask_sparsity)*100:.2f}%) | "
+                      f"valid_ops_per_sample: min={valid_ops_min}, max={valid_ops_max}, mean={valid_ops_mean:.2f} | "
                       f"cross_entropy: min={cross_entropy_min:.6f}, max={cross_entropy_max:.6f}, "
                       f"mean={cross_entropy_mean:.6f}, std={cross_entropy_std:.6f} | "
                       f"loss: {loss_value:.6f}, is_nan={loss_is_nan}, is_inf={loss_is_inf}",
