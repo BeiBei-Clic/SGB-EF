@@ -277,9 +277,9 @@ class ContinuousFlowLoss:
 
 
 class FlowDataset(torch.utils.data.Dataset):
-    """连续流数据集 (z0, z1, x_values, residuals) - 支持内存预加载和文件按需读取"""
+    """连续流数据集 (z0, z1, x_values, y_target, residuals) - 基于文件位置索引的懒加载实现"""
 
-    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False, preload_to_memory=False):
+    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False):
         """
         基于文件位置索引的数据集
 
@@ -290,14 +290,12 @@ class FlowDataset(torch.utils.data.Dataset):
             max_dim: 最大维度
             max_expr_length: 表达式最大长度
             verbose: 是否输出详细日志
-            preload_to_memory: 是否预加载数据到内存（性能优化）
         """
         self.positions = positions
         self.filename = filename
         self.tokenizer = tokenizer
         self.max_expr_length = max_expr_length
         self.max_dim = max_dim
-        self.preload_to_memory = preload_to_memory
 
         # 直接使用tokenizer获取所需信息
         self.vocab_size = len(tokenizer.get_vocab())
@@ -305,29 +303,27 @@ class FlowDataset(torch.utils.data.Dataset):
         self.bos_token = tokenizer.convert_tokens_to_ids('<s>')
         self.gap_token = tokenizer.convert_tokens_to_ids('<gap>')
 
-        # 预加载数据到内存（可选）
-        self.data_cache = None
-        if self.preload_to_memory:
-            self._preload_data(verbose)
+        # 使用懒加载文件句柄（每个 Worker 进程独立打开）
+        # 注意：不在 __init__ 中打开文件，因为文件句柄不能被 pickle 传给 Worker
+        self.file_handle = None
 
     def __len__(self):
         return len(self.positions)
 
-    def _preload_data(self, verbose=False):
-        """预加载数据到内存以提高IO性能"""
-        if verbose:
-            print(f"预加载 {len(self.positions)} 个样本到内存...")
+    def __del__(self):
+        """析构函数：确保文件句柄被正确关闭"""
+        if hasattr(self, 'file_handle') and self.file_handle is not None:
+            try:
+                self.file_handle.close()
+            except Exception:
+                pass  # 忽略关闭时的异常
+            self.file_handle = None
 
-        self.data_cache = []
-        with open(self.filename, 'r', encoding='utf-8') as f:
-            for pos in self.positions:
-                f.seek(pos)
-                line = f.readline().strip()
-                sample = json.loads(line)
-                self.data_cache.append(sample)
-
-        if verbose:
-            print(f"数据预加载完成，占用约 {len(self.data_cache) * 0.5:.1f} MB 内存")
+    def _open_file_handle(self):
+        """打开文件句柄（在每个 Worker 进程中只执行一次）"""
+        if self.file_handle is None:
+            self.file_handle = open(self.filename, 'r', encoding='utf-8')
+        return self.file_handle
 
     def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
         """将token列表转换为token ID列表"""
@@ -335,15 +331,31 @@ class FlowDataset(torch.utils.data.Dataset):
         return self.tokenizer.convert_tokens_to_ids(tokens)
 
     def __getitem__(self, idx):
-        # 如果数据已预加载到内存，直接从缓存读取
-        if self.data_cache is not None:
-            sample = self.data_cache[idx]
-        else:
-            # 从文件指定位置读取样本
-            with open(self.filename, 'r', encoding='utf-8') as f:
-                f.seek(self.positions[idx])
-                line = f.readline().strip()
-                sample = json.loads(line)
+        # 懒加载文件句柄：只在第一次读取时打开，并保持打开状态
+        # 这样在每个 Worker 进程中只打开一次文件，避免每次都开关文件
+        f = self._open_file_handle()
+
+        # 从文件指定位置读取样本
+        try:
+            f.seek(self.positions[idx])
+            line = f.readline().strip()
+            sample = json.loads(line)
+        except (ValueError, IndexError, OSError) as e:
+            # 容错处理：如果句柄失效，尝试重置
+            # 这种情况可能发生在：
+            # 1. 文件被外部修改
+            # 2. 文件句柄意外关闭
+            # 3. 磁盘 I/O 错误
+            try:
+                f.close()
+            except Exception:
+                pass
+
+            # 重新打开文件句柄
+            self.file_handle = open(self.filename, 'r', encoding='utf-8')
+            self.file_handle.seek(self.positions[idx])
+            line = self.file_handle.readline().strip()
+            sample = json.loads(line)
 
         x_values = torch.FloatTensor(sample['x_values'])
         y_target = torch.FloatTensor(sample['y_target'])  # 修改：加载y_target而非residuals
