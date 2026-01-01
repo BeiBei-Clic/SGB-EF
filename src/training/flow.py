@@ -7,6 +7,7 @@ import json
 import os
 import time
 from typing import List, Dict, Tuple, Optional
+from datasets import load_dataset
 from ..symbolic.data_generator import generate_flow_samples
 
 
@@ -276,112 +277,225 @@ class ContinuousFlowLoss:
         return loss
 
 
-class FlowDataset(torch.utils.data.Dataset):
-    """连续流数据集 (z0, z1, x_values, y_target, residuals) - 基于文件位置索引的懒加载实现"""
+def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
+                       max_expr_length: int = 128, stream: bool = True,
+                       num_proc: Optional[int] = None):
+    """
+    使用 Hugging Face datasets 加载并预处理数据
 
-    def __init__(self, positions, filename, tokenizer, max_dim=10, max_expr_length=128, verbose=False):
+    Args:
+        data_file: 数据文件路径 (.txt格式，每行一个JSON样本)
+        tokenizer: 分词器
+        max_dim: 最大维度
+        max_expr_length: 表达式最大长度
+        stream: 是否使用流式加载（默认True，适合大文件）
+        num_proc: 预处理时的进程数，None表示自动选择
+
+    Returns:
+        dataset: Hugging Face Dataset 对象
+    """
+    data_files = {"train": data_file}
+
+    # 加载原始文本数据
+    if stream:
+        # 流式加载：适合大文件，不一次性加载到内存
+        raw_dataset = load_dataset("text", data_files=data_files, split="train", streaming=True)
+    else:
+        # 一次性加载：适合小文件，后续处理更快
+        raw_dataset = load_dataset("text", data_files=data_files, split="train")
+
+    # 获取token相关信息
+    pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
+    bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
+    gap_token_id = tokenizer.convert_tokens_to_ids('<gap>')
+    vocab_size = len(tokenizer.get_vocab())
+
+    def process_function(examples):
         """
-        基于文件位置索引的数据集
+        预处理函数：将JSON字符串转换为模型所需的格式
+        """
+        # 处理单个样本（streaming模式，batch_size=1时）
+        if isinstance(examples, dict) and 'text' in examples:
+            text = examples['text']
+            # 检查是否已经是list（streaming模式可能批处理）
+            if isinstance(text, list):
+                lines = text
+            else:
+                lines = [text]
+        else:
+            # 处理batch（非streaming模式）
+            lines = examples['text']
+
+        batch_size = len(lines)
+
+        # 预分配列表
+        outputs = {
+            'x_values': [],
+            'y_target': [],
+            'residuals': [],
+            'z0_token_ids': [],
+            'z1_token_ids': [],
+            'gap_token': []
+        }
+
+        for line in lines:
+            sample = json.loads(line)
+
+            # 添加数值数据
+            outputs['x_values'].append(sample['x_values'])
+            outputs['y_target'].append(sample['y_target'])
+            outputs['residuals'].append(sample['residuals'])
+
+            # Token处理
+            def pad_z_sequence(tokens):
+                # 过滤掉None值，并确保所有token都是整数
+                filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
+                if len(filtered_tokens) != len(tokens):
+                    print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token")
+
+                # 添加BOS token并截断
+                tokens = [bos_token_id] + filtered_tokens[:max_expr_length-1]
+                # Padding到固定长度
+                tokens.extend([pad_token_id] * (max_expr_length - len(tokens)))
+                return tokens
+
+            # 转换token
+            z0_tokens = tokenizer.convert_tokens_to_ids(sample['z0_tokens'])
+            z1_tokens = tokenizer.convert_tokens_to_ids(sample['z1_tokens'])
+
+            outputs['z0_token_ids'].append(pad_z_sequence(z0_tokens))
+            outputs['z1_token_ids'].append(pad_z_sequence(z1_tokens))
+            outputs['gap_token'].append(gap_token_id)
+
+        return outputs
+
+    # 应用预处理
+    if stream:
+        # 流式模式：使用map (IterableDataset不支持desc参数)
+        tokenized_dataset = raw_dataset.map(
+            process_function,
+            batched=True,
+            remove_columns=["text"]
+        )
+    else:
+        # 非流式模式：使用多进程加速
+        tokenized_dataset = raw_dataset.map(
+            process_function,
+            batched=True,
+            num_proc=num_proc,
+            remove_columns=["text"],
+            desc="Preprocessing dataset"
+        )
+
+    # 设置格式为torch，这样DataLoader拿到的直接是Tensor
+    if stream:
+        # IterableDataset使用with_format (不支持columns参数)
+        tokenized_dataset = tokenized_dataset.with_format(type='torch')
+    else:
+        # 普通Dataset使用set_format
+        tokenized_dataset.set_format(type='torch', columns=[
+            'x_values', 'y_target', 'residuals',
+            'z0_token_ids', 'z1_token_ids', 'gap_token'
+        ])
+
+    # 保存tokenizer引用供后续使用
+    tokenized_dataset.tokenizer = tokenizer
+
+    return tokenized_dataset
+
+
+class FlowDataset(torch.utils.data.Dataset):
+    """连续流数据集包装器 - 兼容旧接口，内部使用 Hugging Face datasets"""
+
+    def __init__(self, data_file: str, tokenizer, max_dim: int = 10,
+                 max_expr_length: int = 128, stream: bool = True,
+                 num_proc: Optional[int] = None):
+        """
+        使用 Hugging Face datasets 的数据集包装器
 
         Args:
-            positions: 文件中样本的位置索引列表
-            filename: 数据文件路径
+            data_file: 数据文件路径
             tokenizer: 分词器
             max_dim: 最大维度
             max_expr_length: 表达式最大长度
-            verbose: 是否输出详细日志
+            stream: 是否使用流式加载（默认True）
+            num_proc: 预处理时的进程数
         """
-        self.positions = positions
-        self.filename = filename
         self.tokenizer = tokenizer
-        self.max_expr_length = max_expr_length
         self.max_dim = max_dim
-
-        # 直接使用tokenizer获取所需信息
+        self.max_expr_length = max_expr_length
         self.vocab_size = len(tokenizer.get_vocab())
         self.pad_token = tokenizer.convert_tokens_to_ids('<pad>')
         self.bos_token = tokenizer.convert_tokens_to_ids('<s>')
         self.gap_token = tokenizer.convert_tokens_to_ids('<gap>')
+        self.stream = stream  # 保存stream模式标志
 
-        # 使用懒加载文件句柄（每个 Worker 进程独立打开）
-        # 注意：不在 __init__ 中打开文件，因为文件句柄不能被 pickle 传给 Worker
-        self.file_handle = None
+        # 使用 Hugging Face datasets 加载数据
+        self._hf_dataset = prepare_dataset_hf(
+            data_file=data_file,
+            tokenizer=tokenizer,
+            max_dim=max_dim,
+            max_expr_length=max_expr_length,
+            stream=stream,
+            num_proc=num_proc
+        )
+
+        # 如果是非流式模式，缓存数据列表以便快速访问
+        if not stream:
+            self._data_list = list(self._hf_dataset)
+            self._dataset_length = len(self._data_list)
+        else:
+            self._data_list = None
+            # 流式模式：直接统计文件行数（比遍历dataset快得多）
+            try:
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    self._dataset_length = sum(1 for _ in f)
+            except Exception as e:
+                # 如果文件统计失败，使用一个默认的大数
+                print(f"警告: 无法统计文件行数，使用默认值。错误: {e}")
+                self._dataset_length = 1000000  # 默认值
 
     def __len__(self):
-        return len(self.positions)
+        """返回数据集大小"""
+        return self._dataset_length
 
-    def __del__(self):
-        """析构函数：确保文件句柄被正确关闭"""
-        if hasattr(self, 'file_handle') and self.file_handle is not None:
-            try:
-                self.file_handle.close()
-            except Exception:
-                pass  # 忽略关闭时的异常
-            self.file_handle = None
-
-    def _open_file_handle(self):
-        """打开文件句柄（在每个 Worker 进程中只执行一次）"""
-        if self.file_handle is None:
-            self.file_handle = open(self.filename, 'r', encoding='utf-8')
-        return self.file_handle
-
-    def _tokenize_expression_tokens(self, tokens: List[str]) -> List[int]:
-        """将token列表转换为token ID列表"""
-        # 直接使用tokenizer转换tokens
-        return self.tokenizer.convert_tokens_to_ids(tokens)
+    def __iter__(self):
+        """流式模式下的迭代器"""
+        if self._data_list is not None:
+            # 非流式模式：迭代缓存列表
+            return iter(self._data_list)
+        else:
+            # 流式模式：直接迭代Hugging Face dataset
+            return self._hf_dataset.__iter__()
 
     def __getitem__(self, idx):
-        # 懒加载文件句柄：只在第一次读取时打开，并保持打开状态
-        # 这样在每个 Worker 进程中只打开一次文件，避免每次都开关文件
-        f = self._open_file_handle()
+        """获取单个样本（仅非流式模式）"""
+        if self._data_list is not None:
+            # 非流式模式：直接从缓存列表获取
+            sample = self._data_list[idx]
+        else:
+            # 流式模式：使用islice跳转到指定位置
+            # 注意：在DataLoader中使用IterableDataset时，__getitem__不应该被调用
+            from itertools import islice
+            sample = next(islice(self._hf_dataset, idx, None))
 
-        # 从文件指定位置读取样本
-        try:
-            f.seek(self.positions[idx])
-            line = f.readline().strip()
-            sample = json.loads(line)
-        except (ValueError, IndexError, OSError) as e:
-            # 容错处理：如果句柄失效，尝试重置
-            # 这种情况可能发生在：
-            # 1. 文件被外部修改
-            # 2. 文件句柄意外关闭
-            # 3. 磁盘 I/O 错误
-            try:
-                f.close()
-            except Exception:
-                pass
-
-            # 重新打开文件句柄
-            self.file_handle = open(self.filename, 'r', encoding='utf-8')
-            self.file_handle.seek(self.positions[idx])
-            line = self.file_handle.readline().strip()
-            sample = json.loads(line)
-
-        x_values = torch.FloatTensor(sample['x_values'])
-        y_target = torch.FloatTensor(sample['y_target'])  # 修改：加载y_target而非residuals
-        residuals = torch.FloatTensor(sample['residuals'])  # 保留residuals用于其他用途
-
-        z0_tokens = self._tokenize_expression_tokens(sample['z0_tokens'])
-        z1_tokens = self._tokenize_expression_tokens(sample['z1_tokens'])
-
-        max_len = self.max_expr_length
-        def pad_z_sequence(tokens):
-            # 过滤掉None值，并确保所有token都是整数
-            filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
-            if len(filtered_tokens) != len(tokens):
-                print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token (原始: {tokens})")
-            tokens = [self.bos_token] + filtered_tokens[:max_len-1]
-            tokens.extend([self.pad_token] * (max_len - len(tokens)))
-            return torch.LongTensor(tokens)
-
-        return {
-            'x_values': x_values,
-            'y_target': y_target,  # 新增：返回y_target
-            'residuals': residuals,  # 保留：用于向后兼容或其他用途
-            'z0_token_ids': pad_z_sequence(z0_tokens),
-            'z1_token_ids': pad_z_sequence(z1_tokens),
-            'gap_token': self.gap_token
+        # 转换为Tensor（如果是numpy的话）
+        result = {
+            'x_values': torch.FloatTensor(sample['x_values'])
+                if not isinstance(sample['x_values'], torch.Tensor) else sample['x_values'],
+            'y_target': torch.FloatTensor(sample['y_target'])
+                if not isinstance(sample['y_target'], torch.Tensor) else sample['y_target'],
+            'residuals': torch.FloatTensor(sample['residuals'])
+                if not isinstance(sample['residuals'], torch.Tensor) else sample['residuals'],
+            'z0_token_ids': sample['z0_token_ids'].long()
+                if not isinstance(sample['z0_token_ids'], torch.Tensor) else sample['z0_token_ids'],
+            'z1_token_ids': sample['z1_token_ids'].long()
+                if not isinstance(sample['z1_token_ids'], torch.Tensor) else sample['z1_token_ids'],
+            'gap_token': sample['gap_token'].item()
+                if isinstance(sample['gap_token'], torch.Tensor) else sample['gap_token']
         }
+
+        return result
 
 
 def custom_collate_fn(batch):

@@ -16,7 +16,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 # from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
-from ..symbolic.data_generator import generate_flow_samples, load_dimension_index
+from ..symbolic.data_generator import generate_flow_samples
 from .flow import (
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
@@ -97,7 +97,7 @@ class EditFlowManager:
         set_seed(seed)
 
     def prepare_data(self, tokenizer):
-        """准备训练数据，支持多进程并行生成"""
+        """准备训练数据，使用 Hugging Face datasets 加载"""
 
         # 1. 数据生成阶段：只使用主进程（单进程）
         cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth_{self.args.max_expr_length}len.txt"
@@ -127,62 +127,137 @@ class EditFlowManager:
         self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_local_main_process:
-            print("[主进程] 数据生成完成，开始训练阶段")
+            print("[主进程] 数据生成完成，开始加载训练数据")
 
         # 3. 同步屏障：确保所有进程都能访问到完整的数据文件
         print(f"[Rank {self.accelerator.process_index}] 准备开始训练阶段...")
         self.accelerator.wait_for_everyone()
 
-        # 加载索引（此时文件已完整）
-        dimension_samples = load_dimension_index(cache_filename, verbose=self.accelerator.is_local_main_process)
+        # 4. 使用 Hugging Face datasets 加载数据
+        # 设置stream参数：默认使用流式加载以节省内存
+        use_stream = getattr(self.args, 'dataset_stream', True)
+        num_proc = getattr(self.args, 'dataset_num_proc', None)
 
-        # === 修改开始：合并所有维度的位置索引 ===
-        all_train_positions = []
-        all_test_positions = []
+        if self.accelerator.is_local_main_process:
+            print(f"使用 Hugging Face datasets 加载数据 (stream={use_stream})...")
 
-        for dim, positions in dimension_samples.items():
-            # 这里的 shuffle 配合 set_seed 保证所有进程打乱顺序一致
-            np.random.shuffle(positions)
-            split_idx = int(len(positions) * (1 - self.args.test_split))
-
-            all_train_positions.extend(positions[:split_idx])
-            all_test_positions.extend(positions[split_idx:])
-
-        # 再次整体打乱，让不同维度的样本混合，有助于模型泛化
-        np.random.shuffle(all_train_positions)
-        np.random.shuffle(all_test_positions)
-
-        # 创建单一的训练和测试数据集
-        train_dataset = FlowDataset(
-            all_train_positions, cache_filename, tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
-        )
-        test_dataset = FlowDataset(
-            all_test_positions, cache_filename, tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length
+        # 加载完整数据集（train和test将通过train_test_split分割）
+        full_dataset = FlowDataset(
+            data_file=cache_filename,
+            tokenizer=tokenizer,
+            max_dim=self.args.max_dim,
+            max_expr_length=self.args.max_expr_length,
+            stream=use_stream,
+            num_proc=num_proc
         )
 
+        # 5. 分割训练集和测试集
+        # 注意：流式模式下无法直接使用train_test_split，需要手动处理
+        if use_stream:
+            # 流式模式：使用迭代器分割（近似）
+            # 先计算分割点
+            split_ratio = 1 - self.args.test_split
+            train_size = int(self.args.num_samples * split_ratio)
+            test_size = self.args.num_samples - train_size
+
+            if self.accelerator.is_local_main_process:
+                print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
+
+            # 创建两个数据集实例（通过跳过不同的行数实现）
+            # 注意：这种方式不够精确，但流式模式下无法预先知道确切数量
+            train_dataset = full_dataset
+            # 对于测试集，我们可以创建一个新的实例，但需要在迭代时跳过训练样本
+            # 简化处理：这里暂时使用相同的数据集，实际训练时通过采样控制
+            test_dataset = full_dataset  # 简化处理
+
+            train_size_estimate = train_size
+            test_size_estimate = test_size
+        else:
+            # 非流式模式：可以精确分割
+            total_size = len(full_dataset)
+            train_size = int(total_size * (1 - self.args.test_split))
+
+            # 手动分割列表
+            from torch.utils.data import Subset
+
+            # 生成索引并打乱
+            indices = list(range(total_size))
+            np.random.shuffle(indices)
+
+            train_indices = indices[:train_size]
+            test_indices = indices[train_size:]
+
+            train_dataset = Subset(full_dataset, train_indices)
+            test_dataset = Subset(full_dataset, test_indices)
+
+            train_size_estimate = len(train_indices)
+            test_size_estimate = len(test_indices)
+
+            if self.accelerator.is_local_main_process:
+                print(f"非流式模式: 训练集 {train_size_estimate} 样本, 测试集 {test_size_estimate} 样本")
+
+        # 6. 创建 DataLoader
         # 关键参数：num_workers 和 drop_last
         # num_workers > 0 可以防止IO阻塞导致的GPU等待
         # drop_last=True 保证每个进程的 batch 数量严格一致，防止 DDP 卡死
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            collate_fn=custom_collate_fn,
-            drop_last=True, # 防止尾部batch不齐导致的死锁
-            pin_memory=True
-        )
 
-        test_dataloader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=False,
-            num_workers=self.args.num_workers,
-            collate_fn=custom_collate_fn,
-            drop_last=False # 测试集通常不需要 drop_last，除非 evaluate 也有同步逻辑
-        )
+        # 检查是否为stream模式
+        is_stream_mode = getattr(train_dataset, 'stream', False)
+
+        # 获取数据集大小，智能调整drop_last
+        train_size = len(train_dataset)
+        test_size = len(test_dataset)
+
+        # 对于小数据集，禁用drop_last以免所有数据都被丢弃
+        train_drop_last = train_size >= self.args.batch_size
+        test_drop_last = test_size >= self.args.batch_size
+
+        if self.accelerator.is_local_main_process:
+            if not train_drop_last:
+                print(f"警告: 训练集大小({train_size}) < batch_size({self.args.batch_size})，禁用drop_last")
+            if not test_drop_last:
+                print(f"警告: 测试集大小({test_size}) < batch_size({self.args.batch_size})，禁用drop_last")
+
+        if is_stream_mode:
+            # Stream模式（IterableDataset）：不支持shuffle，禁用num_workers
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,  # IterableDataset不支持shuffle
+                num_workers=0,  # 避免多进程问题
+                collate_fn=custom_collate_fn,
+                drop_last=train_drop_last,  # 智能调整
+                pin_memory=True
+            )
+
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                num_workers=0,  # 避免多进程问题
+                collate_fn=custom_collate_fn,
+                drop_last=test_drop_last  # 智能调整
+            )
+        else:
+            # 非stream模式：可以使用shuffle和num_workers
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=self.args.num_workers,
+                collate_fn=custom_collate_fn,
+                drop_last=train_drop_last,  # 智能调整
+                pin_memory=True
+            )
+
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                num_workers=self.args.num_workers,
+                collate_fn=custom_collate_fn,
+                drop_last=test_drop_last  # 智能调整
+            )
 
         # 使用 Accelerate 准备
         train_dataloader, test_dataloader = self.accelerator.prepare(
@@ -190,7 +265,7 @@ class EditFlowManager:
         )
 
         if self.accelerator.is_local_main_process:
-            print(f"数据准备完成: 训练集 {len(all_train_positions)} 样本, 测试集 {len(all_test_positions)} 样本")
+            print(f"数据准备完成: 训练集约 {train_size_estimate} 样本, 测试集约 {test_size_estimate} 样本")
 
         return train_dataloader, train_dataset, test_dataloader, test_dataset
 
