@@ -495,20 +495,14 @@ class EditFlowManager:
         lambda_sub = pred_rates[:, :, 2:3]  # 替换速率
 
         # 关键修复：直接使用logits而不是概率
-        # 将速率作为log空间加到logits上，然后做log_softmax
+        # 将速率作为log空间加到logits上
         ins_logits = forward_results['pred_ins_logits'] + torch.log(lambda_ins.clamp(min=1e-8))
         sub_logits = forward_results['pred_sub_logits'] + torch.log(lambda_sub.clamp(min=1e-8))
         del_logits = torch.log(lambda_del.clamp(min=1e-8))
 
-        # 🔧 关键修复：将attention_mask=0的位置的logits设为一个非常大的负数
-        # 这样log_softmax后这些位置的概率接近0，不影响梯度
-        LARGE_NEG = -1e9  # 足够大的负数，exp后接近0
-        if attention_mask is not None:
-            attention_mask_full = attention_mask.unsqueeze(-1)  # [batch, x_seq_len, 1]
-            mask_large_neg = (1.0 - attention_mask_full) * LARGE_NEG
-            ins_logits = ins_logits + mask_large_neg.expand(-1, -1, ins_logits.shape[-1])
-            sub_logits = sub_logits + mask_large_neg.expand(-1, -1, sub_logits.shape[-1])
-            del_logits = del_logits + mask_large_neg
+        # 🔧 修复：不再在这里应用attention_mask
+        # attention_mask会在loss计算时通过u_mask自然处理
+        # 避免在这里设置-1e9导致log_softmax后出现-inf污染
 
         # u_cat_x 现在是logits而不是概率
         # 形状: [batch, x_seq_len, 2*vocab_size+1]

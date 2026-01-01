@@ -233,11 +233,30 @@ class ContinuousFlowLoss:
         u_cat_x_probs = torch.exp(u_cat_x.clamp(max=10))  # 防止溢出
         u_total = u_cat_x_probs.sum(dim=(1, 2))
 
-        # 归一化 u_z 使其成为有效的概率分布
-        # u_z 现在是logits（从u_cat_x扩展而来）
-        # u_z 形状: [batch, z_seq_len, 2*vocab_size+1]
-        # 使用 log_softmax（因为u_cat_x已经是logits了）
-        log_u_z = torch.log_softmax(u_z, dim=-1)
+        # 🔧 关键修复：避免-inf污染loss计算
+        # 问题：如果直接对所有位置计算log_softmax，padding位置的-inf会影响数值稳定性
+        # 解决：对每个样本，只提取有效位置（u_mask=1）的logits，单独计算log_softmax
+
+        batch_size, z_seq_len, n_ops = u_z.shape
+
+        # 初始化输出张量，填充一个较小的负数（不是-inf，避免污染）
+        log_u_z = torch.zeros_like(u_z) - 10.0  # 初始化为log(很小的概率)
+
+        # 对每个样本单独处理
+        for b in range(batch_size):
+            # 找到该样本所有有效位置的mask
+            mask_b = u_mask[b].bool()  # [z_seq_len, n_ops]
+
+            if mask_b.any():
+                # 提取有效位置的logits
+                valid_logits = u_z[b][mask_b]  # [num_valid]
+
+                # 只在有效位置计算log_softmax
+                valid_log_probs = torch.log_softmax(valid_logits, dim=-1)
+
+                # 填充回原位置
+                log_u_z[b][mask_b] = valid_log_probs
+            # 如果没有有效位置，保持初始值-10.0（log(exp(-10)) = -10）
 
         # 统计信息：log_u_z（应该在负无穷到0之间）
         log_u_z_min = float(log_u_z.min().item())

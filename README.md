@@ -76,6 +76,17 @@ accelerate launch \
     --num_samples 1000000\
     --batch_size 960
 
+accelerate launch \
+    --num_processes=1 \
+    --num_machines=1 \
+    --mixed_precision=bf16 \
+    --dynamo_backend=no \
+    train.py \
+    --num_epochs 50 \
+    --num_samples 100\
+    --batch_size 32 \
+    --debug 1
+
 # 将会话挂到后台
 Ctrl + B, D
 # 查看当前有哪些正在运行的会话
