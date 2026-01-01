@@ -108,11 +108,14 @@ class ContinuousFlowLoss:
         pad_token = tokenizer.convert_tokens_to_ids('<pad>')
 
         # 初始化输出掩码（在X空间）
-        u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
+        # ⚠️ 关键修复：使用整数类型而非布尔值，以支持重复操作
+        # 例如：在同一个位置插入2个sin，u_mask[b, pos, sin_token_id] = 2
+        u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.int, device=z_t.device)
 
         # 对每个样本进行双索引遍历（论文Fig. 13的核心逻辑）
         for b in range(batch_size):
             x_t_index = -1  # X空间指针初始化为-1（指向x_t的前一个位置）
+            first_valid_index = 0  # 记录第一个有效token的位置，用于处理开头的gap
 
             for i in range(z_seq_len):
                 token_t = z_t[b, i].item()
@@ -127,6 +130,10 @@ class ContinuousFlowLoss:
                 # 因此需要将x_t_index向前移动一位
                 if token_t != gap_token:
                     x_t_index += 1  # 移动到x_t中的下一个位置
+
+                    # 更新第一个有效token的位置
+                    if first_valid_index == 0:
+                        first_valid_index = x_t_index
 
                     # === 关键修复：检查x_t当前位置是否是pad ===
                     # 如果x_t当前位置是pad，说明已经超出有效长度，停止遍历
@@ -143,9 +150,14 @@ class ContinuousFlowLoss:
                     # 插入操作：
                     # z_t[i]是gap，z_1[i]是有效token
                     # 意味着需要在gap位置插入token_1
-                    # 由于gap不占X空间位置，插入操作标记在x_t_index位置（gap的前一个token）
-                    if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, token_1] = True  # 插入token_1
+                    #
+                    # ⚠️ 关键修复：处理序列开头的gap + 支持重复插入
+                    # 使用 += 而非 = 来支持在同一个位置多次插入相同token
+                    # 例如：[<gap>, <gap>, constant] -> [sin, sin, constant]
+                    #      应该在constant位置标记: u_mask[b, pos, sin_token_id] = 2
+                    insert_pos = max(x_t_index, first_valid_index)
+                    if insert_pos >= 0 and insert_pos < x_seq_len:
+                        u_mask[b, insert_pos, token_1] += 1  # 累加计数（支持重复）
 
                 elif token_t != gap_token and token_1 == gap_token:
                     # 删除操作：
@@ -153,7 +165,7 @@ class ContinuousFlowLoss:
                     # 意味着需要删除当前token
                     # 删除操作直接标记在x_t_index位置（当前token的位置）
                     if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, -1] = True  # 删除操作（最后一维）
+                        u_mask[b, x_t_index, -1] += 1  # 累加计数（通常为1）
 
                 elif token_t != gap_token and token_1 != gap_token and token_t != token_1:
                     # 替换操作：
@@ -161,7 +173,7 @@ class ContinuousFlowLoss:
                     # 意味着需要将token_t替换为token_1
                     # 替换操作标记在x_t_index位置（偏移vocab_size以区分插入和替换）
                     if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, token_1 + vocab_size] = True  # 替换为token_1
+                        u_mask[b, x_t_index, token_1 + vocab_size] += 1  # 累加计数（通常为1）
 
         return u_mask
 

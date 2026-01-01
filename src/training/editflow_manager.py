@@ -42,7 +42,6 @@ class EditFlowManager:
     GRADIENT_CLIP_NORM = 5.0  # 提高到5.0以适应6750万参数的大模型
     NUMERICAL_CLIP_THRESHOLD = 1e6
     MAX_EXPRESSION_LENGTH = 50
-    LEARNING_RATE_SCALE = 0.1  # 降低学习率以防止梯度爆炸
     MIN_ACTION_SCORE = 0.01  # 最小操作分数阈值
 
     def __init__(self, args):
@@ -335,7 +334,7 @@ class EditFlowManager:
         criterion = ContinuousFlowLoss(debug_mode=self.debug_mode)
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(condition_encoder.parameters()),
-            lr=self.args.learning_rate * self.LEARNING_RATE_SCALE,
+            lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay,
             eps=1e-8  # 增加数值稳定性
         )
@@ -495,7 +494,12 @@ class EditFlowManager:
 
         # 生成编辑操作掩码：使用双索引追踪逻辑
         # 在Z空间（z0）遍历，映射到X空间（x_t）的编辑操作
-        u_mask = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer, x_t)
+        # u_mask在X空间生成: [batch, x_seq_len, 2*vocab_size+1]
+        u_mask_x = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, dataset.tokenizer, x_t)
+
+        # ⚠️ 关键修复：将u_mask扩展到Z空间以匹配log_u_z的维度
+        # 使用fill_gap_tokens_with_repeats将X空间的mask扩展到Z空间
+        u_mask = fill_gap_tokens_with_repeats(u_mask_x, z_gap_mask, z_pad_mask)
 
         # 记录损失计算中的关键变量值（仅在debug模式下记录）
         if self.accelerator.is_local_main_process and self.debug_mode:
