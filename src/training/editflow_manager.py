@@ -3,30 +3,26 @@ EditFlow迭代优化训练器 - 实现基于迭代式编辑操作的符号回归
 使用 Hugging Face Accelerate 进行分布式训练加速
 """
 
+import os
+import time
+import sympy as sp
+
 import torch
 import numpy as np
-import os
-import signal
-import sys
-import traceback
-import time
 from tqdm import tqdm
-from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-# from ..utils.special_tokens import SpecialTokensManager  # 已移除：使用小词表后不再需要
 from ..symbolic.data_generator import generate_flow_samples
 from .flow import (
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, FlowDataset, custom_collate_fn
 )
 from ..modeling.condition_encoder import SetTransformerConditionEncoder
-# 使用新的LLaMA EditFlow模型替代BERT
 from ..modeling.llama_editflow import LlamaEditFlowBackbone
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
-from .greedy_search import Candidate, SimpleSymbolicRegression
+from .greedy_search import SimpleSymbolicRegression
 
 
 class EditFlowManager:
@@ -90,6 +86,16 @@ class EditFlowManager:
 
         # 记录训练开始日志
         self.logger.training_start(self.args)
+
+    def _gather_average_loss(self, total_loss, num_batches, default_value=0.0):
+        """跨进程收集并计算平均损失"""
+        self.accelerator.wait_for_everyone()
+        total_loss_tensor = torch.tensor(total_loss, device=self.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.device)
+        gathered_losses = self.accelerator.gather(total_loss_tensor)
+        gathered_batches = self.accelerator.gather(num_batches_tensor)
+        total_batches = gathered_batches.sum().item()
+        return gathered_losses.sum().item() / total_batches if total_batches > 0 else default_value
 
     def set_seed(self, seed: int):
         """设置随机种子 - 现在使用 Accelerate 的 set_seed"""
@@ -218,46 +224,33 @@ class EditFlowManager:
             if not test_drop_last:
                 print(f"警告: 测试集大小({test_size}) < batch_size({self.args.batch_size})，禁用drop_last")
 
+        # 根据stream模式确定DataLoader参数
         if is_stream_mode:
-            # Stream模式（IterableDataset）：不支持shuffle，禁用num_workers
-            train_dataloader = torch.utils.data.DataLoader(
-                train_dataset,
-                batch_size=self.args.batch_size,
-                shuffle=False,  # IterableDataset不支持shuffle
-                num_workers=0,  # 避免多进程问题
-                collate_fn=custom_collate_fn,
-                drop_last=train_drop_last,  # 智能调整
-                pin_memory=True
-            )
-
-            test_dataloader = torch.utils.data.DataLoader(
-                test_dataset,
-                batch_size=self.args.batch_size,
-                shuffle=False,
-                num_workers=0,  # 避免多进程问题
-                collate_fn=custom_collate_fn,
-                drop_last=test_drop_last  # 智能调整
-            )
+            train_shuffle, train_num_workers = False, 0
+            test_num_workers = 0
         else:
-            # 非stream模式：可以使用shuffle和num_workers
-            train_dataloader = torch.utils.data.DataLoader(
-                train_dataset,
-                batch_size=self.args.batch_size,
-                shuffle=True,
-                num_workers=self.args.num_workers,
-                collate_fn=custom_collate_fn,
-                drop_last=train_drop_last,  # 智能调整
-                pin_memory=True
-            )
+            train_shuffle, train_num_workers = True, self.args.num_workers
+            test_num_workers = self.args.num_workers
 
-            test_dataloader = torch.utils.data.DataLoader(
-                test_dataset,
-                batch_size=self.args.batch_size,
-                shuffle=False,
-                num_workers=self.args.num_workers,
-                collate_fn=custom_collate_fn,
-                drop_last=test_drop_last  # 智能调整
-            )
+        # 创建DataLoader
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=train_shuffle,
+            num_workers=train_num_workers,
+            collate_fn=custom_collate_fn,
+            drop_last=train_drop_last,
+            pin_memory=True
+        )
+
+        test_dataloader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=test_num_workers,
+            collate_fn=custom_collate_fn,
+            drop_last=test_drop_last
+        )
 
         # 使用 Accelerate 准备
         train_dataloader, test_dataloader = self.accelerator.prepare(
@@ -379,7 +372,7 @@ class EditFlowManager:
         return model, condition_encoder, criterion, optimizer, scheduler, tokenizer
 
   
-    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info=None):
+    def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
         """
         修改后的前向传播：移除中间状态插值，直接预测从z0到z1的编辑操作
         这将模型从"连续流匹配"转变为"迭代优化"架构
@@ -474,7 +467,7 @@ class EditFlowManager:
             'vocab_size': vocab_size,
         }
 
-    def compute_loss(self, forward_results, criterion, dataset, debug_info=None):
+    def compute_loss(self, forward_results, criterion, debug_info=None):
         pred_rates = forward_results['pred_rates']
         x_t = forward_results['x_t']
         z0 = forward_results['z0']  # 当前状态（起点）
@@ -483,10 +476,6 @@ class EditFlowManager:
         z_pad_mask = forward_results['z_pad_mask']
         effective_vocab_size = forward_results['vocab_size']
         gap_token = self.tokenizer.convert_tokens_to_ids('<gap>')
-        attention_mask = forward_results.get('attention_mask', None)  # 获取attention_mask
-
-        # 获取时间步采样数量
-        num_timesteps = self.args.num_timesteps
 
         # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
         # 因此索引 0=插入, 1=删除, 2=替换
@@ -598,7 +587,6 @@ class EditFlowManager:
                 data_load_start = time.time()
                 x_values = batch['x_values'].to(self.device)
                 y_target = batch['y_target'].to(self.device)  # 修改：使用y_target而非residuals
-                residuals = batch.get('residuals', torch.zeros_like(y_target)).to(self.device)  # 保留用于日志
                 z0_token_ids = batch['z0_token_ids'].to(self.device)
                 z1_token_ids = batch['z1_token_ids'].to(self.device)
                 data_load_time = time.time() - data_load_start
@@ -635,7 +623,7 @@ class EditFlowManager:
                 }
 
                 forward_start = time.time()
-                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, dataset, debug_info)
+                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
                 forward_time = time.time() - forward_start
 
                 if self.accelerator.is_local_main_process and self.debug_mode:
@@ -659,7 +647,7 @@ class EditFlowManager:
 
                 loss_compute_start = time.time()
                 # ✅ 不再手动除以 gradient_accumulation_steps，accelerator.accumulate 会自动处理
-                loss = self.compute_loss(forward_results, criterion, dataset, debug_info)
+                loss = self.compute_loss(forward_results, criterion, debug_info)
                 loss_compute_time = time.time() - loss_compute_start
 
                 # 记录损失值（仅在debug模式下记录详细信息）
@@ -734,18 +722,8 @@ class EditFlowManager:
                                     f"维度{dimension}_batch{batch_idx}", level=2)
 
         # 等待所有进程完成
-        self.accelerator.wait_for_everyone()
-
-        # 收集平均损失（跨进程）
-        total_loss_tensor = torch.tensor(total_loss, device=self.device)
-        num_batches_tensor = torch.tensor(num_batches, device=self.device)
-
-        # 使用 Accelerate 收集所有进程的损失
-        gathered_losses = self.accelerator.gather(total_loss_tensor)
-        gathered_batches = self.accelerator.gather(num_batches_tensor)
-
-        total_batches = gathered_batches.sum().item()
-        avg_loss = gathered_losses.sum().item() / total_batches if total_batches > 0 else 0.0
+        # 跨进程收集并计算平均损失
+        avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
 
         return avg_loss, num_batches
 
@@ -768,30 +746,21 @@ class EditFlowManager:
 
                 # 修改：使用y_target而非residuals
                 condition_embeddings = condition_encoder(x_values, y_target, point_mask)
-                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, test_dataset)
+                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids)
 
                 # 计算损失
-                loss = self.compute_loss(forward_results, criterion, test_dataset)
+                loss = self.compute_loss(forward_results, criterion)
                 total_loss += loss.item()
                 num_batches += 1
 
         # 等待所有进程完成
-        self.accelerator.wait_for_everyone()
-
-        # 使用 Accelerate 收集所有进程的损失
-        total_loss_tensor = torch.tensor(total_loss, device=self.device)
-        num_batches_tensor = torch.tensor(num_batches, device=self.device)
-
-        gathered_losses = self.accelerator.gather(total_loss_tensor)
-        gathered_batches = self.accelerator.gather(num_batches_tensor)
-
-        total_batches = gathered_batches.sum().item()
-        avg_loss = gathered_losses.sum().item() / total_batches if total_batches > 0 else float('inf')
+        # 跨进程收集并计算平均损失
+        avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=float('inf'))
 
         return avg_loss
 
 
-    def save_checkpoint(self, model, condition_encoder, optimizer, loss, epoch, is_final=False):
+    def save_checkpoint(self, model, condition_encoder, loss, epoch, is_final=False):
         # 等待所有进程同步
         self.accelerator.wait_for_everyone()
 
@@ -893,7 +862,7 @@ class EditFlowManager:
             # 保存检查点
             if (epoch + 1) % self.args.save_every == 0:
                 checkpoint_path = self.save_checkpoint(
-                    model, condition_encoder, optimizer, avg_loss, epoch
+                    model, condition_encoder, avg_loss, epoch
                 )
                 if self.accelerator.is_local_main_process:
                     print(f"检查点已保存到: {checkpoint_path}")
@@ -902,7 +871,7 @@ class EditFlowManager:
 
         # 保存最终模型
         final_path = self.save_checkpoint(
-            model, condition_encoder, optimizer, avg_loss, self.args.num_epochs - 1, is_final=True
+            model, condition_encoder, avg_loss, self.args.num_epochs - 1, is_final=True
         )
         if self.accelerator.is_local_main_process:
             print(f"最终模型已保存到: {final_path}")
@@ -911,7 +880,7 @@ class EditFlowManager:
 
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None):
+    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, initial_expr=None):
         """符号回归 - 使用简单推理(贪婪搜索)接收数据点对，输出表达式
 
         Args:
@@ -921,6 +890,7 @@ class EditFlowManager:
             n_steps: 推理步数
             input_dim: 输入维度，如果为None则自动推断
             max_expr_length: 表达式最大token长度，如果为None则使用args中的值
+            initial_expr: 初始表达式（sympy表达式或字符串），如果为None则使用x0
         """
         # 记录开始
         self.logger.log("SYMBOLIC_REGRESSION_START",
@@ -944,7 +914,7 @@ class EditFlowManager:
                 print("="*60 + "\n")
             self.logger.log("MODEL_LOAD", "⚠️ 未找到检查点，使用随机初始化权重（警告：推理质量会很差）", "inference", level=3)
 
-        model, condition_encoder, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+        model, condition_encoder, _, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
 
         # 设置设备和模式
         device = self.device
@@ -961,10 +931,22 @@ class EditFlowManager:
 
         # 计算初始残差 (真实值 - 初始表达式的预测值)
         import sympy as sp
-        from ..symbolic.symbolic_utils import evaluate_expression_safe, evaluate_expression_with_constants, tree_to_expr
+        from ..symbolic.symbolic_utils import evaluate_expression_safe, expr_to_tree
 
-        # initial_expr = sum(sp.Symbol(f'x{i}') for i in range(input_dim))
-        initial_expr = sp.Symbol('x0')
+        # 处理初始表达式
+        if initial_expr is None:
+            initial_expr = sp.Symbol('x0')
+        elif isinstance(initial_expr, str):
+            # 将字符串表达式转换为sympy表达式
+            initial_expr = sp.sympify(initial_expr)
+
+        # 将sympy表达式转换为前缀表达式tokens
+        initial_expr_str = expr_to_tree(initial_expr)
+        current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
+
+        if self.accelerator.is_local_main_process:
+            print(f"初始表达式: {initial_expr}")
+            print(f"初始tokens: {current_tokens}")
 
         # 计算初始表达式在x_data上的预测值
         success, y_pred = evaluate_expression_safe(initial_expr, x_data)
@@ -984,7 +966,8 @@ class EditFlowManager:
         self.logger.log("INITIAL_DATA",
                        f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | "
                        f"y_target: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
-                       f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}]",
+                       f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] | "
+                       f"initial_expr: {initial_expr} | initial_tokens: {current_tokens}",
                        "inference", level=1)
         self.logger.log("ARCHITECTURE_INFO",
                        "使用目标值y_target作为条件（架构改进：北极星模式）",
@@ -1005,36 +988,31 @@ class EditFlowManager:
                        f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
                        "inference", level=1)
 
-        # 构建初始前缀表达式（与训练格式一致）
-        # 统一处理：对于n维，需要(n-1)个add + n个变量
-        # 例如：dim=1 -> ['x0']；dim=2 -> ['add','x0','x1']；dim=3 -> ['add','add','x0','x1','x2']
-        current_tokens = ['add'] * (input_dim - 1) + [f'x{i}' for i in range(input_dim)]
-
         # 创建简单推理器
         self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
 
         # 解析action_thresholds参数
-        action_thresholds = None
-        if hasattr(self.args, 'action_thresholds') and self.args.action_thresholds:
+        action_thresholds = getattr(self.args, 'action_thresholds', None)
+        if action_thresholds:
             try:
-                action_thresholds = [float(x.strip()) for x in self.args.action_thresholds.split(',')]
+                action_thresholds = [float(x.strip()) for x in action_thresholds.split(',')]
                 self.logger.log("ACTION_THRESHOLDS_CONFIG",
                                f"使用多阈值推理模式 | thresholds={action_thresholds}",
                                "inference", level=1)
                 if self.accelerator.is_local_main_process:
                     print(f"\n使用多阈值推理模式，阈值: {action_thresholds}")
-            except (ValueError, AttributeError) as e:
+            except ValueError as e:
                 self.logger.log("ACTION_THRESHOLDS_PARSE_ERROR",
-                               f"无法解析action_thresholds参数: {self.args.action_thresholds} | error={e}",
+                               f"无法解析action_thresholds参数: {action_thresholds} | error={e}",
                                "inference", level=1)
                 if self.accelerator.is_local_main_process:
-                    print(f"\n⚠️ 警告: 无法解析action_thresholds参数 '{self.args.action_thresholds}'，回退到单最佳操作模式")
+                    print(f"\n⚠️ 警告: 无法解析action_thresholds参数 '{action_thresholds}'，回退到单最佳操作模式")
+                action_thresholds = None
 
         simple_searcher = SimpleSymbolicRegression(
             model=model,
             condition_encoder=condition_encoder,
             tokenizer=tokenizer,
-            # special_tokens_manager=special_tokens_manager,  # 已移除：使用小词表后不再需要
             device=device,
             args=self.args,
             logger=self.logger,

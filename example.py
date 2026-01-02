@@ -42,15 +42,11 @@ def reorganize_data_by_used_variables(expression_str, x_data, y_data):
     var_indices = sorted(set(int(m) for m in matches))
     old_used_vars = [f'x{i}' for i in var_indices]
 
-    print(f"原始表达式使用的变量: {old_used_vars}")
-
     # 创建变量映射：原始变量 -> 新变量
     # 例如：如果原始使用 x1, x2，则映射为 x1->x0, x2->x1
     var_mapping = {}
     for new_idx, old_idx in enumerate(var_indices):
         var_mapping[f'x{old_idx}'] = f'x{new_idx}'
-
-    print(f"变量映射: {var_mapping}")
 
     # 重新组织x_data：只保留使用的列，并按原始顺序排列
     new_x_data = x_data[:, var_indices]
@@ -87,7 +83,7 @@ def main():
         'max_expr_length': 24,  # 最大表达式长度
         "num_timesteps": 1,  # 已弃用：新架构固定t=0，不需要多时间步采样
         # 多阈值推理参数
-        'action_thresholds': "0.1,0.05,0.01",  # 多阈值推理的操作采纳阈值（逗号分隔），None表示单最佳操作模式
+        'action_thresholds': "0.1,0.018",  # 多阈值推理的操作采纳阈值（逗号分隔），None表示单最佳操作模式
         # 训练相关参数（推理时也需要，用于兼容性）
         'num_samples': 10000,  # 训练样本数（推理时不使用）
         'batch_size': 32,  # 批次大小（推理时不使用）
@@ -122,34 +118,34 @@ def main():
     # 创建 Logger 实例，传入debug_mode参数
     logger = Logger(enabled=True, debug_mode=args.debug)
 
-    print("=== 符号回归实例 ===")
-
     # 记录开始日志（使用level=3表示推理日志，受debug控制）
     logger.log("INFERENCE_START", "开始符号回归实例", "example", level=3)
 
     manager = EditFlowManager(args)
 
-    # 生成测试数据 - 使用 x1*x2 作为目标表达式
-    print("生成测试数据...")
-    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: x1*x2)", "example", level=3)
+    # 生成测试数据 - 使用 cos(tan(x0 + 3)) 作为目标表达式
+    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: cos(tan(x0 + 3)))", "example", level=3)
 
-    # 直接构造 x1*x2 的数据
+    # 直接构造 cos(tan(x0 + 3)) 的数据
     np.random.seed(42)
     n_points = 100
-    input_dimension = 3  # 需要3维，这样才有x1和x2
+    input_dimension = 1  # 只需要1维，使用x0
 
     # 生成随机数据
     x_data = np.random.randn(n_points, input_dimension) * 2  # 使用标准正态分布
-    y_data = x_data[:, 1] * x_data[:, 2]  # x1 * x2
+    y_data = np.cos(np.tan(x_data[:, 0] + 3))  # cos(tan(x0 + 3))
 
     # 目标表达式字符串
-    target_expr = "x1*x2"
+    target_expr = "cos(tan(x0 + 3))"
 
-    logger.log("DATA_INFO", f"目标表达式: {target_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example", level=3)
+    # 初始表达式字符串
+    initial_expr = "tan(101/100)"
+
+    logger.log("DATA_INFO", f"目标表达式: {target_expr} | 初始表达式: {initial_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example", level=3)
 
     print(f"\n数据信息:")
     print(f"目标表达式: {target_expr}")
-    print(f"初始表达式: {target_expr}")  # 初始表达式和目标表达式相同
+    print(f"初始表达式: {initial_expr}")  # 使用不同于目标的初始表达式
     print(f"x_data 形状: {x_data.shape}")
     print(f"y_data 形状: {y_data.shape}")
 
@@ -166,7 +162,7 @@ def main():
     }
 
     # 模型路径
-    model_path = "checkpoints/checkpoint_epoch_5"
+    model_path = "checkpoints/continuous_flow_final"
 
     # 执行符号回归（使用重新组织后的数据）
     # 支持多阈值推理：每一步采纳所有高于阈值的操作
@@ -191,7 +187,8 @@ def main():
             model_path=model_path,
             x_data=x_data_reorganized,  # 使用重新组织后的数据
             y_data=y_data,
-            n_steps=20      # 推理步数
+            n_steps=20,      # 推理步数
+            initial_expr=initial_expr  # 传入初始表达式
         )
 
         # 判断是否为多阈值模式
@@ -199,21 +196,9 @@ def main():
 
         if is_multi_threshold:
             # 多阈值模式：result 是 {threshold: expression} 字典
-            print(f"\n{'='*60}")
-            print(f"多阈值推理结果 (共 {len(result)} 个阈值)")
-            print(f"{'='*60}")
-
-            # 打印所有阈值的结果
-            for threshold, expression in sorted(result.items(), reverse=True):
-                print(f"\n阈值 {threshold:.4f}: {expression}")
-
-            # 选择MSE最低的结果作为最终预测
-            # 这里简单选择第一个（最低阈值），实际使用中可以根据MSE排序选择
             predicted_expression = list(result.values())[0]  # 最低阈值的结果
 
             print(f"\n{'='*60}")
-            print(f"最终结果对比 (架构v2.0 - 多阈值推理模式)")
-            print(f"{'='*60}")
             print(f"真实表达式: {new_expr_gt}")
             print(f"预测表达式: {predicted_expression}")
             print(f"使用阈值数: {len(result)}")
@@ -222,9 +207,7 @@ def main():
             # 单阈值模式：result 是单个表达式字符串
             predicted_expression = result
             print(f"\n{'='*60}")
-            print(f"最终结果对比 (架构v2.0 - 单最佳操作模式)")
-            print(f"{'='*60}")
-            print(f"真实表达式: {new_expr_gt}")  # 使用更新后的表达式
+            print(f"真实表达式: {new_expr_gt}")
             print(f"预测表达式: {predicted_expression}")
             print(f"{'='*60}")
 
@@ -247,11 +230,7 @@ def main():
                 print(f"  优化后的表达式: {gt_optimized_expr}")
 
             if is_multi_threshold and result:
-                # 多阈值模式：验证所有阈值的结果
-                print(f"\n{'='*60}")
-                print(f"所有阈值的结果质量评估")
-                print(f"{'='*60}")
-
+                # 多阈值模式：验证所有阈值的结果，找出最佳结果
                 results_with_mse = []
                 for threshold, expression in sorted(result.items(), reverse=True):
                     pred_success, pred_optimized_expr, pred_mse = evaluate_expression_with_constants(
@@ -262,24 +241,16 @@ def main():
 
                     if pred_success and pred_optimized_expr is not None:
                         results_with_mse.append((threshold, expression, pred_mse, pred_optimized_expr))
-                        print(f"\n阈值 {threshold:.4f}:")
-                        print(f"  表达式: {expression}")
-                        print(f"  MSE: {pred_mse:.6f}")
-                        print(f"  优化后: {pred_optimized_expr}")
 
                 # 按MSE排序并显示最佳结果
                 if results_with_mse:
                     results_with_mse.sort(key=lambda x: x[2])  # 按MSE排序
                     best_threshold, best_expr, best_mse, best_optimized = results_with_mse[0]
 
-                    print(f"\n{'='*60}")
-                    print(f"最佳结果 (MSE最低)")
-                    print(f"{'='*60}")
-                    print(f"阈值: {best_threshold:.4f}")
-                    print(f"表达式: {best_expr}")
-                    print(f"MSE: {best_mse:.6f}")
-                    print(f"优化后: {best_optimized}")
-                    print(f"{'='*60}")
+                    print(f"\n最佳结果:")
+                    print(f"  表达式: {best_expr}")
+                    print(f"  MSE: {best_mse:.6f}")
+                    print(f"  优化后: {best_optimized}")
 
             else:
                 # 单阈值模式：只验证预测表达式
