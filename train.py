@@ -62,7 +62,7 @@ def main():
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=3e-3, help="学习率")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")

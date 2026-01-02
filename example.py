@@ -11,13 +11,10 @@
 
 import numpy as np
 import re
-import sympy as sp
 import json
 import os
 
-from src.symbolic.data_generator import generate_sample
 from src.training.editflow_manager import EditFlowManager
-from src.utils.logger import Logger
 
 
 def reorganize_data_by_used_variables(expression_str, x_data, y_data):
@@ -69,71 +66,6 @@ def reorganize_data_by_used_variables(expression_str, x_data, y_data):
     return new_expression, new_x_data, new_used_vars
 
 
-def load_sample_from_train_data(target_expression):
-    """从训练数据集中查找包含特定表达式的样本
-
-    Args:
-        target_expression: 目标表达式字符串, 如 "sqrt(Abs(x0))"
-
-    Returns:
-        sample: 包含以下键的字典
-            - 'x': numpy array, 输入数据 (n_points, input_dim)
-            - 'y': numpy array, 目标值 (n_points,)
-            - 'exp_gt': str, 目标表达式
-            - 'exp_cur1': str, 初始corrupted表达式
-            - 'input_dimension': int, 输入维度
-        如果未找到则返回 None
-    """
-    # 确定训练数据文件路径
-    # 优先使用100样本数据集(实际训练过的数据集)
-    train_data_file = "data/flow_samples_100_3dim_100pts_6depth_24len.txt"
-
-    if not os.path.exists(train_data_file):
-        print(f"错误: 找不到训练数据文件")
-        print(f"尝试的路径: {train_data_file}")
-        return None
-
-    print(f"从训练数据文件中查找样本: {train_data_file}")
-    print(f"目标表达式: {target_expression}")
-
-    # 遍历数据文件查找匹配的样本
-    with open(train_data_file, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                sample = json.loads(line.strip())
-                exp_gt = sample.get('exp_gt', '')
-
-                # 去掉空格后比较
-                if exp_gt.replace(' ', '') == target_expression.replace(' ', ''):
-                    print(f"\n✓ 找到匹配样本 (第{line_num}行)")
-                    print(f"  目标表达式: {exp_gt}")
-                    print(f"  初始表达式: {sample.get('exp_cur1', '')}")
-                    print(f"  输入维度: {sample.get('input_dimension', 1)}")
-
-                    # 提取并转换数据
-                    x_values = np.array(sample['x_values'])  # (n_points, input_dim)
-                    y_target = np.array(sample['y_target'])  # (n_points,)
-
-                    print(f"  x_values形状: {x_values.shape}")
-                    print(f"  y_target形状: {y_target.shape}")
-                    print(f"  x范围: [{x_values.min():.3f}, {x_values.max():.3f}]")
-                    print(f"  y范围: [{y_target.min():.3f}, {y_target.max():.3f}]")
-
-                    return {
-                        'x': x_values,
-                        'y': y_target,
-                        'exp_gt': exp_gt,
-                        'exp_cur1': sample.get('exp_cur1', ''),
-                        'input_dimension': sample.get('input_dimension', 1)
-                    }
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"警告: 第{line_num}行解析失败: {e}")
-                continue
-
-    print(f"\n未找到表达式 '{target_expression}' 的样本")
-    return None
-
-
 def main():
     # 设置参数
     args = type('Args', (), {
@@ -149,8 +81,6 @@ def main():
         'max_dim': 3,  # 支持的最大输入维度
         'max_expr_length': 24,  # 最大表达式长度
         "num_timesteps": 1,  # 已弃用：新架构固定t=0，不需要多时间步采样
-        # 多阈值推理参数
-        'action_thresholds': None,  # 使用单最佳操作模式（每步只采纳分数最高的操作）
         # 训练相关参数（推理时也需要，用于兼容性）
         'num_samples': 10000,  # 训练样本数（推理时不使用）
         'batch_size': 32,  # 批次大小（推理时不使用）
@@ -182,16 +112,7 @@ def main():
         'condition_input_normalization': False,  # 是否对输入进行归一化
     })()
 
-    # 创建 Logger 实例，传入debug_mode参数
-    logger = Logger(enabled=True, debug_mode=args.debug)
-
-    # 记录开始日志（使用level=3表示推理日志，受debug控制）
-    logger.log("INFERENCE_START", "开始符号回归实例", "example", level=3)
-
     manager = EditFlowManager(args)
-
-    # 从训练数据集加载样本 - 使用1样本数据集
-    logger.log("DATA_LOADING", "从训练数据集加载样本 (目标表达式: Abs(x1), 初始: 0)", "example", level=3)
 
     # 直接加载1样本数据集
     train_data_file = "data/flow_samples_1_3dim_100pts_6depth_24len.txt"
@@ -212,47 +133,17 @@ def main():
                 target_expr = data['exp_gt']
                 break
 
-    if sample is None:
-        print(f"\n⚠️  错误: 无法从训练数据集加载表达式 '{target_expr}' 的样本")
-        print("请检查:")
-        print("  1. 训练数据文件是否存在")
-        print("  2. 数据集中是否包含该表达式")
-        print("  3. 表达式字符串是否正确")
-        return
-
     # 提取数据
     x_data = sample['x']
     y_data = sample['y']
-    # 使用exp_cur1作为初始表达式（而不是直接使用z0_tokens）
-    # 因为推理时会将表达式字符串转换为tokens，并经过tokenizer编码
-    # 这样才能与训练时的处理保持一致（添加BOS和padding）
     initial_expr = sample['exp_cur1']
-    initial_tokens = sample['z0_tokens']  # 仅用于日志显示
 
     print(f"\n{'='*70}")
-    print(f"使用数据集第1行样本进行测试:")
-    print(f"{'='*70}")
-    print(f"【目标表达式】: {target_expr}")
-    print(f"  → 这是模型需要推导出的最终表达式")
-    print(f"【初始表达式】: {initial_expr}")
-    print(f"  → 这是模型的起点表达式（corrupted version）")
-    print(f"【z0_tokens (初始状态)】: {initial_tokens}")
-    print(f"【z1_tokens (目标状态)】: {sample['z1_tokens']}")
-    print(f"【正确的编辑操作】: DELETE位置0的constant, INSERT abs和x1")
-    print(f"{'='*70}")
-
-    logger.log("DATA_INFO",
-               f"目标表达式: {target_expr} | 初始表达式: {initial_expr} | "
-               f"x_data形状: {x_data.shape} | y_data形状: {y_data.shape}",
-               "example", level=3)
-
-    print(f"\n{'='*70}")
-    print(f"【调试信息】从训练数据集加载的样本:")
-    print(f"{'='*70}")
-    print(f"目标表达式 (Ground Truth): {target_expr}")
-    print(f"初始表达式 (Initial):      {initial_expr}")
-    print(f"x_data 形状: {x_data.shape}")
-    print(f"y_data 形状: {y_data.shape}")
+    print(f"【数据集样本信息】")
+    print(f"  目标表达式: {target_expr}")
+    print(f"  初始表达式: {initial_expr}")
+    print(f"  x_data 形状: {x_data.shape}")
+    print(f"  y_data 形状: {y_data.shape}")
     print(f"{'='*70}\n")
 
     # 根据表达式实际使用的变量重新组织数据
@@ -263,115 +154,56 @@ def main():
     # 模型路径
     model_path = "checkpoints/continuous_flow_final"
 
-    # 执行符号回归（使用重新组织后的数据）
-    # 支持多阈值推理：每一步采纳所有高于阈值的操作
-    logger.log("INFERENCE_START",
-               f"开始符号回归推理 | 模型路径: {model_path} | 推理步数: {5} | "
-               f"方法: 贪婪搜索 | 架构: 迭代优化（北极星模式） | "
-               f"阈值: {args.action_thresholds}",
-               "example", level=3)
-
     # 检查是否有训练好的检查点
     import os
-    result = None  # 初始化result变量
-    is_multi_threshold = False
 
     if not os.path.exists(model_path):
         print(f"\n⚠️  检查点不存在: {model_path}")
         print("跳过推理步骤。请先训练模型：")
         print("  python train.py --num_samples 10000 --num_epochs 30")
-        predicted_expression = ""
-    else:
-        result = manager.symbolic_regression(
-            model_path=model_path,
-            x_data=x_data_reorganized,  # 使用重新组织后的数据
-            y_data=y_data,
-            n_steps=5,      # 推理步数
-            initial_expr=initial_expr  # 传入表达式字符串（而非token列表）
-        )
+        return
 
-        # 判断是否为多阈值模式
-        is_multi_threshold = isinstance(result, dict)
+    # 执行符号回归
+    predicted_expression = manager.symbolic_regression(
+        model_path=model_path,
+        x_data=x_data_reorganized,
+        y_data=y_data,
+        n_steps=1,
+        initial_expr=initial_expr
+    )
 
-        if is_multi_threshold:
-            # 多阈值模式：result 是 {threshold: expression} 字典
-            predicted_expression = list(result.values())[0]  # 最低阈值的结果
+    print(f"\n{'='*70}")
+    print(f"【推理结果】")
+    print(f"  目标表达式: {new_expr_gt}")
+    print(f"  预测表达式: {predicted_expression}")
+    print(f"{'='*70}")
 
-            print(f"\n{'='*70}")
-            print(f"【推理结果】多阈值模式:")
-            print(f"  目标表达式: {new_expr_gt}")
-            print(f"  预测表达式: {predicted_expression}")
-            print(f"  使用阈值数: {len(result)}")
-            print(f"{'='*60}")
-        else:
-            # 单阈值模式：result 是单个表达式字符串
-            predicted_expression = result
-            print(f"\n{'='*70}")
-            print(f"【推理结果】单阈值模式:")
-            print(f"  目标表达式: {new_expr_gt}")
-            print(f"  预测表达式: {predicted_expression}")
-            print(f"{'='*60}")
+    # 验证表达式质量
+    from src.symbolic.symbolic_utils import evaluate_expression_with_constants
 
-    logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression} | 多阈值模式: {is_multi_threshold}", "example", level=3)
+    # 验证目标表达式
+    gt_success, gt_optimized_expr, gt_mse = evaluate_expression_with_constants(
+        tree_str=new_expr_gt,
+        x_values=x_data_reorganized,
+        y_values=y_data
+    )
 
-    # 验证表达式质量（支持常数优化）
-    if predicted_expression:
-        from src.symbolic.symbolic_utils import evaluate_expression_with_constants
-        try:
-            # 计算真实表达式的质量作为对比
-            gt_success, gt_optimized_expr, gt_mse = evaluate_expression_with_constants(
-                tree_str=new_expr_gt,
-                x_values=x_data_reorganized,
-                y_values=y_data
-            )
+    print(f"\n【目标表达式质量】")
+    print(f"  MSE: {gt_mse:.6f}")
+    if gt_optimized_expr != new_expr_gt:
+        print(f"  优化后: {gt_optimized_expr}")
 
-            if gt_success and gt_optimized_expr is not None:
-                print(f"\n真实表达式质量:")
-                print(f"  MSE: {gt_mse:.6f}")
-                print(f"  优化后的表达式: {gt_optimized_expr}")
+    # 验证预测表达式
+    pred_success, pred_optimized_expr, pred_mse = evaluate_expression_with_constants(
+        tree_str=predicted_expression,
+        x_values=x_data_reorganized,
+        y_values=y_data
+    )
 
-            if is_multi_threshold and result:
-                # 多阈值模式：验证所有阈值的结果，找出最佳结果
-                results_with_mse = []
-                for threshold, expression in sorted(result.items(), reverse=True):
-                    pred_success, pred_optimized_expr, pred_mse = evaluate_expression_with_constants(
-                        tree_str=expression,
-                        x_values=x_data_reorganized,
-                        y_values=y_data
-                    )
-
-                    if pred_success and pred_optimized_expr is not None:
-                        results_with_mse.append((threshold, expression, pred_mse, pred_optimized_expr))
-
-                # 按MSE排序并显示最佳结果
-                if results_with_mse:
-                    results_with_mse.sort(key=lambda x: x[2])  # 按MSE排序
-                    best_threshold, best_expr, best_mse, best_optimized = results_with_mse[0]
-
-                    print(f"\n最佳结果:")
-                    print(f"  表达式: {best_expr}")
-                    print(f"  MSE: {best_mse:.6f}")
-                    print(f"  优化后: {best_optimized}")
-
-            else:
-                # 单阈值模式：只验证预测表达式
-                pred_success, pred_optimized_expr, pred_mse = evaluate_expression_with_constants(
-                    tree_str=predicted_expression,
-                    x_values=x_data_reorganized,
-                    y_values=y_data
-                )
-
-                if pred_success and pred_optimized_expr is not None:
-                    print(f"\n预测表达式质量:")
-                    print(f"  MSE: {pred_mse:.6f}")
-                    print(f"  优化后的表达式: {pred_optimized_expr}")
-                else:
-                    print(f"\n验证失败: 无法计算预测表达式")
-
-        except Exception as e:
-            print(f"\n验证失败: {e}")
-            import traceback
-            traceback.print_exc()
+    print(f"\n【预测表达式质量】")
+    print(f"  MSE: {pred_mse:.6f}")
+    if pred_optimized_expr != predicted_expression:
+        print(f"  优化后: {pred_optimized_expr}")
 
 
 if __name__ == "__main__":

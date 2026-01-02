@@ -55,9 +55,11 @@ pkill -9 accelerate
 - **样本级别超时保护**：使用with_timeout装饰器，为每个样本设置超时时间，防止单个样本生成时间过长导致整个批次卡死。
 - **表达式生成时递归深度限制**：为了防止无限递归，设置最大递归深度，超过该深度时抛出异常。
 
-## 监控GPU使用情况
+## 监控GPU和CPU使用情况
 ```bash
 watch -n 1 -d nvidia-smi
+
+watch -n 2 'ps aux | grep "train.py" | grep -v grep | awk "{print \$3,\$2}" | head -3'
 ```
 
 ## tmux 将终端任务挂到后台运行
