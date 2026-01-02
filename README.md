@@ -83,7 +83,7 @@ accelerate launch \
     --dynamo_backend=no \
     train.py \
     --num_epochs 50 \
-    --num_samples 100\
+    --num_samples 1\
     --batch_size 32 \
     --debug 1
 

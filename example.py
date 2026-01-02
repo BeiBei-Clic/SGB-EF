@@ -12,6 +12,8 @@
 import numpy as np
 import re
 import sympy as sp
+import json
+import os
 
 from src.symbolic.data_generator import generate_sample
 from src.training.editflow_manager import EditFlowManager
@@ -67,6 +69,71 @@ def reorganize_data_by_used_variables(expression_str, x_data, y_data):
     return new_expression, new_x_data, new_used_vars
 
 
+def load_sample_from_train_data(target_expression):
+    """从训练数据集中查找包含特定表达式的样本
+
+    Args:
+        target_expression: 目标表达式字符串, 如 "sqrt(Abs(x0))"
+
+    Returns:
+        sample: 包含以下键的字典
+            - 'x': numpy array, 输入数据 (n_points, input_dim)
+            - 'y': numpy array, 目标值 (n_points,)
+            - 'exp_gt': str, 目标表达式
+            - 'exp_cur1': str, 初始corrupted表达式
+            - 'input_dimension': int, 输入维度
+        如果未找到则返回 None
+    """
+    # 确定训练数据文件路径
+    # 优先使用100样本数据集(实际训练过的数据集)
+    train_data_file = "data/flow_samples_100_3dim_100pts_6depth_24len.txt"
+
+    if not os.path.exists(train_data_file):
+        print(f"错误: 找不到训练数据文件")
+        print(f"尝试的路径: {train_data_file}")
+        return None
+
+    print(f"从训练数据文件中查找样本: {train_data_file}")
+    print(f"目标表达式: {target_expression}")
+
+    # 遍历数据文件查找匹配的样本
+    with open(train_data_file, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            try:
+                sample = json.loads(line.strip())
+                exp_gt = sample.get('exp_gt', '')
+
+                # 去掉空格后比较
+                if exp_gt.replace(' ', '') == target_expression.replace(' ', ''):
+                    print(f"\n✓ 找到匹配样本 (第{line_num}行)")
+                    print(f"  目标表达式: {exp_gt}")
+                    print(f"  初始表达式: {sample.get('exp_cur1', '')}")
+                    print(f"  输入维度: {sample.get('input_dimension', 1)}")
+
+                    # 提取并转换数据
+                    x_values = np.array(sample['x_values'])  # (n_points, input_dim)
+                    y_target = np.array(sample['y_target'])  # (n_points,)
+
+                    print(f"  x_values形状: {x_values.shape}")
+                    print(f"  y_target形状: {y_target.shape}")
+                    print(f"  x范围: [{x_values.min():.3f}, {x_values.max():.3f}]")
+                    print(f"  y范围: [{y_target.min():.3f}, {y_target.max():.3f}]")
+
+                    return {
+                        'x': x_values,
+                        'y': y_target,
+                        'exp_gt': exp_gt,
+                        'exp_cur1': sample.get('exp_cur1', ''),
+                        'input_dimension': sample.get('input_dimension', 1)
+                    }
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"警告: 第{line_num}行解析失败: {e}")
+                continue
+
+    print(f"\n未找到表达式 '{target_expression}' 的样本")
+    return None
+
+
 def main():
     # 设置参数
     args = type('Args', (), {
@@ -83,7 +150,7 @@ def main():
         'max_expr_length': 24,  # 最大表达式长度
         "num_timesteps": 1,  # 已弃用：新架构固定t=0，不需要多时间步采样
         # 多阈值推理参数
-        'action_thresholds': "0.1,0.018",  # 多阈值推理的操作采纳阈值（逗号分隔），None表示单最佳操作模式
+        'action_thresholds': None,  # 使用单最佳操作模式（每步只采纳分数最高的操作）
         # 训练相关参数（推理时也需要，用于兼容性）
         'num_samples': 10000,  # 训练样本数（推理时不使用）
         'batch_size': 32,  # 批次大小（推理时不使用）
@@ -97,7 +164,7 @@ def main():
         'cache_size': 1000,  # 数据缓存大小（推理时不使用）
         'num_workers': 4,  # 数据加载工作进程数（推理时不使用）
         'save_dir': 'checkpoints',  # 模型保存目录（推理时不使用）
-        'debug': False,  # 是否启用调试模式
+        'debug': True,  # 【启用调试模式以查看详细推理过程】
         # LLaMA模型架构参数
         'hidden_dim': 512,  # LLaMA隐藏层维度 (匹配checkpoint)
         'n_layers': 8,  # LLaMA Transformer层数 (匹配checkpoint)
@@ -123,43 +190,75 @@ def main():
 
     manager = EditFlowManager(args)
 
-    # 生成测试数据 - 使用 cos(tan(x0 + 3)) 作为目标表达式
-    logger.log("DATA_GENERATION", "开始生成测试数据 (目标表达式: cos(tan(x0 + 3)))", "example", level=3)
+    # 从训练数据集加载样本 - 使用1样本数据集
+    logger.log("DATA_LOADING", "从训练数据集加载样本 (目标表达式: Abs(x1), 初始: 0)", "example", level=3)
 
-    # 直接构造 cos(tan(x0 + 3)) 的数据
-    np.random.seed(42)
-    n_points = 100
-    input_dimension = 1  # 只需要1维，使用x0
+    # 直接加载1样本数据集
+    train_data_file = "data/flow_samples_1_3dim_100pts_6depth_24len.txt"
+    sample = None
+    with open(train_data_file, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f, 1):
+            if i == 1:  # 使用第1行（也是唯一一行）
+                data = json.loads(line.strip())
+                sample = {
+                    'x': np.array(data['x_values']),
+                    'y': np.array(data['y_target']),
+                    'exp_gt': data['exp_gt'],
+                    'exp_cur1': data['exp_cur1'],
+                    'input_dimension': data['input_dimension'],
+                    'z0_tokens': data['z0_tokens'],
+                    'z1_tokens': data['z1_tokens']
+                }
+                target_expr = data['exp_gt']
+                break
 
-    # 生成随机数据
-    x_data = np.random.randn(n_points, input_dimension) * 2  # 使用标准正态分布
-    y_data = np.cos(np.tan(x_data[:, 0] + 3))  # cos(tan(x0 + 3))
+    if sample is None:
+        print(f"\n⚠️  错误: 无法从训练数据集加载表达式 '{target_expr}' 的样本")
+        print("请检查:")
+        print("  1. 训练数据文件是否存在")
+        print("  2. 数据集中是否包含该表达式")
+        print("  3. 表达式字符串是否正确")
+        return
 
-    # 目标表达式字符串
-    target_expr = "cos(tan(x0 + 3))"
+    # 提取数据
+    x_data = sample['x']
+    y_data = sample['y']
+    # 使用exp_cur1作为初始表达式（而不是直接使用z0_tokens）
+    # 因为推理时会将表达式字符串转换为tokens，并经过tokenizer编码
+    # 这样才能与训练时的处理保持一致（添加BOS和padding）
+    initial_expr = sample['exp_cur1']
+    initial_tokens = sample['z0_tokens']  # 仅用于日志显示
 
-    # 初始表达式字符串
-    initial_expr = "tan(101/100)"
+    print(f"\n{'='*70}")
+    print(f"使用数据集第1行样本进行测试:")
+    print(f"{'='*70}")
+    print(f"【目标表达式】: {target_expr}")
+    print(f"  → 这是模型需要推导出的最终表达式")
+    print(f"【初始表达式】: {initial_expr}")
+    print(f"  → 这是模型的起点表达式（corrupted version）")
+    print(f"【z0_tokens (初始状态)】: {initial_tokens}")
+    print(f"【z1_tokens (目标状态)】: {sample['z1_tokens']}")
+    print(f"【正确的编辑操作】: DELETE位置0的constant, INSERT abs和x1")
+    print(f"{'='*70}")
 
-    logger.log("DATA_INFO", f"目标表达式: {target_expr} | 初始表达式: {initial_expr} | x_data形状: {x_data.shape} | y_data形状: {y_data.shape}", "example", level=3)
+    logger.log("DATA_INFO",
+               f"目标表达式: {target_expr} | 初始表达式: {initial_expr} | "
+               f"x_data形状: {x_data.shape} | y_data形状: {y_data.shape}",
+               "example", level=3)
 
-    print(f"\n数据信息:")
-    print(f"目标表达式: {target_expr}")
-    print(f"初始表达式: {initial_expr}")  # 使用不同于目标的初始表达式
+    print(f"\n{'='*70}")
+    print(f"【调试信息】从训练数据集加载的样本:")
+    print(f"{'='*70}")
+    print(f"目标表达式 (Ground Truth): {target_expr}")
+    print(f"初始表达式 (Initial):      {initial_expr}")
     print(f"x_data 形状: {x_data.shape}")
     print(f"y_data 形状: {y_data.shape}")
+    print(f"{'='*70}\n")
 
     # 根据表达式实际使用的变量重新组织数据
     new_expr_gt, x_data_reorganized, new_used_vars = reorganize_data_by_used_variables(
         target_expr, x_data, y_data
     )
-
-    # 创建一个类似sample的字典以保持兼容性
-    sample = {
-        'exp_gt': new_expr_gt,
-        'x': x_data_reorganized,
-        'y': y_data
-    }
 
     # 模型路径
     model_path = "checkpoints/continuous_flow_final"
@@ -167,7 +266,7 @@ def main():
     # 执行符号回归（使用重新组织后的数据）
     # 支持多阈值推理：每一步采纳所有高于阈值的操作
     logger.log("INFERENCE_START",
-               f"开始符号回归推理 | 模型路径: {model_path} | 推理步数: {20} | "
+               f"开始符号回归推理 | 模型路径: {model_path} | 推理步数: {5} | "
                f"方法: 贪婪搜索 | 架构: 迭代优化（北极星模式） | "
                f"阈值: {args.action_thresholds}",
                "example", level=3)
@@ -187,8 +286,8 @@ def main():
             model_path=model_path,
             x_data=x_data_reorganized,  # 使用重新组织后的数据
             y_data=y_data,
-            n_steps=20,      # 推理步数
-            initial_expr=initial_expr  # 传入初始表达式
+            n_steps=5,      # 推理步数
+            initial_expr=initial_expr  # 传入表达式字符串（而非token列表）
         )
 
         # 判断是否为多阈值模式
@@ -198,17 +297,19 @@ def main():
             # 多阈值模式：result 是 {threshold: expression} 字典
             predicted_expression = list(result.values())[0]  # 最低阈值的结果
 
-            print(f"\n{'='*60}")
-            print(f"真实表达式: {new_expr_gt}")
-            print(f"预测表达式: {predicted_expression}")
-            print(f"使用阈值数: {len(result)}")
+            print(f"\n{'='*70}")
+            print(f"【推理结果】多阈值模式:")
+            print(f"  目标表达式: {new_expr_gt}")
+            print(f"  预测表达式: {predicted_expression}")
+            print(f"  使用阈值数: {len(result)}")
             print(f"{'='*60}")
         else:
             # 单阈值模式：result 是单个表达式字符串
             predicted_expression = result
-            print(f"\n{'='*60}")
-            print(f"真实表达式: {new_expr_gt}")
-            print(f"预测表达式: {predicted_expression}")
+            print(f"\n{'='*70}")
+            print(f"【推理结果】单阈值模式:")
+            print(f"  目标表达式: {new_expr_gt}")
+            print(f"  预测表达式: {predicted_expression}")
             print(f"{'='*60}")
 
     logger.log("INFERENCE_COMPLETE", f"符号回归完成 | 预测表达式: {predicted_expression} | 多阈值模式: {is_multi_threshold}", "example", level=3)

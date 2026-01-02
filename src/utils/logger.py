@@ -397,7 +397,7 @@ class Logger:
     # ==================== 编辑操作日志 ====================
 
     def log_u_mask_split(self, tensor_name, u_mask, x_t, vocab_size, context="", level=3):
-        """按语义拆分记录u_mask（INSERT/SUBSTITUTE/DELETE三个独立张量），按位置分行输出"""
+        """按语义拆分记录u_mask（INSERT/DELETE/SUBSTITUTE/KEEP四个独立张量），按位置分行输出"""
         if not self.enabled:
             return
 
@@ -425,21 +425,25 @@ class Logger:
                 if x_t[batch_idx, pos].item() == 0:  # pad token
                     break
 
-                # INSERT部分：前vocab_size维
+                # INSERT部分：前vocab_size维（索引 0 ~ vocab_size-1）
                 ins_vals = u_mask[batch_idx, pos, :vocab_size].cpu().numpy()
                 ins_str = ", ".join([f"{v:.0f}" for v in ins_vals])
 
-                # SUBSTITUTE部分：中间vocab_size维
-                sub_vals = u_mask[batch_idx, pos, vocab_size:2*vocab_size].cpu().numpy()
+                # DELETE部分：第vocab_size位（索引 vocab_size）
+                del_val = u_mask[batch_idx, pos, vocab_size].cpu().item()
+
+                # SUBSTITUTE部分：vocab_size+1 ~ 2*vocab_size（偏移+1）
+                sub_vals = u_mask[batch_idx, pos, vocab_size+1:2*vocab_size+1].cpu().numpy()
                 sub_str = ", ".join([f"{v:.0f}" for v in sub_vals])
 
-                # DELETE部分：最后1维
-                del_val = u_mask[batch_idx, pos, -1].cpu().item()
+                # KEEP部分：最后1位（索引 2*vocab_size+1，即-1）
+                keep_val = u_mask[batch_idx, pos, -1].cpu().item()
 
                 msg += f"\n  pos{pos}(x_t={x_t[batch_idx, pos].item()}):"
                 msg += f"\n    INSERT:    [{ins_str}]"
-                msg += f"\n    SUBSTITUTE: [{sub_str}]"
                 msg += f"\n    DELETE:    {del_val:.0f}"
+                msg += f"\n    SUBSTITUTE: [{sub_str}]"
+                msg += f"\n    KEEP:      {keep_val:.0f}"
 
             # 根据级别选择日志文件
             if level == 1:
@@ -478,10 +482,11 @@ class Logger:
                     msg += f"\n    Position {pos}: [PAD] stop"
                     break
 
-                # 提取三个部分
+                # 提取四个部分（按新顺序：INS, DEL, SUB, KEEP）
                 ins_part = u_mask[batch_idx, pos, :vocab_size]  # 插入部分 [vocab_size]
-                sub_part = u_mask[batch_idx, pos, vocab_size:2*vocab_size]  # 替换部分 [vocab_size]
-                del_part = u_mask[batch_idx, pos, -1]  # 删除部分 [1]
+                del_part = u_mask[batch_idx, pos, vocab_size]  # 删除部分 [1]
+                sub_part = u_mask[batch_idx, pos, vocab_size+1:2*vocab_size+1]  # 替换部分 [vocab_size]
+                keep_part = u_mask[batch_idx, pos, -1]  # KEEP部分 [1]
 
                 # 找出非零位置
                 ins_nonzero = ins_part.nonzero(as_tuple=False).squeeze(-1)
@@ -495,10 +500,11 @@ class Logger:
                 msg += f"\n      INSERT[{ins_count}]: " + (
                     f"ids={[int(t.item()) for t in ins_nonzero]}" if ins_count > 0 else "[]"
                 )
+                msg += f"\n      DELETE: {float(del_part.item()):.1f}"
                 msg += f"\n      SUBSTITUTE[{sub_count}]: " + (
                     f"ids={[int(t.item()) for t in sub_nonzero]}" if sub_count > 0 else "[]"
                 )
-                msg += f"\n      DELETE: {float(del_part.item()):.1f}"
+                msg += f"\n      KEEP: {float(keep_part.item()):.1f}"
 
         # 根据级别选择日志文件
         if level == 1:
@@ -524,30 +530,37 @@ class Logger:
         x_seq_len = u_mask_sample.shape[0]
         pad_token_id = 0  # 假设pad token ID为0
 
-        for pos in range(x_seq_len):
+        for pos in range(min(x_seq_len, len(x_t_sample))):
             # 跳过pad位置
+            if pos >= len(x_t_sample):
+                break
             if x_t_sample[pos].item() == pad_token_id:
                 break
 
             # 检查是否需要操作
             if u_mask_sample[pos].any():
-                # 检查插入操作 (前vocab_size维)
+                # 检查插入操作 (前vocab_size维，索引 0 ~ vocab_size-1)
                 ins_idx = u_mask_sample[pos, :vocab_size].nonzero(as_tuple=False)
                 if ins_idx.numel() > 0:
                     token_id = ins_idx[0].item()
                     ops.append(f"pos{pos}: INSERT id({token_id})")
 
-                # 检查替换操作 (中间vocab_size维, 偏移vocab_size)
-                sub_idx = u_mask_sample[pos, vocab_size:2*vocab_size].nonzero(as_tuple=False)
+                # 检查删除操作 (第vocab_size位，索引 vocab_size)
+                if u_mask_sample[pos, vocab_size].item():
+                    current_id = x_t_sample[pos].item()
+                    ops.append(f"pos{pos}: DELETE id({current_id})")
+
+                # 检查替换操作 (vocab_size+1 ~ 2*vocab_size，偏移+1)
+                sub_idx = u_mask_sample[pos, vocab_size+1:2*vocab_size+1].nonzero(as_tuple=False)
                 if sub_idx.numel() > 0:
                     token_id = sub_idx[0].item()
                     current_id = x_t_sample[pos].item()
                     ops.append(f"pos{pos}: SUBSTITUTE id({current_id})→id({token_id})")
 
-                # 检查删除操作 (最后一维)
+                # 检查KEEP操作 (最后一位，索引 2*vocab_size+1，即-1)
                 if u_mask_sample[pos, -1].item():
                     current_id = x_t_sample[pos].item()
-                    ops.append(f"pos{pos}: DELETE id({current_id})")
+                    ops.append(f"pos{pos}: KEEP id({current_id})")
 
             # 限制显示数量
             if len(ops) >= max_ops:
@@ -653,6 +666,21 @@ class Logger:
 
         self.log("DELETE_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda_del={lambda_rate:.4f} | above_threshold={above_threshold}",
+                "greedy_search", level=level)
+
+    def log_greedy_search_keep_probs(self, position, current_token, lambda_rate, above_threshold, level=3):
+        """记录保持操作的预测概率"""
+        if not self.enabled:
+            return
+
+        # level=2和level=3需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return
+        if level == 3 and not self.debug_mode:
+            return
+
+        self.log("KEEP_PROBS_DEBUG",
+                f"位置{position}(当前={current_token}): lambda_keep={lambda_rate:.4f} | above_threshold={above_threshold}",
                 "greedy_search", level=level)
 
     # ==================== 崩溃日志 ====================

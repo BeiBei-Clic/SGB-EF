@@ -193,11 +193,19 @@ class EditFlowManager:
             train_indices = indices[:train_size]
             test_indices = indices[train_size:]
 
-            train_dataset = Subset(full_dataset, train_indices)
-            test_dataset = Subset(full_dataset, test_indices)
-
-            train_size_estimate = len(train_indices)
-            test_size_estimate = len(test_indices)
+            # 如果只有1个样本，让它既用于训练又用于测试
+            if total_size == 1:
+                if self.accelerator.is_local_main_process:
+                    print("警告: 只有1个样本，将同时用于训练和测试")
+                train_dataset = full_dataset
+                test_dataset = full_dataset
+                train_size_estimate = 1
+                test_size_estimate = 1
+            else:
+                train_dataset = Subset(full_dataset, train_indices)
+                test_dataset = Subset(full_dataset, test_indices)
+                train_size_estimate = len(train_indices)
+                test_size_estimate = len(test_indices)
 
             if self.accelerator.is_local_main_process:
                 print(f"非流式模式: 训练集 {train_size_estimate} 样本, 测试集 {test_size_estimate} 样本")
@@ -434,9 +442,9 @@ class EditFlowManager:
             input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask
         )
 
-        # 合并三个速率为一个tensor（与旧接口保持一致）
-        ins_rate, del_rate, sub_rate = output['rates']
-        pred_rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
+        # 合并四个速率为一个tensor（添加KEEP操作）
+        ins_rate, del_rate, sub_rate, keep_rate = output['rates']
+        pred_rates = torch.cat([ins_rate, del_rate, sub_rate, keep_rate], dim=-1)
 
         # 记录模型输出的完整值（仅在debug模式下记录）
         if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
@@ -477,28 +485,35 @@ class EditFlowManager:
         effective_vocab_size = forward_results['vocab_size']
         gap_token = self.tokenizer.convert_tokens_to_ids('<gap>')
 
-        # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
-        # 因此索引 0=插入, 1=删除, 2=替换
+        # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate, keep_rate]
+        # 因此索引 0=插入, 1=删除, 2=替换, 3=保持
         lambda_ins = pred_rates[:, :, 0:1]  # 插入速率
         lambda_del = pred_rates[:, :, 1:2]  # 删除速率
         lambda_sub = pred_rates[:, :, 2:3]  # 替换速率
+        lambda_keep = pred_rates[:, :, 3:4]  # 保持速率
 
         # 关键修复：直接使用logits而不是概率
         # 将速率作为log空间加到logits上
         ins_logits = forward_results['pred_ins_logits'] + torch.log(lambda_ins.clamp(min=1e-8))
         sub_logits = forward_results['pred_sub_logits'] + torch.log(lambda_sub.clamp(min=1e-8))
         del_logits = torch.log(lambda_del.clamp(min=1e-8))
+        keep_logits = torch.log(lambda_keep.clamp(min=1e-8))  # KEEP操作的logits
 
         # 🔧 修复：不再在这里应用attention_mask
         # attention_mask会在loss计算时通过u_mask自然处理
         # 避免在这里设置-1e9导致log_softmax后出现-inf污染
 
         # u_cat_x 现在是logits而不是概率
-        # 形状: [batch, x_seq_len, 2*vocab_size+1]
-        u_cat_x = torch.cat([ins_logits, sub_logits, del_logits], dim=-1)
+        # 形状: [batch, x_seq_len, 2*vocab_size+2] (添加KEEP操作)
+        # 🔧 修复：调整顺序以匹配u_mask的维度定义和rates_head的输出顺序
+        # 统一顺序：[INS(vocab_size) | DEL(1) | SUB(vocab_size) | KEEP(1)]
+        #           位置: 0~v-1          位置: v   位置: v+1~2v      位置: 2v+1(-1)
+        # 其中 v = vocab_size
+        # 拼接顺序：ins | del | sub | keep (与rates_head的[ins, del, sub, keep]一致)
+        u_cat_x = torch.cat([ins_logits, del_logits, sub_logits, keep_logits], dim=-1)
 
         # u_z 是 Z 空间（扩展空间，含gap重复）的预测速率
-        # 形状: [batch, z_seq_len, 2*vocab_size+1]
+        # 形状: [batch, z_seq_len, 2*vocab_size+2] (添加KEEP操作)
         u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
         # 生成编辑操作掩码：使用双索引追踪逻辑
@@ -936,23 +951,39 @@ class EditFlowManager:
         # 处理初始表达式
         if initial_expr is None:
             initial_expr = sp.Symbol('x0')
+            # 将sympy表达式转换为前缀表达式tokens
+            initial_expr_str = expr_to_tree(initial_expr)
+            current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
         elif isinstance(initial_expr, str):
             # 将字符串表达式转换为sympy表达式
             initial_expr = sp.sympify(initial_expr)
-
-        # 将sympy表达式转换为前缀表达式tokens
-        initial_expr_str = expr_to_tree(initial_expr)
-        current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
+            # 将sympy表达式转换为前缀表达式tokens
+            initial_expr_str = expr_to_tree(initial_expr)
+            current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
+        elif isinstance(initial_expr, list):
+            # 直接传入token列表（用于从训练数据中恢复）
+            current_tokens = initial_expr
+            # 尝试将tokens转换回sympy表达式（用于计算预测值）
+            # 注意：这个转换可能失败，因为tokenizer不支持完全双向转换
+            # 我们先尝试评估，如果失败则使用默认值
+            initial_expr = None  # 标记为需要特殊处理
 
         if self.accelerator.is_local_main_process:
             print(f"初始表达式: {initial_expr}")
             print(f"初始tokens: {current_tokens}")
 
         # 计算初始表达式在x_data上的预测值
-        success, y_pred = evaluate_expression_safe(initial_expr, x_data)
+        if initial_expr is not None:
+            success, y_pred = evaluate_expression_safe(initial_expr, x_data)
+        else:
+            # 如果无法从tokens恢复表达式，使用常量0作为初始预测
+            # 这不是最优解，但可以避免程序崩溃
+            success = False
+            y_pred = [0.0] * len(y_data)
+
         if not success:
-            self.logger.error("INITIAL_EXPR_FAILED", f"无法计算初始表达式 '{initial_expr}' 的预测值", "inference")
-            return ""
+            self.logger.log("INITIAL_EXPR_WARN", f"无法计算初始表达式的预测值，使用零初始化", "inference", level=1)
+            # 继续执行，不返回，因为条件编码器使用的是y_target而非残差
 
         # 计算残差：真实值 - 预测值（仅用于评估，不作为条件）
         residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)

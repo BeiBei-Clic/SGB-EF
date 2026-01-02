@@ -160,12 +160,12 @@ class LlamaEditFlowBackbone(nn.Module):
 
         # 6. 编辑流五大输出头 (论文公式13-15)
 
-        # 预测操作类型概率 (Rates) - 使用softmax归一化，确保三种操作互斥
+        # 预测操作类型概率 (Rates) - 使用softmax归一化，确保四种操作互斥
         self.rates_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 3)  # 输出3维：[ins_logit, del_logit, sub_logit]
+            nn.Linear(hidden_dim // 2, 4)  # 输出4维：[ins_logit, del_logit, sub_logit, keep_logit]
         )
 
         # 预测分布 (Distributions)
@@ -251,13 +251,14 @@ class LlamaEditFlowBackbone(nn.Module):
         # H. 计算五大输出
 
         # 操作类型预测（使用softmax归一化，确保互斥）
-        rates_logits = self.rates_head(hidden_states)  # (batch_size, seq_len, 3)
-        rates_probs = F.softmax(rates_logits, dim=-1)   # (batch_size, seq_len, 3)
+        rates_logits = self.rates_head(hidden_states)  # (batch_size, seq_len, 4)
+        rates_probs = F.softmax(rates_logits, dim=-1)   # (batch_size, seq_len, 4)
 
-        # 分解为三个操作的概率（每个都是batch_size, seq_len, 1）
+        # 分解为四个操作的概率（每个都是batch_size, seq_len, 1）
         ins_rate = rates_probs[:, :, 0:1]  # 插入概率
         del_rate = rates_probs[:, :, 1:2]  # 删除概率
         sub_rate = rates_probs[:, :, 2:3]  # 替换概率
+        keep_rate = rates_probs[:, :, 3:4]  # 保持原样概率
 
         # 词汇分布预测
         ins_logits = self.ins_vocab_head(hidden_states)
@@ -274,13 +275,14 @@ class LlamaEditFlowBackbone(nn.Module):
             ins_rate = ins_rate * attention_mask.unsqueeze(-1)
             del_rate = del_rate * attention_mask.unsqueeze(-1)
             sub_rate = sub_rate * attention_mask.unsqueeze(-1)
+            keep_rate = keep_rate * attention_mask.unsqueeze(-1)
 
         # 计算概率分布
         insert_probs = F.softmax(ins_logits, dim=-1)
         substitute_probs = F.softmax(sub_logits, dim=-1)
 
         return {
-            'rates': (ins_rate, del_rate, sub_rate),
+            'rates': (ins_rate, del_rate, sub_rate, keep_rate),
             'insert_logits': ins_logits,
             'substitute_logits': sub_logits,
             'insert_probs': insert_probs,

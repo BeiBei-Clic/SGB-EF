@@ -3,6 +3,7 @@ EditFlow连续流匹配的核心组件
 """
 
 import torch
+import torch.nn.functional as F
 import json
 import os
 import time
@@ -85,9 +86,9 @@ class ContinuousFlowLoss:
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
                            gap_token: int, tokenizer, x_t: torch.Tensor) -> torch.Tensor:
         """
-        根据论文Fig. 13的双索引追踪逻辑，生成正确的编辑操作掩码
+        使用明确的位置映射表生成正确的编辑操作掩码
 
-        核心思想：在Z空间（含gap）遍历，动态维护X空间（无gap）的索引指针
+        核心改进：构建Z空间到X空间的明确映射表，避免双索引遍历导致的位置错位问题
 
         Args:
             z_t: 当前状态（Z空间，含gap）[batch, z_seq_len]
@@ -95,86 +96,107 @@ class ContinuousFlowLoss:
             vocab_size: 词汇表大小
             gap_token: gap token的ID
             tokenizer: 分词器
-            x_t: 当前状态（X空间，无gap）[batch, x_seq_len] - 用于双索引映射
+            x_t: 当前状态（X空间，无gap）[batch, x_seq_len]
 
         Returns:
-            u_mask: 编辑操作掩码 [batch, x_seq_len, 2*vocab_size+1]
-                    使用one-hot编码：u_mask[b, pos, op_id] = 1 表示在位置pos执行操作op_id
-                    每个位置对应：[vocab_size个插入操作, vocab_size个替换操作, 1个删除操作]
+            u_mask: 编辑操作掩码 [batch, x_seq_len, 2*vocab_size+2]
+                    维度布局：[INS(vocab_size) | DEL(1) | SUB(vocab_size) | KEEP(1)]
         """
         batch_size, z_seq_len = z_t.shape
         x_seq_len = x_t.shape[1]
-        n_ops = 2 * vocab_size + 1  # 插入(vocab_size) + 替换(vocab_size) + 删除(1)
+        n_ops = 2 * vocab_size + 2  # 插入(vocab_size) + 删除(1) + 替换(vocab_size) + KEEP(1)
 
         pad_token = tokenizer.convert_tokens_to_ids('<pad>')
 
         # 初始化输出掩码（在X空间）
-        # ✅ 使用one-hot编码：u_mask[b, pos, op_id] = 1 表示在位置pos执行操作op_id
-        # 即使需要多次插入同一token，也只标记一次（因为这是操作类型，不是数量）
         u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.int, device=z_t.device)
 
-        # 对每个样本进行双索引遍历（论文Fig. 13的核心逻辑）
+        # 对每个样本进行处理
         for b in range(batch_size):
-            x_t_index = -1  # X空间指针初始化为-1（指向x_t的前一个位置）
-            first_valid_index = 0  # 记录第一个有效token的位置，用于处理开头的gap
+            # === 步骤1：构建Z空间到X空间的位置映射表 ===
+            z_to_x_map = {}  # {z_pos: x_pos or None}
+            insert_positions = []  # 记录所有gap位置，用于后续INSERT操作映射
 
-            for i in range(z_seq_len):
-                token_t = z_t[b, i].item()
-                token_1 = z_1[b, i].item()
+            x_index = 0
+            for z_pos in range(z_seq_len):
+                token_t = z_t[b, z_pos].item()
 
-                # 跳过z_t和z_1的pad位置
+                # 跳过pad位置
+                if token_t == pad_token:
+                    z_to_x_map[z_pos] = None
+                    continue
+
+                if token_t != gap_token:
+                    # 非gap位置：映射到X空间位置
+                    z_to_x_map[z_pos] = x_index
+                    x_index += 1
+                else:
+                    # gap位置：不占用X空间位置，但记录为插入点
+                    z_to_x_map[z_pos] = None
+                    insert_positions.append(z_pos)
+
+            # === 步骤2：第一遍处理 - 处理所有非gap位置的操作 ===
+            for z_pos in range(z_seq_len):
+                token_t = z_t[b, z_pos].item()
+                token_1 = z_1[b, z_pos].item()
+
+                # 跳过pad位置
                 if token_t == pad_token or token_1 == pad_token:
                     continue
 
-                # === 关键步骤1：维护X空间指针 ===
-                # 如果z_t当前位置不是gap，说明它在x_t中占据一个位置
-                # 因此需要将x_t_index向前移动一位
-                if token_t != gap_token:
-                    x_t_index += 1  # 移动到x_t中的下一个位置
+                # 只处理非gap位置（SUBSTITUTE/DELETE/KEEP）
+                if token_t == gap_token:
+                    continue  # gap位置的INSERT操作在第二遍处理
 
-                    # 更新第一个有效token的位置
-                    if first_valid_index == 0:
-                        first_valid_index = x_t_index
+                x_pos = z_to_x_map[z_pos]
+                if x_pos is None or x_pos >= x_seq_len:
+                    continue
 
-                    # === 关键修复：检查x_t当前位置是否是pad ===
-                    # 如果x_t当前位置是pad，说明已经超出有效长度，停止遍历
-                    if x_t_index >= x_seq_len:
-                        break  # 超出x_t的有效长度，停止
+                # 判断操作类型
+                if token_1 == gap_token:
+                    # DELETE操作
+                    u_mask[b, x_pos, vocab_size] = 1  # DELETE在位置vocab_size
+                elif token_t != token_1:
+                    # SUBSTITUTE操作
+                    u_mask[b, x_pos, token_1 + vocab_size + 1] = 1  # SUBSTITUTE在vocab_size+1之后
+                else:
+                    # KEEP操作
+                    u_mask[b, x_pos, -1] = 1  # KEEP在最后一位
 
-                    if x_t[b, x_t_index].item() == pad_token:
-                        break  # x_t当前位置是pad，说明已经是填充区域，停止
+            # === 步骤3：第二遍处理 - 处理所有gap位置的INSERT操作 ===
+            for gap_z_pos in insert_positions:
+                token_t = z_t[b, gap_z_pos].item()
+                token_1 = z_1[b, gap_z_pos].item()
 
-                # === 关键步骤2：判断编辑类型并标记 ===
-                # 根据z_t[i]和z_1[i]的关系，决定在x_t[x_t_index]位置执行什么操作
+                # 跳过pad位置
+                if token_t == pad_token or token_1 == pad_token:
+                    continue
 
+                # 只处理 gap → 非gap 的INSERT操作
                 if token_t == gap_token and token_1 != gap_token:
-                    # 插入操作：
-                    # z_t[i]是gap，z_1[i]是有效token
-                    # 意味着需要在gap位置插入token_1
-                    #
-                    # ✅ 修复：使用one-hot编码而非累加计数
-                    # 即使需要多次插入相同token，也只标记一次
-                    # 因为模型只需要知道"在这个位置执行插入sin操作"
-                    # 而不是"插入2次sin"（后者是编辑操作的定义，不是损失的一部分）
-                    insert_pos = max(x_t_index, first_valid_index)
-                    if insert_pos >= 0 and insert_pos < x_seq_len:
-                        u_mask[b, insert_pos, token_1] = 1  # one-hot编码（只标记操作类型）
+                    # 确定INSERT操作的目标X空间位置
+                    # 策略：INSERT操作映射到gap之前的第一个非gap位置
 
-                elif token_t != gap_token and token_1 == gap_token:
-                    # 删除操作：
-                    # z_t[i]是有效token，z_1[i]是gap
-                    # 意味着需要删除当前token
-                    # 删除操作直接标记在x_t_index位置（当前token的位置）
-                    if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, -1] = 1  # one-hot编码
+                    # 找到gap之前的第一个非gap位置的X空间索引
+                    insert_x_pos = None
+                    for prev_z_pos in range(gap_z_pos - 1, -1, -1):
+                        if z_to_x_map[prev_z_pos] is not None:
+                            insert_x_pos = z_to_x_map[prev_z_pos]
+                            break
 
-                elif token_t != gap_token and token_1 != gap_token and token_t != token_1:
-                    # 替换操作：
-                    # z_t[i]和z_1[i]都是有效token但不同
-                    # 意味着需要将token_t替换为token_1
-                    # 替换操作标记在x_t_index位置（偏移vocab_size以区分插入和替换）
-                    if x_t_index >= 0 and x_t_index < x_seq_len:
-                        u_mask[b, x_t_index, token_1 + vocab_size] = 1  # one-hot编码
+                    # 如果gap之前没有非gap位置，插入到x_t的开头（位置0）
+                    if insert_x_pos is None:
+                        insert_x_pos = 0
+
+                    # 标记INSERT操作
+                    if 0 <= insert_x_pos < x_seq_len:
+                        # 检查该位置是否已有KEEP操作
+                        if u_mask[b, insert_x_pos, -1].item() == 1:
+                            # 如果有KEEP操作，移除KEEP，因为INSERT优先级更高
+                            u_mask[b, insert_x_pos, -1] = 0
+
+                        # 标记INSERT操作
+                        u_mask[b, insert_x_pos, token_1] = 1  # INSERT在0~vocab_size-1
 
         return u_mask
 
@@ -228,111 +250,56 @@ class ContinuousFlowLoss:
                         f"Z空间NaN={nan_count_z}, Inf={inf_count_z}, 分布式检测={has_nan_or_inf}",
                         "compute_loss", level=1)
 
-        # 关键修复：u_total 需要在概率空间计算
-        # 从logits转换为概率
-        u_cat_x_probs = torch.exp(u_cat_x.clamp(max=10))  # 防止溢出
-        u_total = u_cat_x_probs.sum(dim=(1, 2))
-
-        # 🔧 关键修复：避免-inf污染loss计算
-        # 问题：如果直接对所有位置计算log_softmax，padding位置的-inf会影响数值稳定性
-        # 解决：对每个样本，只提取有效位置（u_mask=1）的logits，单独计算log_softmax
-
+        # 获取操作空间维度
         batch_size, z_seq_len, n_ops = u_z.shape
 
-        # 初始化输出张量，填充一个较小的负数（不是-inf，避免污染）
-        log_u_z = torch.zeros_like(u_z) - 10.0  # 初始化为log(很小的概率)
+        # 使用标准cross_entropy计算loss
+        # 有了KEEP操作后，每个token位置都有一个明确的操作标签：
+        # - 需要编辑的位置：标记 ins/del/sub
+        # - 不需要编辑的位置：标记 KEEP
+        # - 只有padding位置无标签
+        #
+        # 因此可以安全地使用标准cross_entropy，无需复杂的掩码逻辑
 
-        # 对每个样本单独处理
-        for b in range(batch_size):
-            # 找到该样本所有有效位置的mask
-            mask_b = u_mask[b].bool()  # [z_seq_len, n_ops]
+        # 步骤1: 将one-hot编码的u_mask转换为标签索引
+        # u_mask: [batch, z_seq_len, n_ops] -> target_ids: [batch, z_seq_len]
+        target_ids = u_mask.argmax(dim=-1)
 
-            if mask_b.any():
-                # 提取有效位置的logits
-                valid_logits = u_z[b][mask_b]  # [num_valid]
+        # 步骤2: 计算标准cross_entropy（对每个token位置）
+        # u_z: [batch, z_seq_len, n_ops] -> [batch*z_seq_len, n_ops]
+        # target_ids: [batch, z_seq_len] -> [batch*z_seq_len]
+        loss_per_token = F.cross_entropy(
+            u_z.reshape(-1, n_ops),
+            target_ids.reshape(-1),
+            reduction='none'  # 先不归一化，后续手动处理
+        )  # [batch*z_seq_len]
 
-                # 只在有效位置计算log_softmax
-                valid_log_probs = torch.log_softmax(valid_logits, dim=-1)
+        # 步骤3: 过滤padding位置（使用u_mask判断）
+        # 如果某个位置所有操作都是0，说明是padding
+        valid_positions_mask = (u_mask.sum(dim=-1) > 0)  # [batch, z_seq_len]
+        valid_positions_mask_flat = valid_positions_mask.reshape(-1)  # [batch*z_seq_len]
 
-                # 填充回原位置
-                log_u_z[b][mask_b] = valid_log_probs
-            # 如果没有有效位置，保持初始值-10.0（log(exp(-10)) = -10）
+        # 只对有效位置计算loss
+        loss_per_token = loss_per_token[valid_positions_mask_flat]
 
-        # 统计信息：log_u_z（应该在负无穷到0之间）
-        log_u_z_min = float(log_u_z.min().item())
-        log_u_z_max = float(log_u_z.max().item())
-        log_u_z_mean = float(log_u_z.mean().item())
-        log_u_z_has_inf = bool(torch.isinf(log_u_z).any().item())
-        log_u_z_has_nan = bool(torch.isnan(log_u_z).any().item())
+        # 步骤4: 按样本归一化（避免长序列主导loss）
+        # 记录每个样本的有效token数
+        valid_tokens_per_sample = valid_positions_mask.sum(dim=1)  # [batch]
+        valid_tokens_per_sample = valid_tokens_per_sample.clamp(min=1)  # 避免除0
 
-        # 统计信息：u_mask（标记需要预测的位置）
-        u_mask_num_true = int(u_mask.sum().item())
-        u_mask_total = int(u_mask.numel())
-        u_mask_sparsity = float(1.0 - (u_mask_num_true / u_mask_total))
+        # 计算每个样本的平均loss
+        sample_losses = []
+        start_idx = 0
+        for num_tokens in valid_tokens_per_sample:
+            end_idx = start_idx + num_tokens.item()
+            sample_losses.append(loss_per_token[start_idx:end_idx].mean())
+            start_idx = end_idx
 
-        # cross_entropy 在 Z 空间计算（负对数似然）
-        # u_mask 标记了正确的操作位置（one-hot编码）
-        # 只在 u_mask=True 的位置累加（其他位置不影响损失）
-        masked_log_u_z = log_u_z * u_mask.float()
+        cross_entropy = torch.stack(sample_losses)  # [batch]
 
-        # 🔧 修复：计算每个样本的有效操作数量（用于归一化）
-        # 这确保不同长度的序列对损失的贡献是公平的
-        valid_ops_per_sample = u_mask.sum(dim=(1, 2)).clamp(min=1)  # 至少为1避免除0
-
-        # 计算每个样本的平均负对数似然（对序列长度归一化）
-        cross_entropy = masked_log_u_z.sum(dim=(1, 2)) / valid_ops_per_sample
-
-        # 统计信息：cross_entropy（负对数似然，应该是负数）
-        cross_entropy_min = float(cross_entropy.min().item())
-        cross_entropy_max = float(cross_entropy.max().item())
-        cross_entropy_mean = float(cross_entropy.mean().item())
-        cross_entropy_std = float(cross_entropy.std().item() if cross_entropy.numel() > 1 else 0.0)
-
-        # 最终损失：负对数似然 + u_total正则化
-        # cross_entropy: 惩罚"在需要编辑的位置预测错误"
-        # u_total: 惩罚"预测过高的总操作速率"（鼓励稀疏性）
-        # 这样模型同时学习两个目标：
-        # 1. 在需要编辑的位置预测正确的编辑操作
-        # 2. 在所有位置保持低操作速率（稀疏预测）
-
-        # u_total已经在前面计算：u_total = u_cat_x.sum(dim=(1, 2))
-        # shape: [batch]，每个样本的总操作速率
-
-        # 🔧 测试：完全移除正则化，看能否过拟合
-        reg_coeff = 0.0  # 移除所有正则化
-
-        # 最终损失 = 负对数似然 + u_total正则化
-        ce_loss = -cross_entropy.mean()
-        u_total_loss = u_total.mean()
-        loss = ce_loss + reg_coeff * u_total_loss
-
-        # 统计信息：loss
-        loss_value = float(loss.item())
-        loss_is_nan = bool(torch.isnan(loss).item())
-        loss_is_inf = bool(torch.isinf(loss).item())
-
-        # 额外统计：分解损失项
-        ce_loss_value = float(ce_loss.item())
-        u_total_loss_value = float(u_total_loss.item())
-
-        # 记录所有统计信息到日志（仅在debug模式下）
-        if logger is not None and self.debug_mode:
-            # 添加归一化相关的统计信息
-            valid_ops_min = int(valid_ops_per_sample.min().item())
-            valid_ops_max = int(valid_ops_per_sample.max().item())
-            valid_ops_mean = float(valid_ops_per_sample.float().mean().item())
-
-            logger.log(f"LOSS_STATS",
-                      f"u_z: min={u_z_min:.6f}, max={u_z_max:.6f}, mean={u_z_mean:.6f}, std={u_z_std:.6f} | "
-                      f"zeros={u_z_num_zeros}, near_zero={u_z_has_near_zero}, negative={u_z_has_negative} | "
-                      f"log_u_z: min={log_u_z_min:.6f}, max={log_u_z_max:.6f}, mean={log_u_z_mean:.6f} | "
-                      f"has_inf={log_u_z_has_inf}, has_nan={log_u_z_has_nan} | "
-                      f"u_mask: {u_mask_num_true}/{u_mask_total} ({(1-u_mask_sparsity)*100:.2f}%) | "
-                      f"valid_ops_per_sample: min={valid_ops_min}, max={valid_ops_max}, mean={valid_ops_mean:.2f} | "
-                      f"cross_entropy: min={cross_entropy_min:.6f}, max={cross_entropy_max:.6f}, "
-                      f"mean={cross_entropy_mean:.6f}, std={cross_entropy_std:.6f} | "
-                      f"loss: {loss_value:.6f}, is_nan={loss_is_nan}, is_inf={loss_is_inf}",
-                      level=2)
+        # 最终损失：交叉熵损失
+        ce_loss = cross_entropy.mean()
+        loss = ce_loss
 
         return loss
 

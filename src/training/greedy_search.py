@@ -61,6 +61,8 @@ class ActionProposal:
             return f"Substitute(pos={self.position}, {self.token}, score={self.score:.4f})"
         elif self.action_type == 'delete':
             return f"Delete(pos={self.position}, score={self.score:.4f})"
+        elif self.action_type == 'keep':
+            return f"Keep(pos={self.position}, score={self.score:.4f})"
         return f"Action({self.action_type}, score={self.score:.4f})"
 
 
@@ -178,16 +180,17 @@ class SimpleSymbolicRegression:
             model_forward_time = (time.time() - model_forward_start) * 1000  # ms
 
             # 从字典中提取结果
-            ins_rate, del_rate, sub_rate = output['rates']
-            rates = torch.cat([ins_rate, del_rate, sub_rate], dim=-1)
+            ins_rate, del_rate, sub_rate, keep_rate = output['rates']
+            rates = torch.cat([ins_rate, del_rate, sub_rate, keep_rate], dim=-1)
             insert_probs = output['insert_probs']
             substitute_probs = output['substitute_probs']
 
-            # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate]
-            # 因此索引 0=插入, 1=删除, 2=替换
+            # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate, keep_rate]
+            # 因此索引 0=插入, 1=删除, 2=替换, 3=保持
             lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入速率
             lambda_del = rates[0, :, 1].cpu().numpy()  # 删除速率
             lambda_sub = rates[0, :, 2].cpu().numpy()  # 替换速率
+            lambda_keep = rates[0, :, 3].cpu().numpy()  # 保持速率
 
             # 统计操作速率信息
             ins_rate_mean = float(lambda_ins.mean())
@@ -201,6 +204,10 @@ class SimpleSymbolicRegression:
             sub_rate_mean = float(lambda_sub.mean())
             sub_rate_max = float(lambda_sub.max())
             sub_rate_above_threshold = int(np.sum(lambda_sub > self.min_action_score))
+
+            keep_rate_mean = float(lambda_keep.mean())
+            keep_rate_max = float(lambda_keep.max())
+            keep_rate_above_threshold = int(np.sum(lambda_keep > self.min_action_score))
 
             # 调试：验证序列格式
             base_length = int(attention_mask[0].sum().item())
@@ -354,6 +361,34 @@ class SimpleSymbolicRegression:
                             new_tokens=new_tokens
                         ))
 
+            # 生成KEEP操作提案（新增）
+            seq_len = min(effective_length, lambda_keep.shape[0])
+
+            # 调试：打印保持速率信息
+            if self.logger and self._is_main_process():
+                self.logger.log_greedy_search_separator("保持操作详细预测信息（所有token位置）", level=3)
+                for idx in range(len(current_tokens)):
+                    pos = idx + 1  # +1因为input_ids[0]是BOS
+                    if pos < lambda_keep.shape[0]:
+                        current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
+                        self.logger.log_greedy_search_keep_probs(idx, current_token, lambda_keep[pos],
+                                                                lambda_keep[pos] > self.min_action_score, level=3)
+                self.logger.log_greedy_search_separator(level=3)
+
+            for pos in range(1, seq_len):
+                current_token_idx = pos - 1
+                if pos < lambda_keep.shape[0] and current_token_idx < len(current_tokens) and lambda_keep[pos] > self.min_action_score:
+                    # KEEP操作：保持当前token不变
+                    # new_tokens就是current_tokens的副本（不修改）
+                    new_tokens = current_tokens.copy()
+
+                    proposals.append(ActionProposal(
+                        action_type='keep',
+                        position=current_token_idx,
+                        score=lambda_keep[pos],
+                        new_tokens=new_tokens
+                    ))
+
         # 按分数排序
         proposals.sort(key=lambda p: p.score, reverse=True)
 
@@ -364,14 +399,16 @@ class SimpleSymbolicRegression:
         insert_count = sum(1 for p in proposals if p.action_type == 'insert')
         delete_count = sum(1 for p in proposals if p.action_type == 'delete')
         substitute_count = sum(1 for p in proposals if p.action_type == 'substitute')
+        keep_count = sum(1 for p in proposals if p.action_type == 'keep')
 
         if self.logger and self._is_main_process():
             self.logger.log("ACTION_PROPOSALS_GENERATED",
                            f"step={step} | "
-                           f"proposals={len(proposals)} (ins={insert_count}, del={delete_count}, sub={substitute_count}) | "
+                           f"proposals={len(proposals)} (ins={insert_count}, del={delete_count}, sub={substitute_count}, keep={keep_count}) | "
                            f"rates: ins(mean={ins_rate_mean:.4f}, max={ins_rate_max:.4f}, >thr={ins_rate_above_threshold}) "
                            f"del(mean={del_rate_mean:.4f}, max={del_rate_max:.4f}, >thr={del_rate_above_threshold}) "
-                           f"sub(mean={sub_rate_mean:.4f}, max={sub_rate_max:.4f}, >thr={sub_rate_above_threshold}) | "
+                           f"sub(mean={sub_rate_mean:.4f}, max={sub_rate_max:.4f}, >thr={sub_rate_above_threshold}) "
+                           f"keep(mean={keep_rate_mean:.4f}, max={keep_rate_max:.4f}, >thr={keep_rate_above_threshold}) | "
                            f"time: model={model_forward_time:.1f}ms total={total_time:.1f}ms | "
                            f"current_tokens={','.join(current_tokens) if len(current_tokens)<=10 else ','.join(current_tokens[:10])+'...'}",
                            "simple_search", level=3)
@@ -460,15 +497,26 @@ class SimpleSymbolicRegression:
                     position_offset -= 1  # 后续位置前移
 
             elif action.action_type == 'insert':
-                # 插入操作：在actual_position之前插入
+                # 插入操作
                 if action.token is not None:
-                    result_tokens.insert(actual_position, action.token)
-                    position_offset += 1  # 后续位置后移
+                    # 检查当前位置是否是<gap>
+                    if (0 <= actual_position < len(result_tokens) and
+                        result_tokens[actual_position] == '<gap>'):
+                        # 如果是gap，直接替换（gap只是占位符，插入会消耗gap）
+                        result_tokens[actual_position] = action.token
+                    else:
+                        # 如果不是gap，在actual_position之前插入
+                        result_tokens.insert(actual_position, action.token)
+                        position_offset += 1  # 后续位置后移
 
             elif action.action_type == 'substitute':
                 # 替换操作：不影响位置偏移
                 if 0 <= actual_position < len(result_tokens) and action.token is not None:
                     result_tokens[actual_position] = action.token
+
+            elif action.action_type == 'keep':
+                # KEEP操作：保持当前token不变，不执行任何修改
+                pass
 
         return result_tokens
 
