@@ -111,5 +111,5 @@ Ctrl + C
 # 退出复制模式
 Ctrl + D
 #推理测试命令
-python example.py --sample_idx 96992
+python example.py --parquet_path data/flow_samples_1_3dim_100pts_6depth_24len.parquet --sample_idx 0
 ```

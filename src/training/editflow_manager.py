@@ -1108,5 +1108,14 @@ class EditFlowManager:
                                "inference", level=3)
 
             self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
-            return final_expression
+
+            # 返回详细结果字典
+            return {
+                'final_expression': final_expression,
+                'initial_tokens': current_tokens,  # 初始tokens
+                'final_tokens': best_candidate.tokens if best_candidate else [],  # 最终tokens
+                'history': best_candidate.history if best_candidate else [],  # 操作历史
+                'position_actions_history': best_candidate.position_actions_history if best_candidate else [],  # 每步每个位置的操作
+                'mse_score': best_candidate.mse_score if best_candidate else None  # MSE分数
+            }
 

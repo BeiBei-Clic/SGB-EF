@@ -25,6 +25,7 @@ class Candidate:
         residuals: 对应的残差
         history: 操作历史（可选，用于调试）
         mse_score: 表达式的MSE分数（越低越好，用于最终选择）
+        position_actions_history: 每步每个位置的操作详情 [{position: (action_type, score)}, ...]
     """
     score: float
     tokens: List[str] = field(compare=False)
@@ -32,6 +33,7 @@ class Candidate:
     residuals: Optional[np.ndarray] = field(default=None, compare=False)
     history: List[str] = field(default_factory=list, compare=False)
     mse_score: Optional[float] = field(default=None, compare=False)
+    position_actions_history: List[dict] = field(default_factory=list, compare=False)
 
     def __repr__(self):
         return f"Candidate(score={self.score:.4f}, tokens={','.join(self.tokens) if self.tokens else '<blank>'})"
@@ -493,8 +495,13 @@ class SimpleSymbolicRegression:
             if action.action_type == 'delete':
                 # 删除操作
                 if 0 <= actual_position < len(result_tokens) and len(result_tokens) > 1:
+                    deleted_token = result_tokens[actual_position]
                     del result_tokens[actual_position]
                     position_offset -= 1  # 后续位置前移
+                    # Debug: 只在main process打印
+                    import os
+                    if os.environ.get('RANK', '0') == '0':
+                        print(f"    [DEBUG] Delete @{action.position}→actual@{actual_position}: '{deleted_token}', 剩余{len(result_tokens)} tokens, offset={position_offset}")
 
             elif action.action_type == 'insert':
                 # 插入操作
@@ -686,31 +693,86 @@ class SimpleSymbolicRegression:
                                    "greedy_search", level=2)
                 break
 
-            # 选择分数最高的操作
-            best_proposal = proposals[0]
-            action_desc = f"{best_proposal.action_type}@{best_proposal.position}"
-            if best_proposal.token:
-                action_desc += f":{best_proposal.token}"
-            action_desc += f"(score={best_proposal.score:.4f})"
+            # 方案B改进：按位置选择最佳操作，再按操作类型优先级选择
+            # 优先级: delete > substitute > keep > insert
+            # 这样避免跨操作类型的分数比较（如delete vs keep）
+            position_best = {}  # {position: best_proposal}
+            for proposal in proposals:
+                pos = proposal.position
+                if pos not in position_best or proposal.score > position_best[pos].score:
+                    position_best[pos] = proposal
 
-            history.append(action_desc)
+            # 收集所有位置的最佳操作，同时应用
+            # 这样可以正确处理位置偏移：删除/插入会导致后续位置移动
+            all_position_actions = list(position_best.values())
+
+            # 记录每个位置的最佳操作（用于调试和返回）
+            if self.logger and self._is_main_process():
+                # 传递-1表示没有"选中"的位置（因为所有操作都会执行）
+                self.logger.log_position_best_actions(position_best, -1, level=3)
+
+            # 保存本步每个位置的操作详情到历史记录
+            step_position_actions = {}
+            for pos, prop in position_best.items():
+                step_position_actions[pos] = (prop.action_type, prop.score)
+            current_candidate.position_actions_history.append(step_position_actions)
+
+            # 构建操作描述（显示所有执行的操作）
+            action_descs = []
+            for prop in all_position_actions:
+                desc = f"{prop.action_type}@{prop.position}"
+                if prop.token:
+                    desc += f":{prop.token}"
+                desc += f"({prop.score:.4f})"
+                action_descs.append(desc)
+
+            # Debug: 按action_type排序，让delete操作显示在前面
+            action_priority_order = {'delete': 0, 'substitute': 1, 'insert': 2, 'keep': 3}
+            action_descs_sorted = sorted(action_descs,
+                key=lambda d: action_priority_order.get(d.split('@')[0], 99))
+
+            action_summary = ", ".join(action_descs_sorted[:5])  # 最多显示前5个
+            if len(action_descs) > 5:
+                action_summary += f" ... (共{len(action_descs)}个操作)"
+
+            history.append(action_summary)
 
             if self.logger and self._is_main_process():
-                print(f"执行操作: {action_desc}")
+                print(f"执行操作: {action_summary}")
+                # Debug: 显示delete操作
+                delete_actions = [prop for prop in all_position_actions if prop.action_type == 'delete']
+                if delete_actions:
+                    print(f"  Delete操作: {', '.join(f'@{p.position}({p.score:.4f})' for p in delete_actions)}")
                 self.logger.log("GREEDY_SEARCH_ACTION",
-                               f"step={step} | action={action_desc} | "
-                               f"old_expr={','.join(current_candidate.tokens)} | "
-                               f"new_expr={','.join(best_proposal.new_tokens)}",
+                               f"step={step} | actions={action_summary} | "
+                               f"old_expr={','.join(current_candidate.tokens)}",
                                "greedy_search", level=2)
 
             # 更新当前候选
-            # 注意：不重新计算条件嵌入（架构v2.0：条件恒定）
+            # 使用apply_multiple_actions同时应用所有位置的操作
+            # 该方法会通过position_offset正确处理删除/插入导致的位置偏移
+            if self.logger and self._is_main_process():
+                print(f"  应用操作前: {len(current_candidate.tokens)} tokens")
+
+            new_tokens = self.apply_multiple_actions(
+                current_tokens=current_candidate.tokens,
+                actions=all_position_actions
+            )
+
+            if self.logger and self._is_main_process():
+                print(f"  应用操作后: {len(new_tokens)} tokens")
+                print(f"  预期token数: 15 (目标表达式)")
+
+            # 计算总分（所有操作的平均分）
+            total_score = sum(prop.score for prop in all_position_actions) / len(all_position_actions)
+
             current_candidate = Candidate(
-                tokens=best_proposal.new_tokens,
-                score=current_candidate.score + best_proposal.score,
+                tokens=new_tokens,
+                score=current_candidate.score + total_score,
                 condition=current_candidate.condition,  # 条件保持恒定
                 residuals=current_candidate.residuals,   # 残差仅用于日志
-                history=history.copy()
+                history=history.copy(),
+                position_actions_history=current_candidate.position_actions_history.copy()  # 保留位置操作历史
             )
 
             # 架构v2.0：不重新计算条件嵌入（北极星模式）

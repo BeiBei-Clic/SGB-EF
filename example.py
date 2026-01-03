@@ -7,9 +7,10 @@ import numpy as np
 import re
 import argparse
 import pandas as pd
+import os
+from pathlib import Path
 
 from src.training.editflow_manager import EditFlowManager
-from src.symbolic.symbolic_utils import evaluate_expression_with_constants
 
 
 def reorganize_data_by_used_variables(expression_str, x_data):
@@ -37,8 +38,25 @@ def reorganize_data_by_used_variables(expression_str, x_data):
     return new_expression, new_x_data
 
 
+def list_available_datasets(data_dir='data'):
+    """列出可用的数据集文件"""
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        return []
+
+    parquet_files = sorted(data_path.glob('*.parquet'))
+    return [str(f) for f in parquet_files]
+
+
 def load_sample(parquet_path, target_expr=None, sample_idx=None):
     """从Parquet数据集加载样本"""
+    if not os.path.exists(parquet_path):
+        available = list_available_datasets()
+        raise FileNotFoundError(
+            f"数据集文件不存在: {parquet_path}\n"
+            f"可用的数据集:\n" + "\n".join(f"  - {f}" for f in available)
+        )
+
     df = pd.read_parquet(parquet_path)
 
     if sample_idx is not None:
@@ -67,13 +85,63 @@ def load_sample(parquet_path, target_expr=None, sample_idx=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='符号回归推理测试')
-    parser.add_argument('--target_expr', type=str, default='-x1 + log(Abs(x1) + 1/1000)')
-    parser.add_argument('--sample_idx', type=int, default=None)
-    parser.add_argument('--parquet_path', type=str,
-                       default='data/flow_samples_100000_3dim_100pts_6depth_24len.parquet')
-    parser.add_argument('--model_path', type=str, default='checkpoints/continuous_flow_final')
+    parser = argparse.ArgumentParser(
+        description='符号回归推理测试',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 通过样本索引推理
+  python example.py --sample_idx 0
+
+  # 通过目标表达式推理
+  python example.py --target_expr "x0 + x1"
+
+  # 使用特定数据集
+  python example.py --parquet_path data/flow_samples_1_3dim_100pts_6depth_24len.parquet --sample_idx 0
+
+  # 列出可用数据集
+  python example.py --list_datasets
+        """
+    )
+    parser.add_argument('--target_expr', type=str, default=None,
+                       help='目标表达式（与--sample_idx二选一）')
+    parser.add_argument('--sample_idx', type=int, default=None,
+                       help='样本索引（与--target_expr二选一）')
+    parser.add_argument('--parquet_path', type=str, default=None,
+                       help='Parquet数据集路径（默认使用data目录下第一个parquet文件）')
+    parser.add_argument('--model_path', type=str, default='checkpoints/continuous_flow_final',
+                       help='模型检查点路径')
+    parser.add_argument('--list_datasets', action='store_true',
+                       help='列出所有可用的数据集并退出')
+    parser.add_argument('--data_dir', type=str, default='data',
+                       help='数据集目录（默认: data）')
     args = parser.parse_args()
+
+    # 列出可用数据集
+    if args.list_datasets:
+        available = list_available_datasets(args.data_dir)
+        if not available:
+            print(f"在 {args.data_dir} 目录下未找到parquet数据集")
+        else:
+            print("可用的数据集:")
+            for f in available:
+                print(f"  - {f}")
+        return
+
+    # 自动选择数据集
+    if args.parquet_path is None:
+        available = list_available_datasets(args.data_dir)
+        if not available:
+            raise ValueError(
+                f"在 {args.data_dir} 目录下未找到parquet数据集。"
+                f"请使用 --parquet_path 指定数据集路径，或将数据集放到 {args.data_dir} 目录下"
+            )
+        args.parquet_path = available[0]
+        print(f"使用默认数据集: {args.parquet_path}")
+
+    # 检查参数
+    if args.target_expr is None and args.sample_idx is None:
+        parser.error("必须指定 --target_expr 或 --sample_idx 之一")
 
     # 模型配置
     model_args = type('ModelArgs', (), {
@@ -133,13 +201,20 @@ def main():
     expr_gt, x_data = reorganize_data_by_used_variables(sample['exp_gt'], sample['x'])
     expr_initial, _ = reorganize_data_by_used_variables(sample['exp_cur1'], sample['x'])
 
+    # 将目标表达式转换为tokens（用于对比）
+    import sympy as sp
+    from src.symbolic.symbolic_utils import expr_to_tree
+    target_expr_sympy = sp.sympify(expr_gt) if isinstance(expr_gt, str) else expr_gt
+    target_tokens_str = expr_to_tree(target_expr_sympy)
+    target_tokens = target_tokens_str.split(',') if target_tokens_str else []
+
     # 推理
     print(f"\n{'='*70}")
     print(f"开始推理: {args.model_path}")
     print(f"{'='*70}\n")
 
     manager = EditFlowManager(model_args)
-    predicted_expr = manager.symbolic_regression(
+    result = manager.symbolic_regression(
         model_path=args.model_path,
         x_data=x_data,
         y_data=sample['y'],
@@ -148,28 +223,59 @@ def main():
         initial_expr=expr_initial
     )
 
-    # 评估结果
-    _, _, mse_initial = evaluate_expression_with_constants(expr_initial, x_data, sample['y'])
-    _, _, mse_pred = evaluate_expression_with_constants(predicted_expr, x_data, sample['y'])
+    # 提取结果信息
+    initial_tokens = result['initial_tokens']
+    final_tokens = result['final_tokens']
+    history = result['history']
+    position_actions_history = result['position_actions_history']
 
     print(f"\n{'='*70}")
-    print(f"推理结果")
+    print(f"推理详细信息")
     print(f"{'='*70}")
-    print(f"样本 #{sample['sample_idx']}")
-    print(f"\n目标表达式: {expr_gt}")
-    print(f"当前表达式: {expr_initial}")
-    print(f"预测表达式: {predicted_expr}")
-    print(f"\nMSE 损失:")
-    print(f"  当前 → 目标: {mse_initial:.6e}")
-    print(f"  预测 → 目标: {mse_pred:.6e}")
 
-    # 判断结果
-    if mse_pred < 1e-6:
-        print(f"\n✅ 推理成功！")
-    elif mse_pred < mse_initial:
-        print(f"\n⚠️  部分改进 ({((mse_initial - mse_pred) / mse_initial * 100):.1f}%)")
+    print(f"\n初始状态:")
+    print(f"  表达式: {expr_initial}")
+    tokens_str = ' '.join([f"[{i}]{t}" for i, t in enumerate(initial_tokens)])
+    print(f"  Tokens: {tokens_str}")
+
+    print(f"\n目标状态:")
+    print(f"  表达式: {expr_gt}")
+    tokens_str = ' '.join([f"[{i}]{t}" for i, t in enumerate(target_tokens)])
+    print(f"  Tokens: {tokens_str}")
+
+    print(f"\n各位置的操作选择:")
+    if position_actions_history and len(position_actions_history) > 0:
+        for step_idx, step_actions in enumerate(position_actions_history):
+            print(f"  步骤{step_idx + 1}:")
+            for pos in sorted(step_actions.keys()):
+                action_type, score = step_actions[pos]
+                marker = " ← 执行" if step_idx < len(history) and f"@{pos}" in history[step_idx] else ""
+                print(f"    位置{pos}: {action_type}(score={score:.4f}){marker}")
+
+    print(f"\n执行操作: {history[0] if history else 'None'}")
+
+    print(f"\n操作后状态:")
+    tokens_str = ' '.join([f"[{i}]{t}" for i, t in enumerate(final_tokens)])
+    print(f"  Tokens: {tokens_str}")
+
+    print(f"\n结果对比:")
+    # 检查是否匹配
+    if final_tokens == target_tokens:
+        print(f"  与目标匹配: ✅ 完全匹配")
     else:
-        print(f"\n❌ 推理失败")
+        # 计算匹配度
+        min_len = min(len(final_tokens), len(target_tokens))
+        matches = sum(1 for i in range(min_len) if final_tokens[i] == target_tokens[i])
+
+        # 分析差异
+        if len(final_tokens) > len(target_tokens):
+            diff = f"多了{len(final_tokens) - len(target_tokens)}个token"
+        elif len(final_tokens) < len(target_tokens):
+            diff = f"少了{len(target_tokens) - len(final_tokens)}个token"
+        else:
+            diff = f"有{min_len - matches}个token不同"
+
+        print(f"  与目标匹配: ❌ 不匹配 ({diff}, 匹配{matches}/{min_len}个token)")
 
 
 if __name__ == "__main__":

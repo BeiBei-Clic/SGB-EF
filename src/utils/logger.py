@@ -77,10 +77,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -144,10 +143,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -401,10 +399,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -458,10 +455,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -520,10 +516,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         ops = []
@@ -586,10 +581,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         separator = "=" * 80
@@ -607,10 +601,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         self.log("SEQUENCE_FORMAT",
@@ -624,10 +617,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         tokens_str = str(tokens)
@@ -641,10 +633,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         tokens_str = str(tokens)
@@ -658,10 +649,9 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         self.log("DELETE_PROBS_DEBUG",
@@ -673,14 +663,38 @@ class Logger:
         if not self.enabled:
             return
 
-        # level=2和level=3需要debug_mode启用
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
         if level == 2 and not self.debug_mode:
-            return
-        if level == 3 and not self.debug_mode:
             return
 
         self.log("KEEP_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda_keep={lambda_rate:.4f} | above_threshold={above_threshold}",
+                "greedy_search", level=level)
+
+    def log_position_best_actions(self, position_best_map, selected_position, level=3):
+        """记录每个位置的最佳操作
+
+        Args:
+            position_best_map (dict): {position: ActionProposal}
+            selected_position (int): 最终选中的位置
+            level (int): 日志级别
+        """
+        if not self.enabled:
+            return
+
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
+        if level == 2 and not self.debug_mode:
+            return
+
+        positions_info = []
+        for pos, prop in sorted(position_best_map.items()):
+            marker = " ← 最终选择" if pos == selected_position else ""
+            positions_info.append(f"位置{pos}: {prop.action_type}(score={prop.score:.4f}){marker}")
+
+        self.log("POSITION_BEST_ACTIONS",
+                f"每个位置的最佳操作 | {' | '.join(positions_info)}",
                 "greedy_search", level=level)
 
     # ==================== 崩溃日志 ====================
