@@ -210,9 +210,6 @@ class EditFlowManager:
                 print(f"非流式模式: 训练集 {train_size_estimate} 样本, 测试集 {test_size_estimate} 样本")
 
         # 6. 创建 DataLoader
-        # 关键参数：num_workers 和 drop_last
-        # num_workers > 0 可以防止IO阻塞导致的GPU等待
-        # drop_last=True 保证每个进程的 batch 数量严格一致，防止 DDP 卡死
 
         # 检查是否为stream模式
         is_stream_mode = getattr(train_dataset, 'stream', False)

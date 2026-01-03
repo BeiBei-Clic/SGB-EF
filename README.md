@@ -57,9 +57,12 @@ pkill -9 accelerate
 
 ## 监控GPU和CPU使用情况
 ```bash
+# 查看GPU占用情况
 watch -n 1 -d nvidia-smi
-
+# 查看进程占用的CPU和内存
 watch -n 2 'ps aux | grep "train.py" | grep -v grep | awk "{print \$3,\$2}" | head -3'
+# 查看文件是否在被访问
+lsof | grep "flow_samples_10000000"
 ```
 
 ## tmux 将终端任务挂到后台运行
