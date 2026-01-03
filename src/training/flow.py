@@ -117,13 +117,28 @@ class ContinuousFlowLoss:
             z_to_x_map = {}  # {z_pos: x_pos or None}
             insert_positions = []  # 记录所有gap位置，用于后续INSERT操作映射
 
+            # 🔧 修复：BOS位置也应该参与映射，这样gap位置才能找到之前的非gap位置
+            # 修改前：跳过BOS位置，导致gap找不到之前的非gap，INSERT标记错误
+            # 修改后：BOS映射到X空间位置0，gap可以正确找到BOS作为插入点
+            bos_token = tokenizer.convert_tokens_to_ids('<s>')
+
+            # 从X空间位置0开始映射（包含BOS）
             x_index = 0
+
             for z_pos in range(z_seq_len):
                 token_t = z_t[b, z_pos].item()
 
                 # 跳过pad位置
                 if token_t == pad_token:
                     z_to_x_map[z_pos] = None
+                    continue
+
+                # 🔧 修复：BOS token也要映射到X空间，这样gap位置才能找到BOS作为插入点
+                # 修改前：BOS不映射，导致gap找不到之前的非gap位置
+                # 修改后：BOS映射到X空间位置0
+                if token_t == bos_token:
+                    z_to_x_map[z_pos] = x_index  # BOS映射到X空间位置0
+                    x_index += 1
                     continue
 
                 if token_t != gap_token:
@@ -174,8 +189,16 @@ class ContinuousFlowLoss:
 
                 # 只处理 gap → 非gap 的INSERT操作
                 if token_t == gap_token and token_1 != gap_token:
+                    # INSERT操作语义：在某个位置之后插入token
+                    # 例如：gap在位置1，表示在位置0的元素之后插入
+                    # Z空间: [..., token_A, <gap>, token_B, ...]
+                    #      → [..., token_A, NEW_TOKEN, token_B, ...]
+                    # X空间: [..., token_A, token_B, ...]
+                    #   INSERT在位置0 → [..., token_A, NEW_TOKEN, token_B, ...]
+
                     # 确定INSERT操作的目标X空间位置
                     # 策略：INSERT操作映射到gap之前的第一个非gap位置
+                    # 表示"在该位置之后插入"
 
                     # 找到gap之前的第一个非gap位置的X空间索引
                     insert_x_pos = None
@@ -185,6 +208,7 @@ class ContinuousFlowLoss:
                             break
 
                     # 如果gap之前没有非gap位置，插入到x_t的开头（位置0）
+                    # 这表示在序列最前面插入（即BOS之后，因为BOS在位置0）
                     if insert_x_pos is None:
                         insert_x_pos = 0
 
@@ -195,7 +219,8 @@ class ContinuousFlowLoss:
                             # 如果有KEEP操作，移除KEEP，因为INSERT优先级更高
                             u_mask[b, insert_x_pos, -1] = 0
 
-                        # 标记INSERT操作
+                        # 标记INSERT操作：u_mask[b, insert_x_pos, token_1] = 1
+                        # 语义：在位置insert_x_pos的元素之后插入token_1
                         u_mask[b, insert_x_pos, token_1] = 1  # INSERT在0~vocab_size-1
 
         return u_mask

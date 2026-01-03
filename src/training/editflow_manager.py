@@ -434,9 +434,10 @@ class EditFlowManager:
             input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask
         )
 
-        # 合并四个速率为一个tensor（添加KEEP操作）
-        ins_rate, del_rate, sub_rate, keep_rate = output['rates']
-        pred_rates = torch.cat([ins_rate, del_rate, sub_rate, keep_rate], dim=-1)
+        # 提取rates_logits（原始logits，不经过softmax）
+        # 这样可以在logit空间直接操作，避免log(概率)的数学错误
+        pred_rates_logits = output['rates_logits']  # (batch_size, seq_len, 4)
+        pred_rates = pred_rates_logits  # 保持变量名一致，后续会直接使用logits
 
         # 记录模型输出的完整值（仅在debug模式下记录）
         if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
@@ -479,17 +480,19 @@ class EditFlowManager:
 
         # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate, keep_rate]
         # 因此索引 0=插入, 1=删除, 2=替换, 3=保持
-        lambda_ins = pred_rates[:, :, 0:1]  # 插入速率
-        lambda_del = pred_rates[:, :, 1:2]  # 删除速率
-        lambda_sub = pred_rates[:, :, 2:3]  # 替换速率
-        lambda_keep = pred_rates[:, :, 3:4]  # 保持速率
+        # 注意：现在pred_rates是logits而不是概率
+        ins_logits_rate = pred_rates[:, :, 0:1]  # 插入logits
+        del_logits_rate = pred_rates[:, :, 1:2]  # 删除logits
+        sub_logits_rate = pred_rates[:, :, 2:3]  # 替换logits
+        keep_logits_rate = pred_rates[:, :, 3:4]  # 保持logits
 
-        # 关键修复：直接使用logits而不是概率
-        # 将速率作为log空间加到logits上
-        ins_logits = forward_results['pred_ins_logits'] + torch.log(lambda_ins.clamp(min=1e-8))
-        sub_logits = forward_results['pred_sub_logits'] + torch.log(lambda_sub.clamp(min=1e-8))
-        del_logits = torch.log(lambda_del.clamp(min=1e-8))
-        keep_logits = torch.log(lambda_keep.clamp(min=1e-8))  # KEEP操作的logits
+        # 关键修复：直接在logit空间相加，不使用torch.log
+        # log P(operation AND token) = log P(operation) + log P(token|operation)
+        #                               = rate_logits + vocab_logits
+        ins_logits = forward_results['pred_ins_logits'] + ins_logits_rate
+        sub_logits = forward_results['pred_sub_logits'] + sub_logits_rate
+        del_logits = del_logits_rate  # DEL没有vocab分布，直接用rate_logits
+        keep_logits = keep_logits_rate  # KEEP同理
 
         # 🔧 修复：不再在这里应用attention_mask
         # attention_mask会在loss计算时通过u_mask自然处理
@@ -532,6 +535,14 @@ class EditFlowManager:
                                      context=context, level=2, max_elements=50)
 
             # 记录分解后的速率（模型预测）
+            # 从logits计算概率用于日志显示
+            import torch.nn.functional as F
+            rates_probs = F.softmax(pred_rates, dim=-1)
+            lambda_ins = rates_probs[:, :, 0:1]
+            lambda_del = rates_probs[:, :, 1:2]
+            lambda_sub = rates_probs[:, :, 2:3]
+            lambda_keep = rates_probs[:, :, 3:4]
+
             self.logger.tensor_values(f"pred_lambda_ins_batch{batch_idx}", lambda_ins[sample_idx],
                                      context=context, level=2, max_elements=50)
             self.logger.tensor_values(f"pred_lambda_del_batch{batch_idx}", lambda_del[sample_idx],
@@ -539,19 +550,21 @@ class EditFlowManager:
             self.logger.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx],
                                      context=context, level=2, max_elements=50)
 
-            # 记录标准答案：u_mask（真实编辑操作标签，one-hot编码）
-            # 使用专门的日志方法按语义拆分记录
-            self.logger.log_u_mask_split(f"GT_u_mask", u_mask[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
+            # 记录标准答案：u_mask_x（X空间的编辑操作标签，one-hot编码）
+            # 注意：使用u_mask_x而不是u_mask，因为日志是按x_t（X空间）遍历的
+            # u_mask是Z空间的版本，维度不匹配x_t
+            self.logger.log_u_mask_split(f"GT_u_mask", u_mask_x[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
                                         effective_vocab_size, context=context, level=2)
 
             # 解码并记录Ground Truth编辑操作（可读格式，使用ID）
             self.logger.log_edit_operations(
-                u_mask[sample_idx],
+                u_mask_x[sample_idx],
                 x_t[sample_idx],
                 effective_vocab_size,
                 context=context,
                 level=2,
-                max_ops=20
+                max_ops=20,
+                pad_token_id=self.tokenizer.pad_token_id
             )
 
             # 记录模型预测的u_cat_x（用于对比）

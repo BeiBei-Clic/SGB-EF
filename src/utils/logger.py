@@ -511,8 +511,12 @@ class Logger:
             self._write(msg, self.INFERENCE_LOG)
 
     def log_edit_operations(self, u_mask_sample, x_t_sample, vocab_size,
-                           context="", level=3, max_ops=20):
-        """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）"""
+                           context="", level=3, max_ops=20, pad_token_id=None):
+        """解码并记录Ground Truth编辑操作（使用ID，不翻译成token）
+
+        Args:
+            pad_token_id: pad token的ID (必须从tokenizer传入，不可为None)
+        """
         if not self.enabled:
             return
 
@@ -521,9 +525,12 @@ class Logger:
         if level == 2 and not self.debug_mode:
             return
 
+        # 要求必须传入pad_token_id
+        if pad_token_id is None:
+            raise ValueError("pad_token_id is required. Please pass tokenizer.pad_token_id")
+
         ops = []
         x_seq_len = u_mask_sample.shape[0]
-        pad_token_id = 0  # 假设pad token ID为0
 
         for pos in range(min(x_seq_len, len(x_t_sample))):
             # 跳过pad位置
@@ -538,7 +545,9 @@ class Logger:
                 ins_idx = u_mask_sample[pos, :vocab_size].nonzero(as_tuple=False)
                 if ins_idx.numel() > 0:
                     token_id = ins_idx[0].item()
-                    ops.append(f"pos{pos}: INSERT id({token_id})")
+                    current_id = x_t_sample[pos].item()
+                    # INSERT语义：在位置pos的元素之后插入token_id
+                    ops.append(f"pos{pos}之后: INSERT id({token_id})  (在id({current_id})之后)")
 
                 # 检查删除操作 (第vocab_size位，索引 vocab_size)
                 if u_mask_sample[pos, vocab_size].item():
@@ -671,6 +680,59 @@ class Logger:
         self.log("KEEP_PROBS_DEBUG",
                 f"位置{position}(当前={current_token}): lambda_keep={lambda_rate:.4f} | above_threshold={above_threshold}",
                 "greedy_search", level=level)
+
+    def log_position_action_scores(self, step, current_tokens,
+                                    lambda_ins, lambda_del, lambda_sub, lambda_keep,
+                                    threshold, context="", level=3):
+        """记录每个位置的所有操作预测分数（简洁版）
+
+        Args:
+            step: 当前步骤
+            current_tokens: 当前token列表
+            lambda_ins: 每个位置的INSERT分数 [seq_len]
+            lambda_del: 每个位置的DELETE分数 [seq_len]
+            lambda_sub: 每个位置的SUBSTITUTE分数 [seq_len]
+            lambda_keep: 每个位置的KEEP分数 [seq_len]
+            threshold: 操作分数阈值
+            context: 上下文信息
+            level: 日志级别（默认3，会记录到inference.log）
+        """
+        if not self.enabled:
+            return
+
+        # level=2需要debug_mode启用（训练调试日志）
+        # level=3是推理日志，不受debug控制，默认保存
+        if level == 2 and not self.debug_mode:
+            return
+
+        import numpy as np
+
+        # 记录概要信息
+        tokens_str = ','.join(current_tokens) if len(current_tokens) <= 10 else ','.join(current_tokens[:10]) + '...'
+        self.log("POSITION_ACTION_SCORES",
+                f"step={step} | tokens=[{tokens_str}] | seq_len={len(lambda_ins)} | thr={threshold:.4f}",
+                context, level)
+
+        # 对于input_ids的每个位置（包含BOS）
+        for i in range(len(lambda_ins)):
+            # input_ids位置i对应：
+            # - i=0: BOS位置
+            # - i>0: current_tokens[i-1]
+
+            if i == 0:
+                token_str = "BOS"
+            else:
+                token_idx = i - 1
+                token_str = current_tokens[token_idx] if token_idx < len(current_tokens) else "PAD"
+
+            # 记录该位置的所有操作分数（简洁格式）
+            self.log(f"POS_{i}_SCORES",
+                    f"step={step} | pos{i}({token_str}) | "
+                    f"INS={lambda_ins[i]:.4f} "
+                    f"DEL={lambda_del[i]:.4f} "
+                    f"SUB={lambda_sub[i]:.4f} "
+                    f"KEEP={lambda_keep[i]:.4f}",
+                    context, level)
 
     def log_position_best_actions(self, position_best_map, selected_position, level=3):
         """记录每个位置的最佳操作

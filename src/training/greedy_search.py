@@ -182,17 +182,19 @@ class SimpleSymbolicRegression:
             model_forward_time = (time.time() - model_forward_start) * 1000  # ms
 
             # 从字典中提取结果
-            ins_rate, del_rate, sub_rate, keep_rate = output['rates']
-            rates = torch.cat([ins_rate, del_rate, sub_rate, keep_rate], dim=-1)
+            # 注意：模型现在返回rates_logits而不是概率
+            import torch.nn.functional as F
+            rates_logits = output['rates_logits']  # (batch_size, seq_len, 4)
+            rates_probs = F.softmax(rates_logits, dim=-1)  # 转换为概率
+
+            # 分解为各个操作的概率
+            lambda_ins = rates_probs[0, :, 0].cpu().numpy()  # 插入概率
+            lambda_del = rates_probs[0, :, 1].cpu().numpy()  # 删除概率
+            lambda_sub = rates_probs[0, :, 2].cpu().numpy()  # 替换概率
+            lambda_keep = rates_probs[0, :, 3].cpu().numpy()  # 保持概率
+
             insert_probs = output['insert_probs']
             substitute_probs = output['substitute_probs']
-
-            # 修复索引错位bug：模型输出顺序是 [ins_rate, del_rate, sub_rate, keep_rate]
-            # 因此索引 0=插入, 1=删除, 2=替换, 3=保持
-            lambda_ins = rates[0, :, 0].cpu().numpy()  # 插入速率
-            lambda_del = rates[0, :, 1].cpu().numpy()  # 删除速率
-            lambda_sub = rates[0, :, 2].cpu().numpy()  # 替换速率
-            lambda_keep = rates[0, :, 3].cpu().numpy()  # 保持速率
 
             # 统计操作速率信息
             ins_rate_mean = float(lambda_ins.mean())
@@ -329,7 +331,7 @@ class SimpleSymbolicRegression:
 
                         proposals.append(ActionProposal(
                             action_type='substitute',
-                            position=current_token_idx,
+                            position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
                             token=token_name,
                             score=lambda_sub[pos] * prob.item(),
                             new_tokens=new_tokens
@@ -358,7 +360,7 @@ class SimpleSymbolicRegression:
 
                         proposals.append(ActionProposal(
                             action_type='delete',
-                            position=current_token_idx,
+                            position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
                             score=lambda_del[pos],
                             new_tokens=new_tokens
                         ))
@@ -386,7 +388,7 @@ class SimpleSymbolicRegression:
 
                     proposals.append(ActionProposal(
                         action_type='keep',
-                        position=current_token_idx,
+                        position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
                         score=lambda_keep[pos],
                         new_tokens=new_tokens
                     ))
@@ -414,6 +416,20 @@ class SimpleSymbolicRegression:
                            f"time: model={model_forward_time:.1f}ms total={total_time:.1f}ms | "
                            f"current_tokens={','.join(current_tokens) if len(current_tokens)<=10 else ','.join(current_tokens[:10])+'...'}",
                            "simple_search", level=3)
+
+        # 新增：记录每个位置的详细操作分数（简洁版）
+        if self.logger and self._is_main_process():
+            self.logger.log_position_action_scores(
+                step=step,
+                current_tokens=current_tokens,
+                lambda_ins=lambda_ins,
+                lambda_del=lambda_del,
+                lambda_sub=lambda_sub,
+                lambda_keep=lambda_keep,
+                threshold=self.min_action_score,
+                context="simple_search",
+                level=3  # level=3是推理日志，写入inference.log
+            )
 
         return proposals
 
@@ -486,8 +502,23 @@ class SimpleSymbolicRegression:
 
         # 4. 从前往后应用操作
         for action in sorted_actions:
-            # 计算应用偏移后的实际位置
-            actual_position = action.position + position_offset
+            # 计算实际位置：将input_ids位置转换为current_tokens位置
+            # input_ids: [BOS, token1, token2, ...]
+            # current_tokens: [token1, token2, ...]
+            if action.action_type == 'insert':
+                # INSERT操作：position表示在哪个input_ids位置之后插入
+                # INSERT(0)在BOS之后插入 → current_tokens索引0
+                # INSERT(p)在位置p之后插入 → current_tokens索引p（如果p=0）或p-1之后（如果p>0）
+                if action.position == 0:
+                    # 在BOS之后插入，插入到current_tokens开头
+                    actual_position = 0 + position_offset
+                else:
+                    # 在位置p之后插入，插入到current_tokens的位置p（因为current_tokens不包含BOS）
+                    actual_position = action.position + position_offset
+            else:
+                # DELETE/SUBSTITUTE/KEEP操作：position指向input_ids位置
+                # 需要转换为current_tokens位置：pos-1（跳过BOS）
+                actual_position = (action.position - 1) + position_offset
 
             # 确保位置在有效范围内
             actual_position = max(0, min(actual_position, len(result_tokens)))

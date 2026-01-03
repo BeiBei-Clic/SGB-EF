@@ -250,15 +250,9 @@ class LlamaEditFlowBackbone(nn.Module):
 
         # H. 计算五大输出
 
-        # 操作类型预测（使用softmax归一化，确保互斥）
+        # 操作类型预测（返回原始logits，不经过softmax）
+        # 这样训练时可以直接在logit空间操作，避免log(概率)的数学错误
         rates_logits = self.rates_head(hidden_states)  # (batch_size, seq_len, 4)
-        rates_probs = F.softmax(rates_logits, dim=-1)   # (batch_size, seq_len, 4)
-
-        # 分解为四个操作的概率（每个都是batch_size, seq_len, 1）
-        ins_rate = rates_probs[:, :, 0:1]  # 插入概率
-        del_rate = rates_probs[:, :, 1:2]  # 删除概率
-        sub_rate = rates_probs[:, :, 2:3]  # 替换概率
-        keep_rate = rates_probs[:, :, 3:4]  # 保持原样概率
 
         # 词汇分布预测
         ins_logits = self.ins_vocab_head(hidden_states)
@@ -272,17 +266,17 @@ class LlamaEditFlowBackbone(nn.Module):
             min_val = torch.finfo(float_type).min / 2  # 留出余量避免数值问题
             ins_logits = ins_logits.masked_fill(invalid_mask, min_val)
             sub_logits = sub_logits.masked_fill(invalid_mask, min_val)
-            ins_rate = ins_rate * attention_mask.unsqueeze(-1)
-            del_rate = del_rate * attention_mask.unsqueeze(-1)
-            sub_rate = sub_rate * attention_mask.unsqueeze(-1)
-            keep_rate = keep_rate * attention_mask.unsqueeze(-1)
+            # 将rates_logits的无效位置也设为负无穷
+            # rates_logits形状: (batch, seq_len, 4)，需要扩展invalid_mask到 (batch, seq_len, 4)
+            invalid_mask_rates = invalid_mask.expand(-1, -1, 4)  # (batch, seq_len, 4)
+            rates_logits = rates_logits.masked_fill(invalid_mask_rates, min_val)
 
         # 计算概率分布
         insert_probs = F.softmax(ins_logits, dim=-1)
         substitute_probs = F.softmax(sub_logits, dim=-1)
 
         return {
-            'rates': (ins_rate, del_rate, sub_rate, keep_rate),
+            'rates_logits': rates_logits,  # 返回原始logits而不是概率
             'insert_logits': ins_logits,
             'substitute_logits': sub_logits,
             'insert_probs': insert_probs,
