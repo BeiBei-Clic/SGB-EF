@@ -75,7 +75,7 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_epochs 50 \
-    --num_samples 1000000\
+    --num_samples 10000000\
     --batch_size 960
 
 accelerate launch \

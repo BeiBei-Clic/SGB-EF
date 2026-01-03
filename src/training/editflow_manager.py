@@ -139,10 +139,9 @@ class EditFlowManager:
         self.accelerator.wait_for_everyone()
 
         # 4. 使用 Hugging Face datasets 加载数据
-        # 设置stream参数：默认使用流式加载以节省内存
-        # 🔧 临时修复：强制禁用stream模式以测试数据迭代器问题
-        use_stream = False  # getattr(self.args, 'dataset_stream', True)
-        num_proc = getattr(self.args, 'dataset_num_proc', None)
+        # 使用命令行参数控制数据加载模式
+        use_stream = self.args.dataset_stream
+        num_proc = self.args.dataset_num_proc
 
         if self.accelerator.is_local_main_process:
             print(f"使用 Hugging Face datasets 加载数据 (stream={use_stream})...")
@@ -233,19 +232,15 @@ class EditFlowManager:
                 print(f"警告: 测试集大小({test_size}) < batch_size({self.args.batch_size})，禁用drop_last")
 
         # 根据stream模式确定DataLoader参数
-        if is_stream_mode:
-            train_shuffle, train_num_workers = False, 0
-            test_num_workers = 0
-        else:
-            train_shuffle, train_num_workers = True, self.args.num_workers
-            test_num_workers = self.args.num_workers
+        train_shuffle = not is_stream_mode
+        num_workers = 0 if is_stream_mode else self.accelerator.num_processes
 
         # 创建DataLoader
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=self.args.batch_size,
             shuffle=train_shuffle,
-            num_workers=train_num_workers,
+            num_workers=num_workers,
             collate_fn=custom_collate_fn,
             drop_last=train_drop_last,
             pin_memory=True
@@ -255,7 +250,7 @@ class EditFlowManager:
             test_dataset,
             batch_size=self.args.batch_size,
             shuffle=False,
-            num_workers=test_num_workers,
+            num_workers=num_workers,
             collate_fn=custom_collate_fn,
             drop_last=test_drop_last
         )
