@@ -88,9 +88,9 @@ accelerate launch \
     --mixed_precision=bf16 \
     --dynamo_backend=no \
     train.py \
-    --num_epochs 50 \
+    --num_epochs 100 \
     --num_samples 1\
-    --batch_size 32 \
+    --batch_size 1 \
     --debug 1
 
 # 将会话挂到后台
@@ -110,4 +110,6 @@ Ctrl + B, [
 Ctrl + C
 # 退出复制模式
 Ctrl + D
+#推理测试命令
+python example.py --sample_idx 96992
 ```
