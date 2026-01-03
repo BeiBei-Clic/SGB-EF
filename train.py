@@ -21,7 +21,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 # 设置NCCL超时时间为无穷大，避免数据生成时的等待超时
 os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
-os.environ["NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
 # 额外的NCCL超时设置，确保无限等待
 os.environ["NCCL_P2P_DISABLE"] = "1"     # 禁用P2P以避免某些通信问题
 os.environ["NCCL_IB_DISABLE"] = "1"      # 禁用InfiniBand（如果不是必需的）
@@ -73,7 +73,10 @@ def main():
     parser.add_argument("--use_fp16", type=bool, default=True, help="是否使用FP16混合精度训练")
     parser.add_argument("--log_with", type=str, default=None, help="日志记录方式 (如 wandb, tensorboard)")
     parser.add_argument("--debug", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="是否启用调试模式（记录详细的训练日志）")
-    parser.add_argument("--num_workers", type=int, default=0, help="数据加载进程数（DataLoader的num_workers参数)。注意：使用DDP分布式训练时建议设为0，避免多进程死锁")
+
+    # 数据加载参数
+    parser.add_argument("--dataset_stream", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否使用流式模式加载数据（推荐True，避免大样本OOM）")
+    parser.add_argument("--dataset_num_proc", type=int, default=None, help="数据预处理进程数（仅当dataset_stream=False时生效，None=自动选择CPU核心数，建议设为4-8）")
 
     # 多阈值推理参数（用于推理时）
     parser.add_argument("--action_thresholds", type=str, default=None,
