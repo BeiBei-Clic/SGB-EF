@@ -238,19 +238,26 @@ def generate_flow_samples(
     random.seed(seed_val)
     np.random.seed(seed_val)
 
-    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth_{max_expr_length}len.txt"
+    # 主文件使用parquet格式
+    filename = f"data/flow_samples_{num_samples}_{max_dim}dim_{n_points}pts_{max_depth}depth_{max_expr_length}len.parquet"
     num_batches = (num_samples + batch_size - 1) // batch_size
     temp_dir = "data/temp"
     os.makedirs(temp_dir, exist_ok=True)
-    batch_filenames = [f"{temp_dir}/{os.path.basename(filename).replace('.txt', f'_batch_{i + 1}.txt')}" for i in range(num_batches)]
+    batch_filenames = [f"{temp_dir}/{os.path.basename(filename).replace('.parquet', f'_batch_{i + 1}.txt')}" for i in range(num_batches)]
 
-    # 主文件存在且无批次文件 → 数据完整
-    if os.path.exists(filename) and not any(os.path.exists(f) for f in batch_filenames):
+    # 断点续传检查逻辑（只检查parquet）
+    # 情况1：parquet文件存在 → 数据完整，直接返回
+    if os.path.exists(filename):
+        if verbose:
+            print(f"✓ Parquet文件已存在，跳过生成: {filename}")
         return
 
-    # 主文件存在且有批次文件 → 直接进入合并阶段
-    if os.path.exists(filename) and any(os.path.exists(f) for f in batch_filenames):
-        merge_batches_to_main_file(filename, batch_filenames, num_batches)
+    # 情况2：parquet不存在，检查是否有中断的生成任务
+    txt_filename = filename.replace('.parquet', '.txt')
+    if os.path.exists(txt_filename) and any(os.path.exists(f) for f in batch_filenames):
+        if verbose:
+            print(f"检测到中断的生成任务，正在恢复...")
+        merge_batches_to_main_file(txt_filename, batch_filenames, num_batches, verbose=verbose)
         return
 
     if num_processes is None:
@@ -330,18 +337,22 @@ def generate_flow_samples(
         dim_dist = ', '.join(f"{dim}维:{count}个" for dim, count in sorted(total_dimension_count.items()))
         print(f"\n已完成批次的维度分布: {dim_dist}")
 
-    merge_batches_to_main_file(filename, batch_filenames, num_batches)
+    # 合并批次文件到txt，然后生成parquet
+    txt_filename = filename.replace('.parquet', '.txt')
+    merge_batches_to_main_file(txt_filename, batch_filenames, num_batches, verbose=verbose)
 
 
-def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_batches: int):
-    """合并批次文件到主文件（用于中断恢复）
+def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_batches: int, verbose: bool = True):
+    """合并批次文件到主文件，并生成Parquet格式
 
     Args:
-        filename: 主文件名
+        filename: txt主文件名
         batch_filenames: 批次文件列表
         num_batches: 总批次数
+        verbose: 是否显示详细输出
     """
     index_filename = filename.replace('.txt', '_dimension_index.json')
+    parquet_filename = filename.replace('.txt', '.parquet')
     dimension_samples = {}
 
     if os.path.exists(index_filename) and os.path.exists(filename):
@@ -383,3 +394,39 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
     os.makedirs(os.path.dirname(index_filename), exist_ok=True)
     with open(index_filename, 'w', encoding='utf-8') as f:
         json.dump({str(dim): [int(pos) for pos in positions] for dim, positions in dimension_samples.items()}, f, indent=2)
+
+    # 生成Parquet文件（更高效的格式）
+    if not os.path.exists(parquet_filename):
+        if verbose:
+            print(f"\n正在生成 Parquet 文件: {parquet_filename}")
+
+        import pandas as pd
+        from tqdm import tqdm
+
+        # 读取txt文件中的所有样本
+        samples = []
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, desc="读取txt样本", unit="样本"):
+                line = line.strip()
+                if line:
+                    samples.append(json.loads(line))
+
+        # 转换为DataFrame并保存为Parquet
+        df = pd.DataFrame(samples)
+        df.to_parquet(
+            parquet_filename,
+            engine='pyarrow',
+            compression='snappy',  # 快速压缩
+            index=False
+        )
+
+        if verbose:
+            txt_size = os.path.getsize(filename) / (1024**3)
+            parquet_size = os.path.getsize(parquet_filename) / (1024**3)
+            compression_ratio = (1 - parquet_size / txt_size) * 100
+            print(f"✓ Parquet 文件生成完成:")
+            print(f"  TXT 大小:   {txt_size:.2f} GB")
+            print(f"  Parquet 大小: {parquet_size:.2f} GB (压缩 {compression_ratio:.1f}%)")
+            print(f"  样本数量:   {len(samples)}")
+    elif verbose:
+        print(f"✓ Parquet 文件已存在，跳过生成: {parquet_filename}")

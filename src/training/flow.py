@@ -311,7 +311,7 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
     使用 Hugging Face datasets 加载并预处理数据
 
     Args:
-        data_file: 数据文件路径 (.txt格式，每行一个JSON样本)
+        data_file: 数据文件路径 (.parquet格式)
         tokenizer: 分词器
         max_dim: 最大维度
         max_expr_length: 表达式最大长度
@@ -323,13 +323,13 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
     """
     data_files = {"train": data_file}
 
-    # 加载原始文本数据
+    # 加载Parquet格式数据
     if stream:
         # 流式加载：适合大文件，不一次性加载到内存
-        raw_dataset = load_dataset("text", data_files=data_files, split="train", streaming=True)
+        raw_dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=True)
     else:
         # 一次性加载：适合小文件，后续处理更快
-        raw_dataset = load_dataset("text", data_files=data_files, split="train")
+        raw_dataset = load_dataset("parquet", data_files=data_files, split="train")
 
     # 获取token相关信息
     pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
@@ -339,56 +339,45 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
 
     def process_function(examples):
         """
-        预处理函数：将JSON字符串转换为模型所需的格式
+        预处理函数：将Parquet数据转换为模型所需的格式
+        Parquet直接返回字典，不需要json.loads
         """
-        # 处理单个样本（streaming模式，batch_size=1时）
-        if isinstance(examples, dict) and 'text' in examples:
-            text = examples['text']
-            # 检查是否已经是list（streaming模式可能批处理）
-            if isinstance(text, list):
-                lines = text
-            else:
-                lines = [text]
+        # Parquet加载后直接是字典列表
+        # 获取batch size
+        if isinstance(examples['x_values'], list):
+            batch_size = len(examples['x_values'])
         else:
-            # 处理batch（非streaming模式）
-            lines = examples['text']
-
-        batch_size = len(lines)
+            # 单个样本的情况
+            batch_size = 1
+            examples = {k: [v] for k, v in examples.items()}
 
         # 预分配列表
         outputs = {
-            'x_values': [],
-            'y_target': [],
-            'residuals': [],
+            'x_values': examples['x_values'],
+            'y_target': examples['y_target'],
+            'residuals': examples['residuals'],
             'z0_token_ids': [],
             'z1_token_ids': [],
             'gap_token': []
         }
 
-        for line in lines:
-            sample = json.loads(line)
+        # Token处理
+        def pad_z_sequence(tokens):
+            # 过滤掉None值，并确保所有token都是整数
+            filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
+            if len(filtered_tokens) != len(tokens):
+                print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token")
 
-            # 添加数值数据
-            outputs['x_values'].append(sample['x_values'])
-            outputs['y_target'].append(sample['y_target'])
-            outputs['residuals'].append(sample['residuals'])
+            # 添加BOS token并截断
+            tokens = [bos_token_id] + filtered_tokens[:max_expr_length-1]
+            # Padding到固定长度
+            tokens.extend([pad_token_id] * (max_expr_length - len(tokens)))
+            return tokens
 
-            # Token处理
-            def pad_z_sequence(tokens):
-                # 过滤掉None值，并确保所有token都是整数
-                filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
-                if len(filtered_tokens) != len(tokens):
-                    print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token")
-
-                # 添加BOS token并截断
-                tokens = [bos_token_id] + filtered_tokens[:max_expr_length-1]
-                # Padding到固定长度
-                tokens.extend([pad_token_id] * (max_expr_length - len(tokens)))
-                return tokens
-
-            # 转换token
-            z0_tokens = tokenizer.convert_tokens_to_ids(sample['z0_tokens'])
-            z1_tokens = tokenizer.convert_tokens_to_ids(sample['z1_tokens'])
+        # 转换token（需要逐个处理因为需要padding）
+        for i in range(batch_size):
+            z0_tokens = tokenizer.convert_tokens_to_ids(examples['z0_tokens'][i])
+            z1_tokens = tokenizer.convert_tokens_to_ids(examples['z1_tokens'][i])
 
             outputs['z0_token_ids'].append(pad_z_sequence(z0_tokens))
             outputs['z1_token_ids'].append(pad_z_sequence(z1_tokens))
@@ -402,7 +391,7 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
         tokenized_dataset = raw_dataset.map(
             process_function,
             batched=True,
-            remove_columns=["text"]
+            remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens']
         )
     else:
         # 非流式模式：使用多进程加速
@@ -410,7 +399,7 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
             process_function,
             batched=True,
             num_proc=num_proc,
-            remove_columns=["text"],
+            remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens'],
             desc="Preprocessing dataset"
         )
 
@@ -473,14 +462,20 @@ class FlowDataset(torch.utils.data.Dataset):
             self._dataset_length = len(self._data_list)
         else:
             self._data_list = None
-            # 流式模式：直接统计文件行数（比遍历dataset快得多）
+            # 流式模式：从parquet元数据获取行数（快速准确）
             try:
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    self._dataset_length = sum(1 for _ in f)
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(data_file)
+                self._dataset_length = pf.metadata.num_rows
             except Exception as e:
-                # 如果文件统计失败，使用一个默认的大数
-                print(f"警告: 无法统计文件行数，使用默认值。错误: {e}")
-                self._dataset_length = 1000000  # 默认值
+                # 如果parquet读取失败，尝试遍历dataset（较慢）
+                print(f"警告: 无法从Parquet元数据获取行数，尝试遍历dataset。错误: {e}")
+                try:
+                    self._dataset_length = sum(1 for _ in self._hf_dataset)
+                except:
+                    # 如果遍历也失败，使用默认值
+                    print(f"警告: 无法统计数据集行数，使用默认值。")
+                    self._dataset_length = 1000000  # 默认值
 
     def __len__(self):
         """返回数据集大小"""

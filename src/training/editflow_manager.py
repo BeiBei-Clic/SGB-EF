@@ -105,7 +105,7 @@ class EditFlowManager:
         """准备训练数据，使用 Hugging Face datasets 加载"""
 
         # 1. 数据生成阶段：只使用主进程（单进程）
-        cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth_{self.args.max_expr_length}len.txt"
+        cache_filename = f"data/flow_samples_{self.args.num_samples}_{self.args.max_dim}dim_{self.args.n_points}pts_{self.args.max_depth}depth_{self.args.max_expr_length}len.parquet"
 
         # 只有主进程负责数据生成，避免NCCL通信问题
         if self.accelerator.is_local_main_process:

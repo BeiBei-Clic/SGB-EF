@@ -78,8 +78,9 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_epochs 50 \
-    --num_samples 10000000\
-    --batch_size 960
+    --num_samples 10000000 \
+    --batch_size 960 \
+    --dataset_stream False
 
 accelerate launch \
     --num_processes=1 \
