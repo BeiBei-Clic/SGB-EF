@@ -49,7 +49,7 @@ class ActionProposal:
 
     Attributes:
         action_type: 操作类型 ('insert', 'substitute', 'delete')
-        position: 位置索引
+        position: 位置索引（位置0=BOS，位置1,2,3...=序列中的后续token）
         token: 要插入或替换的token（仅对insert/substitute有效）
         score: 操作分数
         new_tokens: 执行操作后的新token列表
@@ -172,28 +172,26 @@ class SimpleSymbolicRegression:
 
             # 为每个位置选择最佳操作（在联合logit空间，和训练时完全一致）
             for pos in range(len(current_tokens) + 1):
-                input_ids_pos = pos  # 位置索引（包含BOS token）
+                input_ids_pos = pos  # 位置索引（位置0=BOS，位置1,2,3...=后续token）
 
                 if input_ids_pos >= rates_logits.shape[1]:
                     continue
 
-                # 计算当前token的位置信息（用于日志）
-                current_token_idx = input_ids_pos - 1
+                # 获取当前位置的token信息（位置0是BOS token）
                 token_id = None
                 token_name = None
                 if input_ids_pos == 0:
                     token_name = '<BOS>'
                     token_id = self.tokenizer.convert_tokens_to_ids('<s>')
-                elif 0 <= current_token_idx < len(current_tokens):
-                    token_name = current_tokens[current_token_idx]
+                elif 0 <= (input_ids_pos - 1) < len(current_tokens):
+                    token_name = current_tokens[input_ids_pos - 1]
                     token_id = self.tokenizer.convert_tokens_to_ids(token_name)
 
                 # 记录token位置映射和模型预测
                 if self.logger and self._is_main_process() and token_name is not None:
                     self.logger.log_token_position_mapping(
                         step=step,
-                        input_ids_pos=input_ids_pos,
-                        current_token_idx=current_token_idx,
+                        position=input_ids_pos,
                         token_id=token_id,
                         token_name=token_name,
                         lambda_ins=lambda_ins[pos] if pos < len(lambda_ins) else 0.0,
@@ -278,8 +276,7 @@ class SimpleSymbolicRegression:
                     if self.logger and self._is_main_process():
                         self.logger.log_action_execution(
                             step=step,
-                            input_ids_pos=input_ids_pos,
-                            current_token_idx=-1,  # INSERT操作没有current_token_idx
+                            position=input_ids_pos,
                             action_type='insert',
                             token_name=token_name,
                             score=best_prob
@@ -305,8 +302,7 @@ class SimpleSymbolicRegression:
                             if self.logger and self._is_main_process():
                                 self.logger.log_action_execution(
                                     step=step,
-                                    input_ids_pos=input_ids_pos,
-                                    current_token_idx=current_token_idx,
+                                    position=input_ids_pos,
                                     action_type='delete',
                                     token_name=deleted_token,
                                     score=best_prob
@@ -350,8 +346,7 @@ class SimpleSymbolicRegression:
                         if self.logger and self._is_main_process():
                             self.logger.log_action_execution(
                                 step=step,
-                                input_ids_pos=input_ids_pos,
-                                current_token_idx=current_token_idx,
+                                position=input_ids_pos,
                                 action_type='substitute',
                                 token_name=f"{old_token}→{token_name}",
                                 score=best_prob
@@ -373,8 +368,7 @@ class SimpleSymbolicRegression:
                         if self.logger and self._is_main_process():
                             self.logger.log_action_execution(
                                 step=step,
-                                input_ids_pos=input_ids_pos,
-                                current_token_idx=current_token_idx,
+                                position=input_ids_pos,
                                 action_type='keep',
                                 token_name=kept_token,
                                 score=best_prob
@@ -389,17 +383,20 @@ class SimpleSymbolicRegression:
                                actions: List[ActionProposal]) -> List[str]:
         """同时应用多个操作到表达式，智能处理操作间的位置依赖关系
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的实际token
+        current_tokens不包含BOS，但action.position使用的是包含BOS的位置索引
+
         核心思路：
         1. 操作按原始位置从前往后应用
         2. 每次操作后，动态更新后续操作的位置
         3. 插入操作使后续位置+1，删除操作使后续位置-1
 
         Args:
-            current_tokens: 当前token列表
+            current_tokens: 当前token列表（不含BOS）
             actions: 要应用的操作列表（应该已经按阈值过滤）
 
         Returns:
-            应用所有操作后的新token列表
+            应用所有操作后的新token列表（不含BOS）
         """
         if not actions:
             return current_tokens.copy()
@@ -434,8 +431,8 @@ class SimpleSymbolicRegression:
             print(f"    [DEBUG REVERSE DELETE START] result_tokens={result_tokens}, delete_actions={[a.position for a in delete_actions]}")
 
         for i, action in enumerate(reversed(delete_actions)):
-            # DELETE操作：position指向input_ids位置
-            # 需要转换为current_tokens位置：pos-1（跳过BOS）
+            # DELETE操作：position指向input_ids位置（位置0=BOS，位置1,2,3...=实际token）
+            # 需要转换为current_tokens位置：pos-1（因为current_tokens不包含BOS）
             # 注意：从后往前删除时，直接使用原始位置，不需要offset
             actual_position = (action.position - 1)
 
@@ -462,14 +459,14 @@ class SimpleSymbolicRegression:
         # 6. 其他操作从前往后执行
         for action in other_actions:
             # 计算实际位置：将input_ids位置转换为current_tokens位置
-            # input_ids: [BOS, token1, token2, ...]
-            # current_tokens: [token1, token2, ...]
+            # input_ids位置：位置0=BOS，位置1,2,3...=实际token
+            # current_tokens：不包含BOS，所以需要转换
             if action.action_type == 'insert':
                 # INSERT操作：position表示在哪个input_ids位置之后插入
                 # INSERT(0)在BOS之后插入 → current_tokens索引0
                 # INSERT(p)在位置p之后插入 → current_tokens索引p（如果p=0）或p-1之后（如果p>0）
                 if action.position == 0:
-                    # 在BOS之后插入，插入到current_tokens开头
+                    # 在BOS（位置0）之后插入，插入到current_tokens开头
                     actual_position = 0 + position_offset
                 else:
                     # 在位置p之后插入，插入到current_tokens的位置p（因为current_tokens不包含BOS）

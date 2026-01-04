@@ -21,8 +21,13 @@ DEFAULT_MODEL_PATH = 'checkpoints/continuous_flow_final'
 
 # ============= 辅助函数 =============
 def format_tokens_display(tokens):
-    """格式化Token用于显示"""
-    return ' '.join([f"[{i}]{t}" for i, t in enumerate(tokens)])
+    """格式化Token用于显示
+
+    位置说明：位置0=BOS token，位置1,2,3...=序列中的实际token
+    """
+    # 在token列表开头添加BOS token，统一位置索引
+    tokens_with_bos = ['<BOS>'] + list(tokens)
+    return ' '.join([f"[{i}]{t}" for i, t in enumerate(tokens_with_bos)])
 
 
 def ensure_2d_array(x_values):
@@ -252,7 +257,11 @@ def display_inference_details(
     expr_initial, expr_gt, initial_tokens,
     target_tokens, final_tokens, position_actions_history, history
 ):
-    """显示推理详细信息"""
+    """显示推理详细信息
+
+    位置说明：Token列表中的位置0=<BOS>，位置1,2,3...=实际token
+    操作位置也使用相同的索引规则（位置0=BOS之后，位置1=第一个token之后）
+    """
     print(f"\n初始状态:")
     print(f"  表达式: {expr_initial}")
     print(f"  Tokens: {format_tokens_display(initial_tokens)}")

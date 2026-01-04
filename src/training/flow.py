@@ -100,15 +100,16 @@ class ContinuousFlowLoss:
         # 对每个样本进行处理
         for b in range(batch_size):
             # === 步骤1：构建Z空间到X空间的位置映射表 ===
+            # 位置说明：X空间位置0=BOS token，位置1,2,3...=序列中的实际token
             z_to_x_map = {}  # {z_pos: x_pos or None}
             insert_positions = []  # 记录所有gap位置，用于后续INSERT操作映射
 
             # 🔧 修复：BOS位置也应该参与映射，这样gap位置才能找到之前的非gap位置
             # 修改前：跳过BOS位置，导致gap找不到之前的非gap，INSERT标记错误
-            # 修改后：BOS映射到X空间位置0，gap可以正确找到BOS作为插入点
+            # 修改后：BOS映射到X空间位置0（位置0=BOS），gap可以正确找到BOS作为插入点
             bos_token = tokenizer.convert_tokens_to_ids('<s>')
 
-            # 从X空间位置0开始映射（包含BOS）
+            # 从X空间位置0开始映射（位置0是BOS token）
             x_index = 0
 
             for z_pos in range(z_seq_len):
@@ -121,7 +122,7 @@ class ContinuousFlowLoss:
 
                 # 🔧 修复：BOS token也要映射到X空间，这样gap位置才能找到BOS作为插入点
                 # 修改前：BOS不映射，导致gap找不到之前的非gap位置
-                # 修改后：BOS映射到X空间位置0
+                # 修改后：BOS映射到X空间位置0（位置0=BOS，这是序列的开始位置）
                 if token_t == bos_token:
                     z_to_x_map[z_pos] = x_index  # BOS映射到X空间位置0
                     x_index += 1
@@ -194,7 +195,7 @@ class ContinuousFlowLoss:
                             break
 
                     # 如果gap之前没有非gap位置，插入到x_t的开头（位置0）
-                    # 这表示在序列最前面插入（即BOS之后，因为BOS在位置0）
+                    # 这表示在序列最前面插入（位置0是BOS，所以实际是在BOS之后插入）
                     if insert_x_pos is None:
                         insert_x_pos = 0
 

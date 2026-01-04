@@ -561,15 +561,16 @@ class Logger:
             context, level=level
         )
 
-    def log_token_position_mapping(self, step, input_ids_pos, current_token_idx,
-                                    token_id, token_name, lambda_ins, lambda_del,
-                                    lambda_sub, lambda_keep, context="greedy_search", level=3):
+    def log_token_position_mapping(self, step, position, token_id, token_name,
+                                    lambda_ins, lambda_del, lambda_sub, lambda_keep,
+                                    context="greedy_search", level=3):
         """记录token位置映射和模型预测
+
+        位置说明：位置0表示BOS token，位置1、2、3...表示序列中的后续token
 
         Args:
             step (int): 当前推理步数
-            input_ids_pos (int): input_ids中的位置（含BOS）
-            current_token_idx (int): current_tokens中的位置（不含BOS，-1表示无效）
+            position (int): token在序列中的位置（位置0=BOS，位置1,2,3...=后续token）
             token_id (int): token的ID
             token_name (str): token的名称
             lambda_ins (float): INSERT概率
@@ -582,24 +583,24 @@ class Logger:
         if not self._should_log(level):
             return
 
-        current_idx_str = str(current_token_idx) if current_token_idx >= 0 else "N/A"
         self.log(
             "TOKEN_POSITION_MAPPING",
-            f"step={step} | input_ids_pos={input_ids_pos} | current_token_idx={current_idx_str} | "
+            f"step={step} | position={position} | "
             f"token_id={token_id} | token='{token_name}' | "
             f"lambda_ins={lambda_ins:.6f} | lambda_del={lambda_del:.6f} | "
             f"lambda_sub={lambda_sub:.6f} | lambda_keep={lambda_keep:.6f}",
             context, level=level
         )
 
-    def log_action_execution(self, step, input_ids_pos, current_token_idx,
-                              action_type, token_name, score, context="greedy_search", level=3):
+    def log_action_execution(self, step, position, action_type, token_name, score,
+                              context="greedy_search", level=3):
         """记录实际执行的操作
+
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
 
         Args:
             step (int): 当前推理步数
-            input_ids_pos (int): input_ids位置（含BOS）
-            current_token_idx (int): current_tokens位置（不含BOS，-1表示无效）
+            position (int): 操作位置（位置0=BOS，位置1,2,3...=后续token）
             action_type (str): 操作类型（insert/substitute/delete/keep）
             token_name (str): 操作涉及的token名称
             score (float): 操作分数
@@ -609,11 +610,10 @@ class Logger:
         if not self._should_log(level):
             return
 
-        current_idx_str = str(current_token_idx) if current_token_idx >= 0 else "N/A"
         token_str = f"token='{token_name}'" if token_name else ""
         self.log(
             "ACTION_EXECUTION",
-            f"step={step} | input_ids_pos={input_ids_pos} | current_token_idx={current_idx_str} | "
+            f"step={step} | position={position} | "
             f"action={action_type.upper()} | {token_str} | score={score:.4f}",
             context, level=level
         )
@@ -623,9 +623,11 @@ class Logger:
                                  best_action, context="greedy_search", level=3):
         """记录每个位置的预测结果（带token信息）
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             step (int): 当前推理步数
-            pos (int): 位置索引
+            pos (int): 位置索引（位置0=BOS，位置1,2,3...=后续token）
             token_name (str): 该位置的token名称
             lambda_ins (float): INSERT概率
             lambda_del (float): DELETE概率
@@ -660,9 +662,11 @@ class Logger:
                                      context="greedy_search", level=3):
         """记录删除操作后的位置变化
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             step (int): 当前推理步数
-            deleted_pos (int): 被删除的位置（input_ids_pos）
+            deleted_pos (int): 被删除的位置（位置0=BOS，位置1,2,3...=后续token）
             old_tokens (list): 删除前的token列表
             new_tokens (list): 删除后的token列表
             context (str): 上下文标识
@@ -671,9 +675,11 @@ class Logger:
         if not self._should_log(level):
             return
 
-        # 格式化token列表，显示位置索引
-        old_str = ", ".join([f"{i}:{t}" for i, t in enumerate(old_tokens)])
-        new_str = ", ".join([f"{i}:{t}" for i, t in enumerate(new_tokens)])
+        # 格式化token列表，显示位置索引（添加BOS token，位置0=BOS）
+        old_tokens_with_bos = ['<BOS>'] + list(old_tokens)
+        new_tokens_with_bos = ['<BOS>'] + list(new_tokens)
+        old_str = ", ".join([f"{i}:{t}" for i, t in enumerate(old_tokens_with_bos)])
+        new_str = ", ".join([f"{i}:{t}" for i, t in enumerate(new_tokens_with_bos)])
 
         self.log(
             "POSITION_AFTER_DELETE",
@@ -687,9 +693,11 @@ class Logger:
                              context="greedy_search", level=3):
         """记录 INSERT 操作的候选 token
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             step (int): 当前推理步数
-            position (int): 位置索引
+            position (int): 位置索引（位置0=BOS，位置1,2,3...=后续token）
             position_desc (str): 位置描述（如 "位置0(开头插入)"）
             lambda_ins (float): 插入概率
             top_token_ids (torch.Tensor): top-k token IDs
@@ -722,9 +730,11 @@ class Logger:
                                   context="greedy_search", level=3):
         """记录 SUBSTITUTE 操作的候选 token
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             step (int): 当前推理步数
-            position (int): 位置索引
+            position (int): 位置索引（位置0=BOS，位置1,2,3...=后续token）
             current_token (str): 当前 token
             lambda_sub (float): 替换概率
             top_token_ids (torch.Tensor): top-k token IDs
@@ -759,10 +769,12 @@ class Logger:
                                          context="", level=2):
         """记录训练时每个位置的操作概率分布
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             batch_idx (int): batch 索引
             sample_idx (int): sample 索引
-            position (int): token 位置
+            position (int): token 位置（位置0=BOS，位置1,2,3...=后续token）
             x_t_value (int): 当前位置的 token ID
             lambda_ins (float): 插入概率
             lambda_del (float): 删除概率
@@ -787,10 +799,12 @@ class Logger:
                                           context="", level=2):
         """记录训练时 SUBSTITUTE 操作的候选 token
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             batch_idx (int): batch 索引
             sample_idx (int): sample 索引
-            position (int): token 位置
+            position (int): token 位置（位置0=BOS，位置1,2,3...=后续token）
             x_t_value (int): 当前位置的 token ID
             lambda_sub (float): 替换概率
             substitute_logits (torch.Tensor): [vocab_size] 替换操作的 logits
@@ -825,10 +839,12 @@ class Logger:
                                       context="", level=2):
         """记录训练时 INSERT 操作的候选 token
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             batch_idx (int): batch 索引
             sample_idx (int): sample 索引
-            position (int): token 位置
+            position (int): token 位置（位置0=BOS，位置1,2,3...=后续token）
             lambda_ins (float): 插入概率
             insert_logits (torch.Tensor): [vocab_size] 插入操作的 logits
             tokenizer: tokenizer 对象
@@ -862,10 +878,12 @@ class Logger:
                                context="", level=2):
         """记录训练时预测 vs Ground Truth 的对比
 
+        位置说明：位置0=BOS token，位置1,2,3...=序列中的后续token
+
         Args:
             batch_idx (int): batch 索引
             sample_idx (int): sample 索引
-            position (int): token 位置
+            position (int): token 位置（位置0=BOS，位置1,2,3...=后续token）
             x_t_value (int): 当前位置的 token ID
             gt_operation (str): Ground Truth 操作描述
             pred_operation (str): 预测操作描述
