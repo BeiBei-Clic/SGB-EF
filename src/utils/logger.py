@@ -2,6 +2,7 @@
 import os
 import datetime
 import torch
+import numpy as np
 
 
 class Logger:
@@ -46,6 +47,61 @@ class Logger:
         # 确保日志目录存在
         os.makedirs("logs", exist_ok=True)
 
+    def _get_timestamp(self):
+        """获取格式化的时间戳"""
+        return datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+    def _should_log(self, level):
+        """检查是否应该记录该级别的日志"""
+        if not self.enabled:
+            return False
+        # level=2需要debug_mode启用
+        if level == 2 and not self.debug_mode:
+            return False
+        return True
+
+    def _get_log_file(self, level):
+        """根据日志级别获取日志文件路径"""
+        if level == 1:
+            return self.TRAIN_LOG
+        elif level == 2:
+            return self.TRAIN_DEBUG_LOG
+        elif level == 3:
+            return self.INFERENCE_LOG
+        return self.TRAIN_LOG
+
+    def _format_array_info(self, values, max_elements, sample_first_n, sample_last_n):
+        """格式化数组信息（通用方法，用于torch.Tensor和np.ndarray）
+
+        Args:
+            values: 展平后的数组值
+            max_elements: 最大元素数量
+            sample_first_n: 采样前N个
+            sample_last_n: 采样后N个
+
+        Returns:
+            格式化后的字符串
+        """
+        total = len(values)
+        if total == 0:
+            return " | EMPTY"
+        elif total <= max_elements:
+            # 元素较少，显示所有内容
+            values_str = ", ".join([f"{v:.6f}" for v in values])
+            return f" | values=[{values_str}]"
+        else:
+            # 元素过多，显示采样
+            first_vals = values[:sample_first_n]
+            last_vals = values[-sample_last_n:]
+
+            first_str = ", ".join([f"{v:.6f}" for v in first_vals])
+            last_str = ", ".join([f"{v:.6f}" for v in last_vals])
+
+            result = f" | total_elements={total} | sampled: first_{sample_first_n}=[{first_str}] ... last_{sample_last_n}=[{last_str}]"
+            # 额外统计信息
+            result += f" | min={values.min():.6f} | max={values.max():.6f} | mean={values.mean():.6f} | std={values.std():.6f}"
+            return result
+
     def _write(self, msg, filename):
         """内部方法：写入日志到文件，支持自动轮转"""
         if filename not in self._log_line_count:
@@ -74,28 +130,17 @@ class Logger:
             context (str): 上下文
             level (int): 日志级别 (1=训练主日志, 2=训练调试日志, 3=推理日志)
         """
-        if not self.enabled:
+        if not self._should_log(level):
             return
 
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} {step_type}"
         if context:
             msg += f" [{context}]"
         if details:
             msg += f" | {details}"
 
-        # 根据级别选择日志文件
-        if level == 1:
-            self._write(msg, self.TRAIN_LOG)
-        elif level == 2:
-            self._write(msg, self.TRAIN_DEBUG_LOG)
-        elif level == 3:
-            self._write(msg, self.INFERENCE_LOG)
+        self._write(msg, self._get_log_file(level))
 
         # 推理步骤时同时打印到控制台
         if step_type.startswith("INFERENCE_STEP") and self.enabled:
@@ -106,7 +151,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} ERROR {error_type}"
         if context:
             msg += f" [{context}]"
@@ -140,15 +185,10 @@ class Logger:
             sample_first_n (int): 当元素过多时，显示前N个
             sample_last_n (int): 当元素过多时，显示后N个
         """
-        if not self.enabled:
+        if not self._should_log(level):
             return
 
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} TENSOR_VALUES {tensor_name}"
         if context:
             msg += f" [{context}]"
@@ -160,61 +200,23 @@ class Logger:
             # 转换为numpy数组便于处理
             if tensor_cpu.numel() == 0:
                 msg += " | EMPTY"
-            elif tensor_cpu.numel() <= max_elements:
-                # 元素较少，显示所有内容
-                values = tensor_cpu.flatten().numpy()
-                values_str = ", ".join([f"{v:.6f}" for v in values])
-                msg += f" | values=[{values_str}]"
             else:
-                # 元素过多，显示采样
                 values = tensor_cpu.flatten().numpy()
-                total = len(values)
-                first_vals = values[:sample_first_n]
-                last_vals = values[-sample_last_n:]
-
-                first_str = ", ".join([f"{v:.6f}" for v in first_vals])
-                last_str = ", ".join([f"{v:.6f}" for v in last_vals])
-
-                msg += f" | total_elements={total} | sampled: first_{sample_first_n}=[{first_str}] ... last_{sample_last_n}=[{last_str}]"
-
-                # 额外统计信息
-                msg += f" | min={values.min():.6f} | max={values.max():.6f} | mean={values.mean():.6f} | std={values.std():.6f}"
+                msg += self._format_array_info(values, max_elements, sample_first_n, sample_last_n)
 
         elif isinstance(tensor, np.ndarray):
             msg += f" | shape={list(tensor.shape)} | dtype={tensor.dtype}"
 
             if tensor.size == 0:
                 msg += " | EMPTY"
-            elif tensor.size <= max_elements:
-                # 元素较少，显示所有内容
-                values = tensor.flatten()
-                values_str = ", ".join([f"{v:.6f}" for v in values])
-                msg += f" | values=[{values_str}]"
             else:
-                # 元素过多，显示采样
                 values = tensor.flatten()
-                total = len(values)
-                first_vals = values[:sample_first_n]
-                last_vals = values[-sample_last_n:]
-
-                first_str = ", ".join([f"{v:.6f}" for v in first_vals])
-                last_str = ", ".join([f"{v:.6f}" for v in last_vals])
-
-                msg += f" | total_elements={total} | sampled: first_{sample_first_n}=[{first_str}] ... last_{sample_last_n}=[{last_str}]"
-
-                # 额外统计信息
-                msg += f" | min={values.min():.6f} | max={values.max():.6f} | mean={values.mean():.6f} | std={values.std():.6f}"
+                msg += self._format_array_info(values, max_elements, sample_first_n, sample_last_n)
         else:
             # 标量或其他类型
             msg += f" | type={type(tensor).__name__} | value={tensor}"
 
-        # 根据级别选择日志文件
-        if level == 1:
-            self._write(msg, self.TRAIN_LOG)
-        elif level == 2:
-            self._write(msg, self.TRAIN_DEBUG_LOG)
-        elif level == 3:
-            self._write(msg, self.INFERENCE_LOG)
+        self._write(msg, self._get_log_file(level))
 
     # ==================== 样本生成日志 ====================
 
@@ -227,7 +229,7 @@ class Logger:
         if info_only and not details and any(step.startswith(s) for s in ["生成数据点", "计算", "处理删减", "生成当前", "生成删减"]):
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] {step}" + (f" | {details}" if details else "")
         self._write(msg, self.SAMPLE_LOG)
 
@@ -236,7 +238,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] GENERATE_RANDOM_EXPR '{expr_str}' | time={gen_time_ms:.1f}ms"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -245,7 +247,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] EXPR_VALIDATION_PASSED '{expr_str}' len={expr_len} tokens={token_count}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -254,7 +256,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] EXPR_TO_TREE tokens={token_count} | time={convert_time_ms:.1f}ms"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -263,7 +265,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] REDUCE_SEQUENCE {step_count} steps | time={time_ms:.1f}ms"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -272,7 +274,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg1 = f"{timestamp} [{sample_id}] CORRUPT_EXPRESSION step{step} | time={time_ms:.1f}ms"
         msg2 = f"{timestamp} [{sample_id}] CORRUPT_RESULT step{step} '{orig_expr}' → '{corrupt_expr}'"
         self._write(msg1, self.SAMPLE_LOG)
@@ -283,7 +285,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] SKIP_DUPLICATE step{step}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -292,7 +294,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] SKIP_COMPLEX step{step} expr='{expr_str}'"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -301,7 +303,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         expr_info = f" expr='{expr_str}'" if expr_str else ""
         msg = f"{timestamp} [{sample_id}] EVAL_CURR_EXPRESSION step{step} success={success} | time={time_ms:.1f}ms{expr_info}"
         self._write(msg, self.SAMPLE_LOG)
@@ -311,7 +313,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] CONVERT_TO_TREES step{step} | time={time_ms:.1f}ms target_tokens={target_tokens} curr_tokens={curr_tokens}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -320,7 +322,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] LEVENSHTEIN_ALIGNMENT step{step} | time={time_ms:.1f}ms z0_len={z0_len} z1_len={z1_len}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -329,7 +331,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] RESIDUALS_BEFORE_CLIP step{step} | min={min_val:.6f} max={max_val:.6f} mean={mean_val:.6f}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -338,7 +340,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] SKIP_CLIPPED step{step} | clipped={clip_count}/{total_count} threshold={threshold}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -347,7 +349,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] SUCCESS"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -356,7 +358,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] ERROR {error_type}: {error_msg}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -369,7 +371,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] FAILED: {reason}"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -378,7 +380,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         msg = f"{timestamp} [{sample_id}] TIMEOUT: Sample generation exceeded {timeout_seconds}s"
         self._write(msg, self.SAMPLE_LOG)
 
@@ -387,7 +389,7 @@ class Logger:
         if not self.enabled:
             return
 
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         status = "OK" if success else f"FAIL: {error_msg}"
         msg = f"{timestamp} [{sample_id}] EVAL {status} {eval_time_ms:.1f}ms"
         self._write(msg, self.SAMPLE_LOG)
@@ -396,15 +398,10 @@ class Logger:
 
     def log_u_mask_split(self, tensor_name, u_mask, x_t, vocab_size, context="", level=3):
         """按语义拆分记录u_mask（INSERT/DELETE/SUBSTITUTE/KEEP四个独立张量），按位置分行输出"""
-        if not self.enabled:
+        if not self._should_log(level):
             return
 
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        timestamp = self._get_timestamp()
         batch_size, x_seq_len, mask_dim = u_mask.shape
 
         # 按样本分别记录
@@ -442,73 +439,7 @@ class Logger:
                 msg += f"\n    SUBSTITUTE: [{sub_str}]"
                 msg += f"\n    KEEP:      {keep_val:.0f}"
 
-            # 根据级别选择日志文件
-            if level == 1:
-                self._write(msg, self.TRAIN_LOG)
-            elif level == 2:
-                self._write(msg, self.TRAIN_DEBUG_LOG)
-            elif level == 3:
-                self._write(msg, self.INFERENCE_LOG)
-
-    def log_u_mask_detailed(self, tensor_name, u_mask, x_t, vocab_size, context="", level=3):
-        """详细记录u_mask标签的完整结构（按位置和操作类型分解）"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        batch_size, x_seq_len, mask_dim = u_mask.shape
-
-        msg = f"{timestamp} TENSOR_VALUES_DETAILED {tensor_name}"
-        if context:
-            msg += f" [{context}]"
-        msg += f" | shape={list(u_mask.shape)} | vocab_size={vocab_size}"
-
-        # 对每个样本、每个位置进行详细记录
-        for batch_idx in range(batch_size):
-            msg += f"\n  Batch {batch_idx}:"
-
-            for pos in range(x_seq_len):
-                # 跳过pad位置
-                if x_t[batch_idx, pos].item() == 0:
-                    msg += f"\n    Position {pos}: [PAD] stop"
-                    break
-
-                # 提取四个部分（按新顺序：INS, DEL, SUB, KEEP）
-                ins_part = u_mask[batch_idx, pos, :vocab_size]  # 插入部分 [vocab_size]
-                del_part = u_mask[batch_idx, pos, vocab_size]  # 删除部分 [1]
-                sub_part = u_mask[batch_idx, pos, vocab_size+1:2*vocab_size+1]  # 替换部分 [vocab_size]
-                keep_part = u_mask[batch_idx, pos, -1]  # KEEP部分 [1]
-
-                # 找出非零位置
-                ins_nonzero = ins_part.nonzero(as_tuple=False).squeeze(-1)
-                sub_nonzero = sub_part.nonzero(as_tuple=False).squeeze(-1)
-
-                # 处理空tensor的情况
-                ins_count = ins_nonzero.numel() if len(ins_nonzero.shape) > 0 else 0
-                sub_count = sub_nonzero.numel() if len(sub_nonzero.shape) > 0 else 0
-
-                msg += f"\n    Position {pos}:"
-                msg += f"\n      INSERT[{ins_count}]: " + (
-                    f"ids={[int(t.item()) for t in ins_nonzero]}" if ins_count > 0 else "[]"
-                )
-                msg += f"\n      DELETE: {float(del_part.item()):.1f}"
-                msg += f"\n      SUBSTITUTE[{sub_count}]: " + (
-                    f"ids={[int(t.item()) for t in sub_nonzero]}" if sub_count > 0 else "[]"
-                )
-                msg += f"\n      KEEP: {float(keep_part.item()):.1f}"
-
-        # 根据级别选择日志文件
-        if level == 1:
-            self._write(msg, self.TRAIN_LOG)
-        elif level == 2:
-            self._write(msg, self.TRAIN_DEBUG_LOG)
-        elif level == 3:
-            self._write(msg, self.INFERENCE_LOG)
+            self._write(msg, self._get_log_file(level))
 
     def log_edit_operations(self, u_mask_sample, x_t_sample, vocab_size,
                            context="", level=3, max_ops=20, pad_token_id=None):
@@ -517,12 +448,7 @@ class Logger:
         Args:
             pad_token_id: pad token的ID (必须从tokenizer传入，不可为None)
         """
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
+        if not self._should_log(level):
             return
 
         # 要求必须传入pad_token_id
@@ -585,155 +511,6 @@ class Logger:
 
     # ==================== 束搜索推理日志 ====================
 
-    def log_greedy_search_separator(self, title="", level=3):
-        """记录分隔线"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        separator = "=" * 80
-        if title:
-            msg = separator
-            self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
-            self.log("GREEDY_SEARCH", title, "greedy_search", level=level)
-        else:
-            msg = separator
-            self._write(msg, self.TRAIN_DEBUG_LOG if level == 2 else self.INFERENCE_LOG)
-
-    def log_greedy_search_sequence_format(self, input_ids_head, base_length,
-                                         effective_length, current_tokens_head, level=3):
-        """记录推理序列格式信息"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        self.log("SEQUENCE_FORMAT",
-                f"推理序列格式验证 | input_ids[0:5]={input_ids_head} | "
-                f"base_length={base_length} | effective_length={effective_length} | "
-                f"current_tokens={current_tokens_head}",
-                "simple_search", level=level)
-
-    def log_greedy_search_insert_probs(self, position, lambda_rate, tokens, probs, level=3):
-        """记录插入操作的预测概率"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        tokens_str = str(tokens)
-        probs_str = [f"{p:.6f}" for p in probs]
-        self.log("INSERT_PROBS_DEBUG",
-                f"位置{position}: lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
-                "greedy_search", level=level)
-
-    def log_greedy_search_substitute_probs(self, position, current_token, lambda_rate, tokens, probs, level=3):
-        """记录替换操作的预测概率"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        tokens_str = str(tokens)
-        probs_str = [f"{p:.6f}" for p in probs]
-        self.log("SUBSTITUTE_PROBS_DEBUG",
-                f"位置{position}(当前={current_token}): lambda={lambda_rate:.4f} | top_tokens={tokens_str} | probs={probs_str}",
-                "greedy_search", level=level)
-
-    def log_greedy_search_delete_probs(self, position, current_token, lambda_rate, above_threshold, level=3):
-        """记录删除操作的预测概率"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        self.log("DELETE_PROBS_DEBUG",
-                f"位置{position}(当前={current_token}): lambda_del={lambda_rate:.4f} | above_threshold={above_threshold}",
-                "greedy_search", level=level)
-
-    def log_greedy_search_keep_probs(self, position, current_token, lambda_rate, above_threshold, level=3):
-        """记录保持操作的预测概率"""
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        self.log("KEEP_PROBS_DEBUG",
-                f"位置{position}(当前={current_token}): lambda_keep={lambda_rate:.4f} | above_threshold={above_threshold}",
-                "greedy_search", level=level)
-
-    def log_position_action_scores(self, step, current_tokens,
-                                    lambda_ins, lambda_del, lambda_sub, lambda_keep,
-                                    threshold, context="", level=3):
-        """记录每个位置的所有操作预测分数（简洁版）
-
-        Args:
-            step: 当前步骤
-            current_tokens: 当前token列表
-            lambda_ins: 每个位置的INSERT分数 [seq_len]
-            lambda_del: 每个位置的DELETE分数 [seq_len]
-            lambda_sub: 每个位置的SUBSTITUTE分数 [seq_len]
-            lambda_keep: 每个位置的KEEP分数 [seq_len]
-            threshold: 操作分数阈值
-            context: 上下文信息
-            level: 日志级别（默认3，会记录到inference.log）
-        """
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
-            return
-
-        import numpy as np
-
-        # 记录概要信息
-        tokens_str = ','.join(current_tokens) if len(current_tokens) <= 10 else ','.join(current_tokens[:10]) + '...'
-        self.log("POSITION_ACTION_SCORES",
-                f"step={step} | tokens=[{tokens_str}] | seq_len={len(lambda_ins)} | thr={threshold:.4f}",
-                context, level)
-
-        # 对于input_ids的每个位置（包含BOS）
-        for i in range(len(lambda_ins)):
-            # input_ids位置i对应：
-            # - i=0: BOS位置
-            # - i>0: current_tokens[i-1]
-
-            if i == 0:
-                token_str = "BOS"
-            else:
-                token_idx = i - 1
-                token_str = current_tokens[token_idx] if token_idx < len(current_tokens) else "PAD"
-
-            # 记录该位置的所有操作分数（简洁格式）
-            self.log(f"POS_{i}_SCORES",
-                    f"step={step} | pos{i}({token_str}) | "
-                    f"INS={lambda_ins[i]:.4f} "
-                    f"DEL={lambda_del[i]:.4f} "
-                    f"SUB={lambda_sub[i]:.4f} "
-                    f"KEEP={lambda_keep[i]:.4f}",
-                    context, level)
-
     def log_position_best_actions(self, position_best_map, selected_position, level=3):
         """记录每个位置的最佳操作
 
@@ -742,12 +519,7 @@ class Logger:
             selected_position (int): 最终选中的位置
             level (int): 日志级别
         """
-        if not self.enabled:
-            return
-
-        # level=2需要debug_mode启用（训练调试日志）
-        # level=3是推理日志，不受debug控制，默认保存
-        if level == 2 and not self.debug_mode:
+        if not self._should_log(level):
             return
 
         positions_info = []

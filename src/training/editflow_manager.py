@@ -900,25 +900,11 @@ class EditFlowManager:
 
         return model, condition_encoder
 
-    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, initial_expr=None):
-        """符号回归 - 使用简单推理(贪婪搜索)接收数据点对，输出表达式
-
-        Args:
-            model_path: 模型检查点路径
-            x_data: 输入x数据
-            y_data: 目标y数据
-            n_steps: 推理步数
-            input_dim: 输入维度，如果为None则自动推断
-            max_expr_length: 表达式最大token长度，如果为None则使用args中的值
-            initial_expr: 初始表达式（sympy表达式或字符串），如果为None则使用x0
-        """
-        # 记录开始
-        self.logger.log("SYMBOLIC_REGRESSION_START",
-                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | n_steps={n_steps}",
-                       "inference", level=1)
-
-        # 加载模型
+    # ============= 推理辅助方法 =============
+    def _load_inference_model(self, model_path):
+        """加载推理模型并处理检查点警告"""
         checkpoint_path = model_path if model_path and os.path.exists(model_path) else None
+
         if checkpoint_path:
             self.logger.log("MODEL_LOAD", f"使用检查点: {checkpoint_path}", "inference", level=3)
         else:
@@ -934,70 +920,43 @@ class EditFlowManager:
                 print("="*60 + "\n")
             self.logger.log("MODEL_LOAD", "⚠️ 未找到检查点，使用随机初始化权重（警告：推理质量会很差）", "inference", level=3)
 
-        model, condition_encoder, _, _, _, tokenizer = self.setup_models(checkpoint_path=checkpoint_path)
+        return self.setup_models(checkpoint_path=checkpoint_path)
 
-        # 设置设备和模式
-        device = self.device
-        model.eval()
-        condition_encoder.eval()
-
-        # 准备输入数据
-        x_values = torch.FloatTensor(x_data).unsqueeze(0).to(device)
-        y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)  # 这是目标值
-
-        # 推断输入维度并生成初始表达式
-        if input_dim is None:
-            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
-
-        # 计算初始残差 (真实值 - 初始表达式的预测值)
+    def _prepare_initial_expression(self, initial_expr, x_data, y_data_len):
+        """准备初始表达式和tokens"""
         import sympy as sp
         from ..symbolic.symbolic_utils import evaluate_expression_safe, expr_to_tree
 
         # 处理初始表达式
         if initial_expr is None:
             initial_expr = sp.Symbol('x0')
-            # 将sympy表达式转换为前缀表达式tokens
             initial_expr_str = expr_to_tree(initial_expr)
             current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
         elif isinstance(initial_expr, str):
-            # 将字符串表达式转换为sympy表达式
             initial_expr = sp.sympify(initial_expr)
-            # 将sympy表达式转换为前缀表达式tokens
             initial_expr_str = expr_to_tree(initial_expr)
             current_tokens = initial_expr_str.split(',') if initial_expr_str else ['x0']
         elif isinstance(initial_expr, list):
-            # 直接传入token列表（用于从训练数据中恢复）
             current_tokens = initial_expr
-            # 尝试将tokens转换回sympy表达式（用于计算预测值）
-            # 注意：这个转换可能失败，因为tokenizer不支持完全双向转换
-            # 我们先尝试评估，如果失败则使用默认值
             initial_expr = None  # 标记为需要特殊处理
+        else:
+            current_tokens = ['x0']
+            initial_expr = sp.Symbol('x0')
 
-        if self.accelerator.is_local_main_process:
-            print(f"初始表达式: {initial_expr}")
-            print(f"初始tokens: {current_tokens}")
-
-        # 计算初始表达式在x_data上的预测值
+        # 计算初始表达式的预测值
         if initial_expr is not None:
             success, y_pred = evaluate_expression_safe(initial_expr, x_data)
         else:
-            # 如果无法从tokens恢复表达式，使用常量0作为初始预测
-            # 这不是最优解，但可以避免程序崩溃
             success = False
-            y_pred = [0.0] * len(y_data)
+            y_pred = [0.0] * y_data_len
 
         if not success:
             self.logger.log("INITIAL_EXPR_WARN", f"无法计算初始表达式的预测值，使用零初始化", "inference", level=1)
-            # 继续执行，不返回，因为条件编码器使用的是y_target而非残差
 
-        # 计算残差：真实值 - 预测值（仅用于评估，不作为条件）
-        residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
+        return initial_expr, current_tokens, y_pred
 
-        # 关键修改：使用目标值y_values作为条件，而非残差
-        # 这样条件在推理过程中保持恒定，作为"北极星"指引方向
-        point_mask = torch.ones_like(y_values)
-        condition = condition_encoder(x_values, y_values, point_mask)
-
+    def _encode_condition_and_log(self, condition_encoder, x_values, y_values, condition, initial_expr, current_tokens, residuals):
+        """编码条件并记录详细日志"""
         # 记录初始数据
         self.logger.log("INITIAL_DATA",
                        f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | "
@@ -1012,40 +971,19 @@ class EditFlowManager:
                        f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}]",
                        "inference", level=1)
 
-        # 打印条件嵌入的前10个维度的具体值
+        # 打印条件嵌入的前10个维度
         condition_cpu = condition.cpu().squeeze(0)
         condition_values = condition_cpu.detach().numpy()
-        # 处理序列格式 (num_seeds, dim_hidden) 或向量格式 (dim_hidden,)
-        if condition_values.ndim == 2:
-            condition_preview = condition_values.flatten()[:10]  # 展平后取前10个
-        else:
-            condition_preview = condition_values[:10]
+        condition_preview = condition_values.flatten()[:10] if condition_values.ndim == 2 else condition_values[:10]
         self.logger.log("INITIAL_CONDITION_VALUES",
                        f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
                        "inference", level=1)
 
-        # 创建简单推理器
+    def _create_searcher(self, model, condition_encoder, tokenizer, device, n_steps):
+        """创建搜索器"""
         self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
 
-        # 解析action_thresholds参数
-        action_thresholds = getattr(self.args, 'action_thresholds', None)
-        if action_thresholds:
-            try:
-                action_thresholds = [float(x.strip()) for x in action_thresholds.split(',')]
-                self.logger.log("ACTION_THRESHOLDS_CONFIG",
-                               f"使用多阈值推理模式 | thresholds={action_thresholds}",
-                               "inference", level=1)
-                if self.accelerator.is_local_main_process:
-                    print(f"\n使用多阈值推理模式，阈值: {action_thresholds}")
-            except ValueError as e:
-                self.logger.log("ACTION_THRESHOLDS_PARSE_ERROR",
-                               f"无法解析action_thresholds参数: {action_thresholds} | error={e}",
-                               "inference", level=1)
-                if self.accelerator.is_local_main_process:
-                    print(f"\n⚠️ 警告: 无法解析action_thresholds参数 '{action_thresholds}'，回退到单最佳操作模式")
-                action_thresholds = None
-
-        simple_searcher = SimpleSymbolicRegression(
+        searcher = SimpleSymbolicRegression(
             model=model,
             condition_encoder=condition_encoder,
             tokenizer=tokenizer,
@@ -1054,81 +992,104 @@ class EditFlowManager:
             logger=self.logger,
             min_action_score=self.MIN_ACTION_SCORE,
             max_expression_length=self.MAX_EXPRESSION_LENGTH,
-            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD,
-            action_thresholds=action_thresholds
+            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
         )
 
-        # 执行推理（单阈值或多阈值模式）
-        initial_residuals_np = residuals.cpu().squeeze(0).numpy()
+        return searcher
 
-        # 根据是否启用多阈值模式选择推理方法
-        if simple_searcher.use_multi_threshold:
-            # 多阈值推理模式
-            if self.accelerator.is_local_main_process:
-                print(f"\n执行多阈值推理...")
+    def _run_single_threshold_search(self, searcher, current_tokens, condition, residuals_np, x_data, y_data, x_values, n_steps):
+        """执行单阈值搜索并返回结果"""
+        if self.accelerator.is_local_main_process:
+            print(f"\n执行单最佳操作推理...")
 
-            results_dict = simple_searcher.multi_threshold_search(
-                initial_tokens=current_tokens,
-                initial_condition=condition,
-                initial_residuals=initial_residuals_np,
-                x_data=x_data,
-                y_data=y_data,
-                x_values=x_values,
-                n_steps=n_steps
-            )
+        best_candidate = searcher.greedy_search(
+            initial_tokens=current_tokens,
+            initial_condition=condition,
+            initial_residuals=residuals_np,
+            x_data=x_data,
+            y_data=y_data,
+            x_values=x_values,
+            n_steps=n_steps
+        )
 
-            # 返回所有结果的表达式字典
-            if self.accelerator.is_local_main_process:
-                print(f"\n多阈值推理完成，返回 {len(results_dict)} 个候选结果")
+        final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
 
-                # 记录所有结果到日志
-                for threshold, candidate in results_dict.items():
-                    expr_str = ','.join(candidate.tokens) if candidate and candidate.tokens else ""
-                    mse_str = f'{candidate.mse_score:.6f}' if candidate.mse_score is not None else 'N/A'
-                    self.logger.log("MULTI_THRESHOLD_RESULT",
-                                   f"threshold={threshold} | expression={expr_str} | MSE={mse_str}",
-                                   "inference", level=1)
+        if best_candidate and self.accelerator.is_local_main_process:
+            mse_score = best_candidate.mse_score
+            mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
+            self.logger.log("SIMPLE_SEARCH_RESULT",
+                           f"MSE分数: {mse_str} | "
+                           f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
+                           "inference", level=3)
 
-            # 返回字典格式的结果：{threshold: expression}
-            return {threshold: ','.join(candidate.tokens) if candidate and candidate.tokens else ""
-                    for threshold, candidate in results_dict.items()}
+        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
 
-        else:
-            # 单最佳操作模式（原有逻辑）
-            if self.accelerator.is_local_main_process:
-                print(f"\n执行单最佳操作推理...")
+        return {
+            'final_expression': final_expression,
+            'initial_tokens': current_tokens,
+            'final_tokens': best_candidate.tokens if best_candidate else [],
+            'history': best_candidate.history if best_candidate else [],
+            'position_actions_history': best_candidate.position_actions_history if best_candidate else [],
+            'mse_score': best_candidate.mse_score if best_candidate else None
+        }
 
-            best_candidate = simple_searcher.greedy_search(
-                initial_tokens=current_tokens,
-                initial_condition=condition,
-                initial_residuals=initial_residuals_np,
-                x_data=x_data,
-                y_data=y_data,
-                x_values=x_values,
-                n_steps=n_steps
-            )
+    # ============= 主推理方法 =============
+    def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, initial_expr=None):
+        """符号回归 - 使用简单推理(贪婪搜索)接收数据点对，输出表达式
 
-            # 返回最佳候选的表达式
-            final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
+        Args:
+            model_path: 模型检查点路径
+            x_data: 输入x数据
+            y_data: 目标y数据
+            n_steps: 推理步数
+            input_dim: 输入维度，如果为None则自动推断
+            max_expr_length: 表达式最大token长度，如果为None则使用args中的值
+            initial_expr: 初始表达式（sympy表达式或字符串），如果为None则使用x0
+        """
+        self.logger.log("SYMBOLIC_REGRESSION_START",
+                       f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | n_steps={n_steps}",
+                       "inference", level=1)
 
-            if best_candidate and self.accelerator.is_local_main_process:
-                # 记录MSE分数
-                mse_score = best_candidate.mse_score
-                mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
-                self.logger.log("SIMPLE_SEARCH_RESULT",
-                               f"MSE分数: {mse_str} | "
-                               f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
-                               "inference", level=3)
+        # 加载模型
+        model, condition_encoder, _, _, _, tokenizer = self._load_inference_model(model_path)
 
-            self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
+        # 设置设备和模式
+        device = self.device
+        model.eval()
+        condition_encoder.eval()
 
-            # 返回详细结果字典
-            return {
-                'final_expression': final_expression,
-                'initial_tokens': current_tokens,  # 初始tokens
-                'final_tokens': best_candidate.tokens if best_candidate else [],  # 最终tokens
-                'history': best_candidate.history if best_candidate else [],  # 操作历史
-                'position_actions_history': best_candidate.position_actions_history if best_candidate else [],  # 每步每个位置的操作
-                'mse_score': best_candidate.mse_score if best_candidate else None  # MSE分数
-            }
+        # 准备输入数据
+        x_values = torch.FloatTensor(x_data).unsqueeze(0).to(device)
+        y_values = torch.FloatTensor(y_data).unsqueeze(0).to(device)
+
+        # 推断输入维度
+        if input_dim is None:
+            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
+
+        # 准备初始表达式
+        initial_expr, current_tokens, y_pred = self._prepare_initial_expression(initial_expr, x_data, len(y_data))
+
+        if self.accelerator.is_local_main_process:
+            print(f"初始表达式: {initial_expr}")
+            print(f"初始tokens: {current_tokens}")
+
+        # 计算残差并编码条件
+        residuals = y_values - torch.FloatTensor(y_pred).unsqueeze(0).to(device)
+        point_mask = torch.ones_like(y_values)
+        condition = condition_encoder(x_values, y_values, point_mask)
+
+        # 记录条件信息
+        self._encode_condition_and_log(condition_encoder, x_values, y_values, condition, initial_expr, current_tokens, residuals)
+
+        # 创建搜索器
+        searcher = self._create_searcher(
+            model, condition_encoder, tokenizer, device, n_steps
+        )
+
+        # 执行推理
+        residuals_np = residuals.cpu().squeeze(0).numpy()
+        return self._run_single_threshold_search(
+            searcher, current_tokens, condition, residuals_np,
+            x_data, y_data, x_values, n_steps
+        )
 

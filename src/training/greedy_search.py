@@ -8,12 +8,16 @@
 - 移除了旧架构的"渐进式时间步"逻辑
 """
 
+import os
+import time
 import torch
+import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 
+# ============= 数据类定义 =============
 @dataclass(order=True)
 class Candidate:
     """候选表达式
@@ -68,6 +72,7 @@ class ActionProposal:
         return f"Action({self.action_type}, score={self.score:.4f})"
 
 
+# ============= 推理器类 =============
 class SimpleSymbolicRegression:
     """简单符号回归推理器 - 使用贪婪搜索(每次选择最佳操作)
 
@@ -81,14 +86,12 @@ class SimpleSymbolicRegression:
                  model,
                  condition_encoder,
                  tokenizer,
-                 # special_tokens_manager,  # 已移除：使用小词表后不再需要
                  device,
                  args,
                  logger,
                  min_action_score=0.01,
                  max_expression_length=50,
-                 numerical_clip_threshold=1e6,
-                 action_thresholds=None):
+                 numerical_clip_threshold=1e6):
         """初始化简单推理器
 
         Args:
@@ -101,30 +104,16 @@ class SimpleSymbolicRegression:
             min_action_score: 最小操作分数阈值（用于过滤低分操作）
             max_expression_length: 表达式最大长度
             numerical_clip_threshold: 数值裁剪阈值
-            action_thresholds: 操作采纳阈值列表，用于多阈值推理
-                              例如: [0.1, 0.05, 0.01] 表示采纳分数>0.1, >0.05, >0.01的所有操作
-                              如果为None,则使用传统的单最佳操作模式
         """
         self.model = model
         self.condition_encoder = condition_encoder
         self.tokenizer = tokenizer
-        # self.special_tokens_manager = special_tokens_manager  # 已移除：使用小词表后不再需要
         self.device = device
         self.args = args
         self.logger = logger
         self.min_action_score = min_action_score
         self.max_expression_length = max_expression_length
         self.numerical_clip_threshold = numerical_clip_threshold
-
-        # 多阈值推理配置
-        if action_thresholds is None:
-            # 默认使用单最佳操作模式（向后兼容）
-            self.action_thresholds = []
-            self.use_multi_threshold = False
-        else:
-            # 确保阈值是排序的（从高到低）
-            self.action_thresholds = sorted(action_thresholds, reverse=True)
-            self.use_multi_threshold = True
 
     def generate_action_proposals(self,
                                   current_tokens: List[str],
@@ -133,26 +122,10 @@ class SimpleSymbolicRegression:
                                   top_k: Optional[int] = None,
                                   valid_variables: Optional[List[str]] = None,
                                   step: int = -1) -> List[ActionProposal]:
-        """为当前表达式生成操作提案
-
-        Args:
-            current_tokens: 当前token列表
-            condition: 条件嵌入
-            x_values: 输入x值
-            top_k: 每种操作类型保留的top-k数量，None表示全部
-            valid_variables: 有效的变量token列表（如 ['x0', 'x1']），用于过滤无效变量
-            step: 当前推理步数（用于日志记录）
-
-        Returns:
-            操作提案列表
-        """
-        import time
+        """为当前表达式生成操作提案"""
         proposals = []
 
-        # 记录开始时间用于性能统计
-        start_time = time.time()
-
-        # 构建模型输入 - 确保与训练时的序列格式完全一致
+        # 构建模型输入
         tokenized_expr = self.tokenizer.convert_tokens_to_ids(current_tokens)
         max_len = getattr(self.args, 'max_expr_length', 128)
 
@@ -162,32 +135,24 @@ class SimpleSymbolicRegression:
         bos_token = self.tokenizer.convert_tokens_to_ids('<s>')
         pad_token = self.tokenizer.convert_tokens_to_ids('<pad>')
 
-        # 关键：必须添加 BOS token，与训练时的格式一致 [BOS] + tokens + [PAD]
+        # 必须添加 BOS token，与训练时的格式一致 [BOS] + tokens + [PAD]
         tokenized_expr = [bos_token] + tokenized_expr
         tokenized_expr = tokenized_expr + [pad_token] * (max_len - len(tokenized_expr))
-
-        # 验证 BOS token 在正确位置
-        assert tokenized_expr[0] == bos_token, f"BOS token 必须在位置0，但得到 {tokenized_expr[0]}"
 
         input_ids = torch.LongTensor([tokenized_expr]).to(self.device)
         attention_mask = (input_ids != pad_token).float().to(self.device)
 
         with torch.no_grad():
-            model_forward_start = time.time()
             output = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 condition=condition
             )
-            model_forward_time = (time.time() - model_forward_start) * 1000  # ms
 
-            # 从字典中提取结果
-            # 注意：模型现在返回rates_logits而不是概率
-            import torch.nn.functional as F
-            rates_logits = output['rates_logits']  # (batch_size, seq_len, 4)
-            rates_probs = F.softmax(rates_logits, dim=-1)  # 转换为概率
+            # 提取结果
+            rates_logits = output['rates_logits']
+            rates_probs = F.softmax(rates_logits, dim=-1)
 
-            # 分解为各个操作的概率
             lambda_ins = rates_probs[0, :, 0].cpu().numpy()  # 插入概率
             lambda_del = rates_probs[0, :, 1].cpu().numpy()  # 删除概率
             lambda_sub = rates_probs[0, :, 2].cpu().numpy()  # 替换概率
@@ -196,54 +161,12 @@ class SimpleSymbolicRegression:
             insert_probs = output['insert_probs']
             substitute_probs = output['substitute_probs']
 
-            # 统计操作速率信息
-            ins_rate_mean = float(lambda_ins.mean())
-            ins_rate_max = float(lambda_ins.max())
-            ins_rate_above_threshold = int(np.sum(lambda_ins > self.min_action_score))
-
-            del_rate_mean = float(lambda_del.mean())
-            del_rate_max = float(lambda_del.max())
-            del_rate_above_threshold = int(np.sum(lambda_del > self.min_action_score))
-
-            sub_rate_mean = float(lambda_sub.mean())
-            sub_rate_max = float(lambda_sub.max())
-            sub_rate_above_threshold = int(np.sum(lambda_sub > self.min_action_score))
-
-            keep_rate_mean = float(lambda_keep.mean())
-            keep_rate_max = float(lambda_keep.max())
-            keep_rate_above_threshold = int(np.sum(lambda_keep > self.min_action_score))
-
-            # 调试：验证序列格式
-            base_length = int(attention_mask[0].sum().item())
-            effective_length = base_length  # 使用实际序列长度
-
-            # 调试：打印序列格式信息（每次调用都打印）
-            if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_sequence_format(
-                    input_ids[0, :5].tolist(),
-                    base_length,
-                    effective_length,
-                    current_tokens[:3],
-                    level=3
-                )
-
-            # 调试：打印top-10插入概率和token
-            if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("插入操作详细预测信息（前3个位置）", level=3)
-                for i in range(min(3, effective_length)):
-                    top10 = torch.topk(insert_probs[0, i], 10)
-                    tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
-                    probs = top10.values.tolist()
-                    self.logger.log_greedy_search_insert_probs(i, lambda_ins[i], tokens, probs, level=3)
-                self.logger.log_greedy_search_separator(level=3)
-
+            effective_length = int(attention_mask[0].sum().item())
             seq_len = min(effective_length, lambda_ins.shape[0])
 
-            # 特殊情况：在最开头插入时，使用BOS的预测（位置0）
+            # 生成INSERT操作提案
             if 0 < lambda_ins.shape[0] and lambda_ins[0] > self.min_action_score:
-                insert_pos = 0  # 在current_tokens最前面插入
                 top_k_tokens = top_k if top_k else insert_probs.shape[2]
-                # 使用位置0（BOS）的预测
                 top_tokens = torch.topk(insert_probs[0, 0], min(top_k_tokens, insert_probs.shape[2]))
 
                 for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
@@ -254,36 +177,29 @@ class SimpleSymbolicRegression:
                             continue
 
                     new_tokens = current_tokens.copy()
-                    new_tokens.insert(insert_pos, token_name)
+                    new_tokens.insert(0, token_name)
 
                     proposals.append(ActionProposal(
                         action_type='insert',
-                        position=insert_pos,
+                        position=0,
                         token=token_name,
                         score=lambda_ins[0] * prob.item(),
                         new_tokens=new_tokens
                     ))
 
-            # 遍历每个token位置（在current_tokens中的索引）
-            # 在位置p之后插入，使用input_ids[p+1]的预测（因为input_ids[0]是BOS）
+            # 遍历每个token位置生成INSERT
             for current_token_pos in range(len(current_tokens)):
-                input_ids_pos = current_token_pos + 1  # +1因为input_ids[0]是BOS
+                input_ids_pos = current_token_pos + 1
                 if input_ids_pos < lambda_ins.shape[0] and lambda_ins[input_ids_pos] > self.min_action_score:
-                    # 关键修复：Python的list.insert(i, x)是在索引i之前插入
-                    # 要在current_tokens[current_token_pos]之后插入，需要用current_token_pos + 1
                     insert_pos = current_token_pos + 1
                     top_k_tokens = top_k if top_k else insert_probs.shape[2]
-                    # 使用input_ids[input_ids_pos]的预测
                     top_tokens = torch.topk(insert_probs[0, input_ids_pos], min(top_k_tokens, insert_probs.shape[2]))
 
                     for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
                         token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
 
-                        # 过滤无效的变量token
-                        if valid_variables is not None:
-                            # 检查是否是变量token（以'x'开头且后面跟数字）
-                            if token_name.startswith('x') and token_name not in valid_variables:
-                                continue  # 跳过无效的变量
+                        if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
+                            continue
 
                         new_tokens = current_tokens.copy()
                         new_tokens.insert(insert_pos, token_name)
@@ -296,22 +212,8 @@ class SimpleSymbolicRegression:
                             new_tokens=new_tokens
                         ))
 
-            # 生成substitute操作提案
+            # 生成SUBSTITUTE操作提案
             seq_len = min(effective_length, lambda_sub.shape[0])
-
-            # 调试：打印top-10替换概率和token
-            if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("替换操作详细预测信息（前3个token位置）", level=3)
-                for idx in range(min(3, len(current_tokens))):
-                    pos = idx + 1  # +1因为input_ids[0]是BOS
-                    if pos < substitute_probs.shape[1]:
-                        top10 = torch.topk(substitute_probs[0, pos], 10)
-                        tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] for idx in top10.indices]
-                        probs = top10.values.tolist()
-                        current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                        self.logger.log_greedy_search_substitute_probs(idx, current_token, lambda_sub[pos], tokens, probs, level=3)
-                self.logger.log_greedy_search_separator(level=3)
-
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
                 if pos < lambda_sub.shape[0] and current_token_idx < len(current_tokens) and lambda_sub[pos] > self.min_action_score:
@@ -321,147 +223,51 @@ class SimpleSymbolicRegression:
                     for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
                         token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
 
-                        # 过滤无效的变量token
-                        if valid_variables is not None:
-                            if token_name.startswith('x') and token_name not in valid_variables:
-                                continue  # 跳过无效的变量
+                        if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
+                            continue
 
                         new_tokens = current_tokens.copy()
                         new_tokens[current_token_idx] = token_name
 
                         proposals.append(ActionProposal(
                             action_type='substitute',
-                            position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
+                            position=pos,
                             token=token_name,
                             score=lambda_sub[pos] * prob.item(),
                             new_tokens=new_tokens
                         ))
 
-            # 生成delete操作提案
+            # 生成DELETE操作提案
             seq_len = min(effective_length, lambda_del.shape[0])
-
-            # 调试：打印删除速率信息（每次调用都打印）
-            if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("删除操作详细预测信息（所有token位置）", level=3)
-                for idx in range(len(current_tokens)):
-                    pos = idx + 1  # +1因为input_ids[0]是BOS
-                    if pos < lambda_del.shape[0]:
-                        current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                        self.logger.log_greedy_search_delete_probs(idx, current_token, lambda_del[pos],
-                                                                lambda_del[pos] > self.min_action_score, level=3)
-                self.logger.log_greedy_search_separator(level=3)
-
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
                 if pos < lambda_del.shape[0] and current_token_idx < len(current_tokens) and lambda_del[pos] > self.min_action_score:
-                    if len(current_tokens) > 1:  # 保持至少一个token
+                    if len(current_tokens) > 1:
                         new_tokens = current_tokens.copy()
                         del new_tokens[current_token_idx]
 
                         proposals.append(ActionProposal(
                             action_type='delete',
-                            position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
+                            position=pos,
                             score=lambda_del[pos],
                             new_tokens=new_tokens
                         ))
 
-            # 生成KEEP操作提案（新增）
+            # 生成KEEP操作提案
             seq_len = min(effective_length, lambda_keep.shape[0])
-
-            # 调试：打印保持速率信息
-            if self.logger and self._is_main_process():
-                self.logger.log_greedy_search_separator("保持操作详细预测信息（所有token位置）", level=3)
-                for idx in range(len(current_tokens)):
-                    pos = idx + 1  # +1因为input_ids[0]是BOS
-                    if pos < lambda_keep.shape[0]:
-                        current_token = current_tokens[idx] if idx < len(current_tokens) else 'N/A'
-                        self.logger.log_greedy_search_keep_probs(idx, current_token, lambda_keep[pos],
-                                                                lambda_keep[pos] > self.min_action_score, level=3)
-                self.logger.log_greedy_search_separator(level=3)
-
             for pos in range(1, seq_len):
                 current_token_idx = pos - 1
                 if pos < lambda_keep.shape[0] and current_token_idx < len(current_tokens) and lambda_keep[pos] > self.min_action_score:
-                    # KEEP操作：保持当前token不变
-                    # new_tokens就是current_tokens的副本（不修改）
-                    new_tokens = current_tokens.copy()
-
                     proposals.append(ActionProposal(
                         action_type='keep',
-                        position=pos,  # 修复：使用input_ids位置（pos），而不是current_tokens位置
+                        position=pos,
                         score=lambda_keep[pos],
-                        new_tokens=new_tokens
+                        new_tokens=current_tokens.copy()
                     ))
 
         # 按分数排序
         proposals.sort(key=lambda p: p.score, reverse=True)
-
-        # 记录提案生成性能和统计信息
-        total_time = (time.time() - start_time) * 1000  # ms
-
-        # 统计各类操作数量
-        insert_count = sum(1 for p in proposals if p.action_type == 'insert')
-        delete_count = sum(1 for p in proposals if p.action_type == 'delete')
-        substitute_count = sum(1 for p in proposals if p.action_type == 'substitute')
-        keep_count = sum(1 for p in proposals if p.action_type == 'keep')
-
-        if self.logger and self._is_main_process():
-            self.logger.log("ACTION_PROPOSALS_GENERATED",
-                           f"step={step} | "
-                           f"proposals={len(proposals)} (ins={insert_count}, del={delete_count}, sub={substitute_count}, keep={keep_count}) | "
-                           f"rates: ins(mean={ins_rate_mean:.4f}, max={ins_rate_max:.4f}, >thr={ins_rate_above_threshold}) "
-                           f"del(mean={del_rate_mean:.4f}, max={del_rate_max:.4f}, >thr={del_rate_above_threshold}) "
-                           f"sub(mean={sub_rate_mean:.4f}, max={sub_rate_max:.4f}, >thr={sub_rate_above_threshold}) "
-                           f"keep(mean={keep_rate_mean:.4f}, max={keep_rate_max:.4f}, >thr={keep_rate_above_threshold}) | "
-                           f"time: model={model_forward_time:.1f}ms total={total_time:.1f}ms | "
-                           f"current_tokens={','.join(current_tokens) if len(current_tokens)<=10 else ','.join(current_tokens[:10])+'...'}",
-                           "simple_search", level=3)
-
-        # 新增：记录每个位置的详细操作分数（简洁版）
-        if self.logger and self._is_main_process():
-            self.logger.log_position_action_scores(
-                step=step,
-                current_tokens=current_tokens,
-                lambda_ins=lambda_ins,
-                lambda_del=lambda_del,
-                lambda_sub=lambda_sub,
-                lambda_keep=lambda_keep,
-                threshold=self.min_action_score,
-                context="simple_search",
-                level=3  # level=3是推理日志，写入inference.log
-            )
-
         return proposals
-
-    def select_actions_by_threshold(self,
-                                     proposals: List[ActionProposal],
-                                     threshold: float) -> List[ActionProposal]:
-        """基于阈值选择操作提案
-
-        Args:
-            proposals: 所有操作提案列表（已按分数降序排序）
-            threshold: 操作采纳阈值（采纳分数>=threshold的所有操作）
-
-        Returns:
-            选中的操作提案列表
-        """
-        # 选择分数大于等于阈值的操作
-        selected = [p for p in proposals if p.score >= threshold]
-
-        # 如果没有操作满足阈值,返回空列表
-        if not selected:
-            return []
-
-        # 记录选择信息
-        if self.logger and self._is_main_process():
-            self.logger.log("THRESHOLD_SELECTION",
-                           f"threshold={threshold:.4f} | "
-                           f"total_proposals={len(proposals)} | "
-                           f"selected={len(selected)} | "
-                           f"score_range=[{proposals[0].score:.4f}, {proposals[-1].score:.4f}]",
-                           "multi_threshold", level=3)
-
-        return selected
 
     def apply_multiple_actions(self,
                                current_tokens: List[str],
@@ -530,7 +336,6 @@ class SimpleSymbolicRegression:
                     del result_tokens[actual_position]
                     position_offset -= 1  # 后续位置前移
                     # Debug: 只在main process打印
-                    import os
                     if os.environ.get('RANK', '0') == '0':
                         print(f"    [DEBUG] Delete @{action.position}→actual@{actual_position}: '{deleted_token}', 剩余{len(result_tokens)} tokens, offset={position_offset}")
 
@@ -576,14 +381,12 @@ class SimpleSymbolicRegression:
         Returns:
             (成功标志, MSE分数, 残差)
         """
-        import time
         try:
             eval_start = time.time()
 
             from ..symbolic.symbolic_utils import (
                 evaluate_expression_with_constants,
-                evaluate_expression_safe,
-                tree_to_expr
+                evaluate_expression_safe
             )
 
             expr_str = ','.join(tokens)
@@ -618,7 +421,7 @@ class SimpleSymbolicRegression:
                     return False, float('-inf'), None
             else:
                 return False, float('-inf'), None
-        except Exception as e:
+        except Exception:
             return False, float('-inf'), None
 
     def greedy_search(self,
@@ -657,12 +460,7 @@ class SimpleSymbolicRegression:
             input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
             valid_variables = [f'x{i}' for i in range(input_dim)]
 
-        # 记录有效变量信息
-        if self.logger and self._is_main_process():
-            self.logger.log("VALID_VARIABLES",
-                           f"贪婪搜索初始化 | input_dim={input_dim if len(x_data.shape) > 1 else 1} | "
-                           f"valid_variables={valid_variables}",
-                           "greedy_search", level=3)
+        if self._is_main_process():
             print(f"\n开始贪婪搜索推理 (共{n_steps}步)")
             print(f"初始表达式: {','.join(initial_tokens)}")
 
@@ -678,50 +476,22 @@ class SimpleSymbolicRegression:
         history = []
 
         for step in range(n_steps):
-            if self.logger and self._is_main_process():
-                print(f"\n步骤 {step + 1}/{n_steps}")
-                print(f"当前表达式: {','.join(current_candidate.tokens)}")
+            if self._is_main_process():
+                print(f"步骤 {step + 1}/{n_steps}: {','.join(current_candidate.tokens)}")
 
-                # 记录残差信息
-                if current_candidate.residuals is not None:
-                    residuals = current_candidate.residuals
-                    self.logger.log("STEP_RESIDUALS",
-                                   f"step={step} | "
-                                   f"residuals: mean={residuals.mean():.6f}, std={residuals.std():.6f}, "
-                                   f"min={residuals.min():.6f}, max={residuals.max():.6f}, "
-                                   f"l2_norm={np.linalg.norm(residuals):.6f}",
-                                   "greedy_search", level=3)
-
-                # 记录条件嵌入信息
-                if current_candidate.condition is not None:
-                    condition = current_candidate.condition
-                    if condition.dim() == 3:
-                        cond_flat = condition.detach().cpu().flatten().numpy()
-                    else:
-                        cond_flat = condition.detach().cpu().squeeze(0).numpy()
-                    self.logger.log("STEP_CONDITION",
-                                   f"step={step} | "
-                                   f"condition: shape={list(condition.shape)}, "
-                                   f"mean={cond_flat.mean():.6f}, std={cond_flat.std():.6f}, "
-                                   f"min={cond_flat.min():.6f}, max={cond_flat.max():.6f}",
-                                   "greedy_search", level=3)
-
-            # 为当前候选生成操作提案
+            # 生成操作提案
             proposals = self.generate_action_proposals(
                 current_tokens=current_candidate.tokens,
                 condition=current_candidate.condition,
                 x_values=x_values,
-                top_k=None,  # 获取所有操作提案
+                top_k=None,
                 valid_variables=valid_variables,
                 step=step
             )
 
             if not proposals:
-                if self.logger and self._is_main_process():
+                if self._is_main_process():
                     print(f"没有找到有效操作,提前终止")
-                    self.logger.log("GREEDY_SEARCH_STOP",
-                                   f"step={step} | 没有找到有效操作,提前终止",
-                                   "greedy_search", level=2)
                 break
 
             # 方案B改进：按位置选择最佳操作，再按操作类型优先级选择
@@ -841,224 +611,6 @@ class SimpleSymbolicRegression:
                                "inference", level=1)
 
         return current_candidate
-
-    def multi_threshold_search(self,
-                               initial_tokens: List[str],
-                               initial_condition: torch.Tensor,
-                               initial_residuals: np.ndarray,
-                               x_data: np.ndarray,
-                               y_data: np.ndarray,
-                               x_values: torch.Tensor,
-                               n_steps: int,
-                               valid_variables: Optional[List[str]] = None) -> dict:
-        """执行多阈值推理（为每个阈值维护独立的推理路径）
-
-        对每个阈值维护一个独立的候选路径,在每一步中:
-        1. 生成所有操作提案
-        2. 根据每个阈值选择操作
-        3. 对每个阈值,选中所有满足阈值的操作
-        4. 同时应用所有选中的操作
-
-        Args:
-            initial_tokens: 初始token列表
-            initial_condition: 初始条件嵌入（使用y_target生成，恒定不变）
-            initial_residuals: 初始残差（仅用于日志，不作为条件）
-            x_data: 输入x数据
-            y_data: 目标y数据
-            x_values: 输入x的tensor形式
-            n_steps: 推理步数
-            valid_variables: 有效的变量token列表（如 ['x0', 'x1']），如果为None则从x_data推断
-
-        Returns:
-            字典,键为阈值,值为对应的最终候选
-        """
-        # 如果没有提供有效变量列表，从x_data推断
-        if valid_variables is None:
-            input_dim = x_data.shape[1] if len(x_data.shape) > 1 else 1
-            valid_variables = [f'x{i}' for i in range(input_dim)]
-
-        # 检查是否启用了多阈值模式
-        if not self.use_multi_threshold or not self.action_thresholds:
-            # 如果未启用,回退到单阈值模式
-            if self.logger and self._is_main_process():
-                print(f"\n未启用多阈值模式,回退到单最佳操作模式")
-            single_result = self.greedy_search(
-                initial_tokens=initial_tokens,
-                initial_condition=initial_condition,
-                initial_residuals=initial_residuals,
-                x_data=x_data,
-                y_data=y_data,
-                x_values=x_values,
-                n_steps=n_steps,
-                valid_variables=valid_variables
-            )
-            return {"single_best": single_result}
-
-        # 为每个阈值初始化候选
-        threshold_candidates = {
-            threshold: Candidate(
-                tokens=initial_tokens.copy(),
-                score=0.0,
-                condition=initial_condition,
-                residuals=initial_residuals,
-                history=[]
-            )
-            for threshold in self.action_thresholds
-        }
-
-        # 记录初始信息
-        if self.logger and self._is_main_process():
-            print(f"\n开始多阈值推理 (共{n_steps}步)")
-            print(f"阈值配置: {self.action_thresholds}")
-            print(f"初始表达式: {','.join(initial_tokens)}")
-            self.logger.log("MULTI_THRESHOLD_START",
-                           f"thresholds={self.action_thresholds} | n_steps={n_steps} | "
-                           f"initial_tokens={','.join(initial_tokens)}",
-                           "multi_threshold", level=1)
-
-        # 对每个推理步骤
-        for step in range(n_steps):
-            if self.logger and self._is_main_process():
-                print(f"\n{'='*60}")
-                print(f"步骤 {step + 1}/{n_steps}")
-                print(f"{'='*60}")
-
-            # 为每个阈值生成操作提案并执行
-            for threshold in self.action_thresholds:
-                current_candidate = threshold_candidates[threshold]
-
-                if self.logger and self._is_main_process():
-                    print(f"\n[阈值 {threshold:.4f}]")
-                    print(f"当前表达式: {','.join(current_candidate.tokens)}")
-
-                # 生成操作提案
-                proposals = self.generate_action_proposals(
-                    current_tokens=current_candidate.tokens,
-                    condition=current_candidate.condition,
-                    x_values=x_values,
-                    top_k=None,
-                    valid_variables=valid_variables,
-                    step=step
-                )
-
-                if not proposals:
-                    if self.logger and self._is_main_process():
-                        print(f"  没有找到有效操作,停止此阈值的推理")
-                    continue
-
-                # 基于阈值选择操作
-                selected_actions = self.select_actions_by_threshold(
-                    proposals=proposals,
-                    threshold=threshold
-                )
-
-                if not selected_actions:
-                    if self.logger and self._is_main_process():
-                        print(f"  没有操作满足阈值 {threshold:.4f},停止此阈值的推理")
-                    continue
-
-                # 同时应用所有选中的操作
-                # 使用智能的位置处理逻辑，考虑操作间的依赖关系
-                new_tokens = self.apply_multiple_actions(
-                    current_tokens=current_candidate.tokens,
-                    actions=selected_actions
-                )
-
-                # 构建操作描述
-                action_descs = []
-                for action in selected_actions:
-                    desc = f"{action.action_type}@{action.position}"
-                    if action.token:
-                        desc += f":{action.token}"
-                    desc += f"({action.score:.4f})"
-                    action_descs.append(desc)
-
-                if self.logger and self._is_main_process():
-                    print(f"  同时应用 {len(selected_actions)} 个操作:")
-                    for desc in action_descs:
-                        print(f"    - {desc}")
-                    print(f"  新表达式: {','.join(new_tokens)}")
-
-                # 计算累积分数（所有操作分数之和）
-                total_score = sum(action.score for action in selected_actions)
-                combined_action_desc = f"[{len(selected_actions)} ops] total_score={total_score:.4f}"
-
-                # 更新候选
-                current_candidate.history.append(combined_action_desc)
-                threshold_candidates[threshold] = Candidate(
-                    tokens=new_tokens,
-                    score=current_candidate.score + total_score,
-                    condition=current_candidate.condition,
-                    residuals=current_candidate.residuals,
-                    history=current_candidate.history.copy()
-                )
-
-        # 评估所有阈值的最终结果
-        if self.logger and self._is_main_process():
-            print(f"\n{'='*60}")
-            print(f"多阈值推理完成,评估所有候选表达式")
-            print(f"{'='*60}\n")
-
-        results = {}
-        for threshold, candidate in threshold_candidates.items():
-            # 评估MSE
-            success, expr_mse_score, _ = self.evaluate_candidate(
-                tokens=candidate.tokens,
-                x_data=x_data,
-                y_data=y_data,
-                step=n_steps,
-                candidate_id=f"threshold_{threshold:.4f}"
-            )
-
-            if success:
-                candidate.mse_score = -expr_mse_score  # 转换为正MSE
-                results[threshold] = candidate
-
-                if self.logger and self._is_main_process():
-                    print(f"阈值 {threshold:.4f}:")
-                    print(f"  表达式: {','.join(candidate.tokens)}")
-                    print(f"  MSE: {candidate.mse_score:.6f}")
-                    print(f"  操作数: {len(candidate.history)}")
-                    print()
-            else:
-                if self.logger and self._is_main_process():
-                    print(f"阈值 {threshold:.4f}: 评估失败")
-                    print()
-
-                # 仍然包含在结果中,但MSE为None
-                candidate.mse_score = None
-                results[threshold] = candidate
-
-        # 按MSE排序并输出总结
-        if self.logger and self._is_main_process():
-            print(f"{'='*60}")
-            print(f"多阈值推理结果总结")
-            print(f"{'='*60}\n")
-
-            # 按MSE排序(忽略评估失败的候选)
-            valid_results = [(t, c) for t, c in results.items() if c.mse_score is not None]
-            valid_results.sort(key=lambda x: x[1].mse_score)
-
-            for rank, (threshold, candidate) in enumerate(valid_results, 1):
-                print(f"排名 {rank}: 阈值 {threshold:.4f}")
-                print(f"  表达式: {','.join(candidate.tokens)}")
-                print(f"  MSE: {candidate.mse_score:.6f}")
-                print(f"  操作数: {len(candidate.history)}")
-                print()
-
-            # 记录最佳MSE（如果有有效结果）
-            if valid_results:
-                best_mse_str = f"{valid_results[0][1].mse_score:.6f}"
-            else:
-                best_mse_str = 'N/A'
-
-            self.logger.log("MULTI_THRESHOLD_COMPLETE",
-                           f"thresholds={self.action_thresholds} | "
-                           f"valid_results={len(valid_results)} | "
-                           f"best_mse={best_mse_str}",
-                           "multi_threshold", level=1)
-
-        return results
 
     def _is_main_process(self):
         """检查是否为主进程"""
