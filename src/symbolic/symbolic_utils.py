@@ -3,12 +3,11 @@
 """
 
 import random
-import time
 import numpy as np
 import sympy as sp
 from typing import List, Tuple, Union
 from scipy.optimize import minimize
-from src.symbolic.corruption import corrupt_expression, replace_variables
+from src.symbolic.corruption import corrupt_expression
 from src.utils.logger import Logger
 
 # 创建全局 Logger 实例
@@ -72,25 +71,8 @@ def expr_to_tree(expr: sp.Expr) -> str:
 
 def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
     """生成随机表达式"""
-    import time
-    import datetime
-    start_time = time.time()
-
-    def log_debug(step: str, details: str = ""):
-        """记录调试日志"""
-        timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        message = f"[GENERATE_RANDOM_EXPR] {step}"
-        if details:
-            message += f" | {details}"
-        _logger._write(f"{timestamp} {message}", _logger.SAMPLE_LOG)
-
-    log_debug("开始", f"input_dimension={input_dimension}, max_depth={max_depth}")
-
     # 创建符号
-    symbol_start = time.time()
     symbols = [sp.Symbol(f'x{i}') for i in range(input_dimension)]
-    symbol_time = (time.time() - symbol_start) * 1000
-    log_debug("符号创建完成", f"{symbol_time:.1f}ms, symbols={[str(s) for s in symbols]}")
 
     # 递归生成表达式的计数器
     recursion_count = 0
@@ -104,84 +86,50 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
             raise Exception(f"递归次数过多: {recursion_count} > {max_recursions}")
 
         if depth >= max_depth:
-            result = random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
-            log_debug(f"递归底层(depth={depth})", str(result))
-            return result
+            return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
         node_type = "operation" if random.random() < 0.5 else "leaf"
-        log_debug(f"递归层(depth={depth})", f"选择{node_type}")
 
         if node_type == "operation":
             op_type = random.choice(['unary', 'binary'])
-            log_debug(f"递归层(depth={depth})", f"选择{op_type}操作")
 
             if op_type == 'unary':
                 op = random.choice(UNARY_OPS)
-                log_debug(f"递归层(depth={depth})", f"应用一元操作{op}")
                 operand = generate_expr(depth + 1)
-                result = apply_unary_op(op, operand)
-                log_debug(f"递归层(depth={depth})", f"{op}({operand}) = {result}")
-                return result
+                # 应用一元运算符
+                if op == 'sin': return sp.sin(operand)
+                elif op == 'cos': return sp.cos(operand)
+                elif op == 'tan': return sp.tan(operand)
+                elif op == 'exp': return sp.exp(operand)
+                elif op == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
+                elif op == 'sqrt': return sp.sqrt(abs(operand))
+                elif op == 'abs': return abs(operand)
+                else: return operand
             else:
                 op = random.choice(BINARY_OPS)
-                log_debug(f"递归层(depth={depth})", f"应用二元操作{op}")
                 left = generate_expr(depth + 1)
                 right = generate_expr(depth + 1)
-                result = apply_binary_op(op, left, right)
-                log_debug(f"递归层(depth={depth})", f"{left} {op} {right} = {result}")
-                return result
+                # 应用二元运算符
+                if op == 'add': return left + right
+                elif op == 'sub': return left - right
+                elif op == 'mul': return left * right
+                elif op == 'div': return left / (right + sp.Rational(1, 100))
+                elif op == 'pow': return left ** right
+                else: return left + right
         else:
-            result = random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
-            log_debug(f"递归层(depth={depth})", f"叶子节点 {result}")
-            return result
+            return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
     # 生成表达式
-    log_debug("开始生成表达式")
-    gen_start = time.time()
     expr = generate_expr(0)
-    gen_time = (time.time() - gen_start) * 1000
-    log_debug("表达式生成完成", f"{gen_time:.1f}ms, 递归次数={recursion_count}, 表达式={expr}")
 
     # 简化表达式
-    log_debug("开始简化表达式")
-    simplify_start = time.time()
     try:
         expr = simplify_expr(expr)
-        simplify_time = (time.time() - simplify_start) * 1000
-        log_debug("表达式简化成功", f"{simplify_time:.1f}ms, 简化后={expr}")
-    except Exception as e:
-        simplify_time = (time.time() - simplify_start) * 1000
-        log_debug("表达式简化失败", f"{simplify_time:.1f}ms, 错误={e}, 使用原始表达式")
+    except Exception:
         # 简化失败就使用原始表达式
-
-    total_time = (time.time() - start_time) * 1000
-    log_debug("generate_random_expr完成", f"总时间={total_time:.1f}ms, 最终表达式={expr}")
+        pass
 
     return expr
-
-
-def apply_unary_op(op: str, operand: sp.Expr) -> sp.Expr:
-    """应用一元运算符"""
-    if op == 'sin': return sp.sin(operand)
-    elif op == 'cos': return sp.cos(operand)
-    elif op == 'tan': return sp.tan(operand)
-    elif op == 'exp': return sp.exp(operand)
-    elif op == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
-    elif op == 'sqrt': return sp.sqrt(abs(operand))
-    elif op == 'abs': return abs(operand)
-    return operand
-
-
-def apply_binary_op(op: str, left: sp.Expr, right: sp.Expr) -> sp.Expr:
-    """应用二元运算符"""
-    if op == 'add': return left + right
-    elif op == 'sub': return left - right
-    elif op == 'mul': return left * right
-    elif op == 'div': return left / (right + sp.Rational(1, 100))
-    elif op == 'pow': return left ** right
-    return left + right
-
-
 
 
 def reduce_expression(expr: sp.Expr) -> sp.Expr:
@@ -219,9 +167,6 @@ def reduce_expression(expr: sp.Expr) -> sp.Expr:
 def reduce_expression_random_subtree(expr: sp.Expr) -> sp.Expr:
     """随机删减表达式中的任意子树，不局限于根节点
 
-    这个方法解决了原版reduce_expression只删减根节点的问题，
-    让模型学习在不同位置进行编辑操作。
-
     改进点：
     - 30%概率删减根节点（保持原方法的行为）
     - 70%概率深入子树删减（新增行为，让编辑分布更均匀）
@@ -231,18 +176,6 @@ def reduce_expression_random_subtree(expr: sp.Expr) -> sp.Expr:
 
     Returns:
         删减后的表达式
-
-    Examples:
-        目标: add(sin(x0), cos(x1))
-
-        原方法 (reduce_expression):
-            → sin(x0) 或 cos(x1)  # 只能删根节点add
-
-        新方法 (reduce_expression_random_subtree):
-            → add(x0, cos(x1))    # 删减sin子树
-            → add(sin(x0), x1)    # 删减cos子树
-            → sin(x0)             # 删减根节点（30%概率）
-            → cos(x1)             # 删减根节点（30%概率）
     """
     # 如果表达式已经是常数或符号，无法进一步删减
     if expr.is_Number or expr.is_Symbol:
@@ -395,9 +328,7 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
 def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
     """随机化辅助对齐方法 (来自《Edit Flows》论文)
 
-    通过在DP回溯时随机选择最优路径来解决"gap集中"问题：
-    - Levenshtein对齐按照固定优先级回溯，导致gap集中在序列开头
-    - 随机化对齐在所有最优路径中随机选择，保持Token相对顺序不变
+    通过在DP回溯时随机选择最优路径来解决"gap集中"问题。
 
     核心原理：
     1. 构建标准编辑距离DP矩阵
@@ -410,16 +341,6 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
 
     Returns:
         Tuple[List[str], List[str]]: 对齐后的两个等长序列，包含<gap>标记
-
-    Example:
-        tokens1 = ['add', 'x0', 'x1']
-        tokens2 = ['add', 'sin', 'x0', 'cos', 'x1']
-
-        可能的对齐结果（每次运行gap位置不同）:
-        z1 = ['add', 'x0', '<gap>', 'x1', '<gap>']
-        z2 = ['add', 'sin', 'x0', 'cos', 'x1']
-
-        注意：移除<gap>后，z2始终保持['add', 'sin', 'x0', 'cos', 'x1']
     """
     m, n = len(tokens1), len(tokens2)
 
@@ -480,53 +401,6 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
     return list(reversed(z1)), list(reversed(z2))
 
 
-def evaluate_expr(expr: sp.Expr, x_values: np.ndarray) -> np.ndarray:
-    """在给定x值上计算表达式
-
-    如果表达式包含有问题的值，将抛出异常而不是修复
-    """
-    # 检查表达式是否包含有问题的值
-    if expr.has(sp.I):
-        raise ValueError(f"表达式包含复数单位I: {expr}")
-    if expr.has(sp.zoo):
-        raise ValueError(f"表达式包含复无穷大(zoo): {expr}")
-    if expr.has(sp.oo) or expr.has(-sp.oo):
-        raise ValueError(f"表达式包含无穷大: {expr}")
-    if expr.has(sp.nan):
-        raise ValueError(f"表达式包含NaN: {expr}")
-
-    # 获取表达式中的变量
-    n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
-    symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
-    expr_vars = [s for s in symbols if s in expr.free_symbols]
-
-    # 常数表达式直接计算
-    if not expr_vars:
-        value = float(sp.re(expr)) if expr.is_complex else float(expr)
-        return np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
-
-    # 转换为可计算函数
-    f = sp.lambdify(expr_vars, expr, 'numpy')
-
-    # 计算结果
-    if x_values.ndim > 1:
-        result = f(*[x_values[:, i] for i in range(len(expr_vars))])
-    else:
-        result = f(x_values)
-
-    # 检查结果是否为复数
-    if np.iscomplexobj(result):
-        raise ValueError(f"计算结果包含复数: {expr}")
-
-    # 检查结果中是否包含NaN或无穷大
-    if np.any(np.isnan(result)):
-        raise ValueError(f"计算结果包含NaN，表达式: {expr}")
-    if np.any(np.isinf(result)):
-        raise ValueError(f"计算结果包含无穷大，表达式: {expr}")
-
-    return result
-
-
 def tree_to_expr(tree_str: str) -> sp.Expr:
     """将前序遍历字符串转换为SymPy表达式"""
     if not tree_str or tree_str.strip() == '':
@@ -562,12 +436,26 @@ def tree_to_expr(tree_str: str) -> sp.Expr:
         elif token in UNARY_OPS:
             # 一元操作: op,operand
             operand = parse_expression(tokens_iter)
-            return apply_unary_op(token, operand)
+            # 应用一元运算符
+            if token == 'sin': return sp.sin(operand)
+            elif token == 'cos': return sp.cos(operand)
+            elif token == 'tan': return sp.tan(operand)
+            elif token == 'exp': return sp.exp(operand)
+            elif token == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
+            elif token == 'sqrt': return sp.sqrt(abs(operand))
+            elif token == 'abs': return abs(operand)
+            else: return operand
         elif token in BINARY_OPS:
             # 二元操作: op,left,right
             left = parse_expression(tokens_iter)
             right = parse_expression(tokens_iter)
-            return apply_binary_op(token, left, right)
+            # 应用二元运算符
+            if token == 'add': return left + right
+            elif token == 'sub': return left - right
+            elif token == 'mul': return left * right
+            elif token == 'div': return left / (right + sp.Rational(1, 100))
+            elif token == 'pow': return left ** right
+            else: return left + right
         else:
             # 尝试解析为数字
             try:
@@ -577,8 +465,6 @@ def tree_to_expr(tree_str: str) -> sp.Expr:
 
     # 创建迭代器并解析
     return parse_expression(iter(tokens))
-
-
 
 
 def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
@@ -597,7 +483,46 @@ def evaluate_expression_safe(expr: sp.Expr, x_values: np.ndarray,
         - 失败: (False, None)
     """
     try:
-        result = evaluate_expr(expr, x_values)
+        # 在给定x值上计算表达式
+        # 检查表达式是否包含有问题的值
+        if expr.has(sp.I):
+            raise ValueError(f"表达式包含复数单位I: {expr}")
+        if expr.has(sp.zoo):
+            raise ValueError(f"表达式包含复无穷大(zoo): {expr}")
+        if expr.has(sp.oo) or expr.has(-sp.oo):
+            raise ValueError(f"表达式包含无穷大: {expr}")
+        if expr.has(sp.nan):
+            raise ValueError(f"表达式包含NaN: {expr}")
+
+        # 获取表达式中的变量
+        n_dims = x_values.shape[1] if x_values.ndim > 1 else 1
+        symbols = [sp.Symbol(f'x{i}') for i in range(n_dims)]
+        expr_vars = [s for s in symbols if s in expr.free_symbols]
+
+        # 常数表达式直接计算
+        if not expr_vars:
+            value = float(sp.re(expr)) if expr.is_complex else float(expr)
+            result = np.full(x_values.shape[0] if x_values.ndim > 1 else len(x_values), value)
+        else:
+            # 转换为可计算函数
+            f = sp.lambdify(expr_vars, expr, 'numpy')
+
+            # 计算结果
+            if x_values.ndim > 1:
+                result = f(*[x_values[:, i] for i in range(len(expr_vars))])
+            else:
+                result = f(x_values)
+
+            # 检查结果是否为复数
+            if np.iscomplexobj(result):
+                raise ValueError(f"计算结果包含复数: {expr}")
+
+            # 检查结果中是否包含NaN或无穷大
+            if np.any(np.isnan(result)):
+                raise ValueError(f"计算结果包含NaN，表达式: {expr}")
+            if np.any(np.isinf(result)):
+                raise ValueError(f"计算结果包含无穷大，表达式: {expr}")
+
         # 检查结果是否包含nan或inf
         if np.any(np.isnan(result)) or np.any(np.isinf(result)):
             if error_callback:

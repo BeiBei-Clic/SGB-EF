@@ -8,7 +8,6 @@ import os
 import warnings
 import time
 import json
-import datetime
 import multiprocessing
 from typing import List, Dict, Tuple
 from tqdm import tqdm
@@ -133,74 +132,6 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
         debug_log(f"保存成功 | 样本数={len(batch_samples)}")
 
     return batch_idx, len(batch_samples), dimension_count
-
-def generate_sample(input_dimension: int, n_points: int = 100, max_depth: int = 4, seed: int = None) -> Dict:
-    """生成单个样本
-
-    Args:
-        input_dimension: 输入维度
-        n_points: 数据点数量
-        max_depth: 表达式最大深度
-        seed: 随机种子，None表示使用系统随机源
-    """
-    if seed is not None:
-        np.random.seed(seed)
-        random.seed(seed)
-
-    x_values = [list(point) for point in np.random.uniform(-5.0, 5.0, (n_points, input_dimension))]
-    x_array = np.array(x_values)
-    target_expr = generate_random_expr(input_dimension, max_depth)
-
-    success, y_values = evaluate_expression_safe(target_expr, x_array)
-    if not success:
-        raise ValueError(f"表达式计算失败: {target_expr}")
-
-    curr_expr = corrupt_expression(target_expr)
-
-    return {
-        "input_dimension": input_dimension,
-        "x": x_values,
-        "y": y_values.tolist(),
-        "tree_gt": expr_to_tree(target_expr),
-        "exp_gt": str(target_expr),
-        "tree_cur1": expr_to_tree(curr_expr),
-        "exp_cur1": str(curr_expr)
-    }
-
-def load_dimension_index(filename: str, verbose: bool = True) -> Dict[int, List[int]]:
-    """加载维度索引文件，如果不存在则扫描数据文件并保存索引"""
-    index_filename = filename.replace('.txt', '_dimension_index.json')
-
-    if os.path.exists(index_filename):
-        with open(index_filename, 'r', encoding='utf-8') as f:
-            index_data = json.load(f)
-        return {int(dim_str): positions for dim_str, positions in index_data.items()}
-
-    # 扫描文件创建索引
-    dimension_samples = {}
-    with open(filename, 'r', encoding='utf-8') as f:
-        while True:
-            pos = f.tell()
-            line = f.readline()
-            if not line:
-                break
-            line = line.strip()
-            if line:
-                sample = json.loads(line)
-                dim = sample['input_dimension']
-                if dim not in dimension_samples:
-                    dimension_samples[dim] = []
-                dimension_samples[dim].append(pos)
-
-    # 保存索引
-    index_dir = os.path.dirname(index_filename)
-    if index_dir:
-        os.makedirs(index_dir, exist_ok=True)
-
-    with open(index_filename, 'w', encoding='utf-8') as f:
-        json.dump({str(dim): [int(pos) for pos in positions] for dim, positions in dimension_samples.items()}, f, indent=2)
-
-    return dimension_samples
 
 def generate_flow_samples(
     num_samples: int,

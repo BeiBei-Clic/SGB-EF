@@ -3,53 +3,38 @@
 """
 
 import random
-import time
 import sympy as sp
 from src.utils.timeout_utils import TimeoutError
 
 
-def simplify_expr(expr: sp.Expr) -> sp.Expr:
-    """化简表达式"""
-    simplified = expr
-    simplified = sp.together(simplified)
-    simplified = sp.radsimp(simplified)
-    return simplified
-
-
-def replace_variables(expr: sp.Expr) -> sp.Expr:
-    """替换表达式中的变量，模拟变量混淆错误"""
-    # 获取表达式中的所有变量
-    variables = list(expr.free_symbols)
-
-    # 如果没有变量或者只有一个变量，直接返回原表达式
-    if len(variables) <= 1:
-        return expr
-
-    # 创建变量替换映射
-    # 策略1：随机交换两个变量
-    if random.random() < 0.5:
-        var1, var2 = random.sample(variables, 2)
-        replacement_map = {var1: var2, var2: var1}
-
-    # 策略2：将一个变量随机替换为另一个变量
-    else:
-        var_to_replace = random.choice(variables)
-        var_candidates = [v for v in variables if v != var_to_replace]
-        replacement_var = random.choice(var_candidates)
-        replacement_map = {var_to_replace: replacement_var}
-
-    # 应用替换
-    return expr.xreplace(replacement_map)
-
-
 def corrupt_expression(expr: sp.Expr) -> sp.Expr:
     """对表达式进行破坏，模拟计算错误"""
-    corruption_start = time.time()
-    """对表达式应用随机破坏"""
     corruption_type = random.choice(['mutate_operator', 'replace_variable'])
 
     if corruption_type == 'replace_variable':
-        return replace_variables(expr)
+        # 替换表达式中的变量，模拟变量混淆错误
+        # 获取表达式中的所有变量
+        variables = list(expr.free_symbols)
+
+        # 如果没有变量或者只有一个变量，直接返回原表达式
+        if len(variables) <= 1:
+            return expr
+
+        # 创建变量替换映射
+        # 策略1：随机交换两个变量
+        if random.random() < 0.5:
+            var1, var2 = random.sample(variables, 2)
+            replacement_map = {var1: var2, var2: var1}
+
+        # 策略2：将一个变量随机替换为另一个变量
+        else:
+            var_to_replace = random.choice(variables)
+            var_candidates = [v for v in variables if v != var_to_replace]
+            replacement_var = random.choice(var_candidates)
+            replacement_map = {var_to_replace: replacement_var}
+
+        # 应用替换
+        return expr.xreplace(replacement_map)
     elif corruption_type == 'mutate_operator' and hasattr(expr, 'args') and len(expr.args) >= 1:
         func_name = str(expr.func).lower()
 

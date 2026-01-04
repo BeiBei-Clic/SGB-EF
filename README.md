@@ -78,7 +78,7 @@ accelerate launch \
     --multi_gpu \
     train.py \
     --num_epochs 50 \
-    --num_samples 10000000 \
+    --num_samples 1000000 \
     --batch_size 960 \
     --dataset_stream False
 
@@ -88,7 +88,7 @@ accelerate launch \
     --mixed_precision=bf16 \
     --dynamo_backend=no \
     train.py \
-    --num_epochs 10 \
+    --num_epochs 50 \
     --num_samples 1\
     --batch_size 1 \
     --debug 1
