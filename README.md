@@ -88,7 +88,7 @@ accelerate launch \
     --mixed_precision=bf16 \
     --dynamo_backend=no \
     train.py \
-    --num_epochs 100 \
+    --num_epochs 10 \
     --num_samples 1\
     --batch_size 1 \
     --debug 1
