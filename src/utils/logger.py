@@ -58,6 +58,7 @@ class Logger:
         # level=2需要debug_mode启用
         if level == 2 and not self.debug_mode:
             return False
+        # level=3推理日志始终记录，不受debug控制
         return True
 
     def _get_log_file(self, level):
@@ -557,6 +558,127 @@ class Logger:
             f"lambda_del={lambda_del:.6f} | "
             f"lambda_sub={lambda_sub:.6f} | "
             f"lambda_keep={lambda_keep:.6f}",
+            context, level=level
+        )
+
+    def log_token_position_mapping(self, step, input_ids_pos, current_token_idx,
+                                    token_id, token_name, lambda_ins, lambda_del,
+                                    lambda_sub, lambda_keep, context="greedy_search", level=3):
+        """记录token位置映射和模型预测
+
+        Args:
+            step (int): 当前推理步数
+            input_ids_pos (int): input_ids中的位置（含BOS）
+            current_token_idx (int): current_tokens中的位置（不含BOS，-1表示无效）
+            token_id (int): token的ID
+            token_name (str): token的名称
+            lambda_ins (float): INSERT概率
+            lambda_del (float): DELETE概率
+            lambda_sub (float): SUBSTITUTE概率
+            lambda_keep (float): KEEP概率
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        current_idx_str = str(current_token_idx) if current_token_idx >= 0 else "N/A"
+        self.log(
+            "TOKEN_POSITION_MAPPING",
+            f"step={step} | input_ids_pos={input_ids_pos} | current_token_idx={current_idx_str} | "
+            f"token_id={token_id} | token='{token_name}' | "
+            f"lambda_ins={lambda_ins:.6f} | lambda_del={lambda_del:.6f} | "
+            f"lambda_sub={lambda_sub:.6f} | lambda_keep={lambda_keep:.6f}",
+            context, level=level
+        )
+
+    def log_action_execution(self, step, input_ids_pos, current_token_idx,
+                              action_type, token_name, score, context="greedy_search", level=3):
+        """记录实际执行的操作
+
+        Args:
+            step (int): 当前推理步数
+            input_ids_pos (int): input_ids位置（含BOS）
+            current_token_idx (int): current_tokens位置（不含BOS，-1表示无效）
+            action_type (str): 操作类型（insert/substitute/delete/keep）
+            token_name (str): 操作涉及的token名称
+            score (float): 操作分数
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        current_idx_str = str(current_token_idx) if current_token_idx >= 0 else "N/A"
+        token_str = f"token='{token_name}'" if token_name else ""
+        self.log(
+            "ACTION_EXECUTION",
+            f"step={step} | input_ids_pos={input_ids_pos} | current_token_idx={current_idx_str} | "
+            f"action={action_type.upper()} | {token_str} | score={score:.4f}",
+            context, level=level
+        )
+
+    def log_position_prediction(self, step, pos, token_name,
+                                 lambda_ins, lambda_del, lambda_sub, lambda_keep,
+                                 best_action, context="greedy_search", level=3):
+        """记录每个位置的预测结果（带token信息）
+
+        Args:
+            step (int): 当前推理步数
+            pos (int): 位置索引
+            token_name (str): 该位置的token名称
+            lambda_ins (float): INSERT概率
+            lambda_del (float): DELETE概率
+            lambda_sub (float): SUBSTITUTE概率
+            lambda_keep (float): KEEP概率
+            best_action (str): 预测的最佳操作
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        # 确定最佳操作的lambda值
+        if best_action == "INSERT":
+            best_lambda = lambda_ins
+        elif best_action == "DELETE":
+            best_lambda = lambda_del
+        elif best_action == "SUBSTITUTE":
+            best_lambda = lambda_sub
+        else:  # KEEP
+            best_lambda = lambda_keep
+
+        self.log(
+            "POSITION_PREDICTION",
+            f"step={step} | pos={pos} | token='{token_name}' | "
+            f"pred={best_action}(λ_{best_action.lower()}={best_lambda:.6f}) | "
+            f"[ins={lambda_ins:.6f}, del={lambda_del:.6f}, sub={lambda_sub:.6f}]",
+            context, level=level
+        )
+
+    def log_position_after_deletion(self, step, deleted_pos, old_tokens, new_tokens,
+                                     context="greedy_search", level=3):
+        """记录删除操作后的位置变化
+
+        Args:
+            step (int): 当前推理步数
+            deleted_pos (int): 被删除的位置（input_ids_pos）
+            old_tokens (list): 删除前的token列表
+            new_tokens (list): 删除后的token列表
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        # 格式化token列表，显示位置索引
+        old_str = ", ".join([f"{i}:{t}" for i, t in enumerate(old_tokens)])
+        new_str = ", ".join([f"{i}:{t}" for i, t in enumerate(new_tokens)])
+
+        self.log(
+            "POSITION_AFTER_DELETE",
+            f"step={step} | deleted_pos={deleted_pos} | "
+            f"old: [{old_str}] | new: [{new_str}]",
             context, level=level
         )
 

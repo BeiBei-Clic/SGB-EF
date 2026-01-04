@@ -910,7 +910,7 @@ class EditFlowManager:
         if initial_expr is not None:
             success, y_pred = evaluate_expression_safe(initial_expr, x_data)
             if not success:
-                self.logger.log("INITIAL_EXPR_WARN", "无法计算初始表达式的预测值，使用零初始化", "inference", level=1)
+                self.logger.log("INITIAL_EXPR_WARN", "无法计算初始表达式的预测值，使用零初始化", "inference", level=3)
         else:
             y_pred = [0.0] * y_data_len
 
@@ -923,13 +923,13 @@ class EditFlowManager:
                        f"y_target: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
                        f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] | "
                        f"initial_expr: {initial_expr} | initial_tokens: {current_tokens}",
-                       "inference", level=1)
+                       "inference", level=3)
         self.logger.log("ARCHITECTURE_INFO",
                        "使用目标值y_target作为条件（架构改进：北极星模式）",
-                       "inference", level=1)
+                       "inference", level=3)
         self.logger.log("INITIAL_CONDITION",
                        f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}]",
-                       "inference", level=1)
+                       "inference", level=3)
 
         # 打印条件嵌入的前10个维度
         condition_cpu = condition.cpu().squeeze(0)
@@ -937,7 +937,7 @@ class EditFlowManager:
         condition_preview = condition_values.flatten()[:10] if condition_values.ndim == 2 else condition_values[:10]
         self.logger.log("INITIAL_CONDITION_VALUES",
                        f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
-                       "inference", level=1)
+                       "inference", level=3)
 
     def _create_searcher(self, model, condition_encoder, tokenizer, device, n_steps):
         """创建搜索器"""
@@ -1008,7 +1008,7 @@ class EditFlowManager:
         """
         self.logger.log("SYMBOLIC_REGRESSION_START",
                        f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | n_steps={n_steps}",
-                       "inference", level=1)
+                       "inference", level=3)
 
         model, condition_encoder, _, _, _, tokenizer = self._load_inference_model(model_path)
 
