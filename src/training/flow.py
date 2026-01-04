@@ -371,13 +371,13 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
             tokens.extend([pad_token_id] * (max_expr_length - len(tokens)))
             return tokens
 
-        # 转换token（需要逐个处理因为需要padding）
+        # 直接使用预计算的token IDs（需要逐个处理因为需要padding）
         for i in range(batch_size):
-            z0_tokens = tokenizer.convert_tokens_to_ids(examples['z0_tokens'][i])
-            z1_tokens = tokenizer.convert_tokens_to_ids(examples['z1_tokens'][i])
+            z0_token_ids = examples['z0_token_ids'][i]
+            z1_token_ids = examples['z1_token_ids'][i]
 
-            outputs['z0_token_ids'].append(pad_z_sequence(z0_tokens))
-            outputs['z1_token_ids'].append(pad_z_sequence(z1_tokens))
+            outputs['z0_token_ids'].append(pad_z_sequence(z0_token_ids))
+            outputs['z1_token_ids'].append(pad_z_sequence(z1_token_ids))
             outputs['gap_token'].append(gap_token_id)
 
         return outputs

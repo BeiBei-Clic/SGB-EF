@@ -6,6 +6,7 @@ import numpy as np
 import sympy as sp
 from typing import List, Dict
 from src.utils.logger import Logger
+from src.utils.special_tokens import SymbolicRegressionTokenizer
 from src.symbolic.symbolic_utils import (
     expr_to_tree, generate_random_expr,
     generate_reduction_sequence,
@@ -64,6 +65,9 @@ def generate_single_sample(
     sample_start_time = time.time()
 
     try:
+        # 初始化tokenizer用于token→ID转换
+        tokenizer = SymbolicRegressionTokenizer(max_dim=max_dim)
+
         dim = random.randint(1, max_dim)
 
         _sample_logger.sample_step(sample_id, "开始生成样本",
@@ -200,7 +204,9 @@ def generate_single_sample(
                 "curr_tokens": curr_tokens,
                 "target_tokens": target_tokens,
                 "z0_tokens": z0_tokens,
-                "z1_tokens": z1_tokens
+                "z1_tokens": z1_tokens,
+                "z0_token_ids": tokenizer.convert_tokens_to_ids(z0_tokens),
+                "z1_token_ids": tokenizer.convert_tokens_to_ids(z1_tokens)
             })
 
             # 生成对称样本
@@ -238,7 +244,9 @@ def generate_single_sample(
                 "curr_tokens": sym_curr_tokens,
                 "target_tokens": sym_target_tokens,
                 "z0_tokens": sym_z0_tokens,
-                "z1_tokens": sym_z1_tokens
+                "z1_tokens": sym_z1_tokens,
+                "z0_token_ids": tokenizer.convert_tokens_to_ids(sym_z0_tokens),
+                "z1_token_ids": tokenizer.convert_tokens_to_ids(sym_z1_tokens)
             })
             _sample_logger.levenshtein_alignment(sample_id, f"{i+1}-sym", len(sym_z0_tokens), len(sym_z1_tokens), sym_align_time)
 
