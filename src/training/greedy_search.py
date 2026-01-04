@@ -167,19 +167,6 @@ class SimpleSymbolicRegression:
 
             effective_length = int(attention_mask[0].sum().item())
 
-            # 记录每个位置的操作概率分布
-            if self.logger and self._is_main_process():
-                for pos in range(len(current_tokens) + 1):  # +1 因为有BOS token
-                    if pos < lambda_ins.shape[0]:
-                        self.logger.log_action_probabilities(
-                            step=step,
-                            position=pos,
-                            expr_len=len(current_tokens),
-                            lambda_ins=lambda_ins[pos],
-                            lambda_del=lambda_del[pos],
-                            lambda_sub=lambda_sub[pos],
-                            lambda_keep=lambda_keep[pos]
-                        )
             # 获取词汇表大小
             vocab_size = self.tokenizer.vocab_size
 
@@ -189,6 +176,31 @@ class SimpleSymbolicRegression:
 
                 if input_ids_pos >= rates_logits.shape[1]:
                     continue
+
+                # 计算当前token的位置信息（用于日志）
+                current_token_idx = input_ids_pos - 1
+                token_id = None
+                token_name = None
+                if input_ids_pos == 0:
+                    token_name = '<BOS>'
+                    token_id = self.tokenizer.convert_tokens_to_ids('<s>')
+                elif 0 <= current_token_idx < len(current_tokens):
+                    token_name = current_tokens[current_token_idx]
+                    token_id = self.tokenizer.convert_tokens_to_ids(token_name)
+
+                # 记录token位置映射和模型预测
+                if self.logger and self._is_main_process() and token_name is not None:
+                    self.logger.log_token_position_mapping(
+                        step=step,
+                        input_ids_pos=input_ids_pos,
+                        current_token_idx=current_token_idx,
+                        token_id=token_id,
+                        token_name=token_name,
+                        lambda_ins=lambda_ins[pos] if pos < len(lambda_ins) else 0.0,
+                        lambda_del=lambda_del[pos] if pos < len(lambda_del) else 0.0,
+                        lambda_sub=lambda_sub[pos] if pos < len(lambda_sub) else 0.0,
+                        lambda_keep=lambda_keep[pos] if pos < len(lambda_keep) else 0.0
+                    )
 
                 # 重构训练时的logit空间（editflow_manager.py:460-467）
                 # ins_logits = insert_logits + ins_logits_rate
@@ -211,6 +223,29 @@ class SimpleSymbolicRegression:
                 # 找到最大概率的操作
                 best_op_idx = all_logits.argmax()
                 best_prob = all_probs[best_op_idx].item()
+
+                # 根据lambda值确定最佳操作（用于日志）
+                if lambda_del[pos] > lambda_ins[pos] and lambda_del[pos] > lambda_sub[pos] and lambda_del[pos] > lambda_keep[pos]:
+                    best_action = "DELETE"
+                elif lambda_ins[pos] > lambda_keep[pos] and lambda_ins[pos] > lambda_sub[pos]:
+                    best_action = "INSERT"
+                elif lambda_sub[pos] > lambda_keep[pos]:
+                    best_action = "SUBSTITUTE"
+                else:
+                    best_action = "KEEP"
+
+                # 记录位置预测
+                if self.logger and self._is_main_process() and token_name is not None:
+                    self.logger.log_position_prediction(
+                        step=step,
+                        pos=pos,
+                        token_name=token_name if token_name != '<BOS>' else 'BOS',
+                        lambda_ins=lambda_ins[pos] if pos < len(lambda_ins) else 0.0,
+                        lambda_del=lambda_del[pos] if pos < len(lambda_del) else 0.0,
+                        lambda_sub=lambda_sub[pos] if pos < len(lambda_sub) else 0.0,
+                        lambda_keep=lambda_keep[pos] if pos < len(lambda_keep) else 0.0,
+                        best_action=best_action
+                    )
 
                 # 解码操作类型和token
                 if best_op_idx < vocab_size:
@@ -239,11 +274,23 @@ class SimpleSymbolicRegression:
                         new_tokens=new_tokens
                     ))
 
+                    # 记录INSERT操作
+                    if self.logger and self._is_main_process():
+                        self.logger.log_action_execution(
+                            step=step,
+                            input_ids_pos=input_ids_pos,
+                            current_token_idx=-1,  # INSERT操作没有current_token_idx
+                            action_type='insert',
+                            token_name=token_name,
+                            score=best_prob
+                        )
+
                 elif best_op_idx == vocab_size:
                     # DELETE操作
                     if len(current_tokens) > 1:
                         current_token_idx = input_ids_pos - 1
                         if 0 <= current_token_idx < len(current_tokens):
+                            deleted_token = current_tokens[current_token_idx]
                             new_tokens = current_tokens.copy()
                             del new_tokens[current_token_idx]
 
@@ -253,6 +300,26 @@ class SimpleSymbolicRegression:
                                 score=best_prob,  # 使用联合概率
                                 new_tokens=new_tokens
                             ))
+
+                            # 记录DELETE操作
+                            if self.logger and self._is_main_process():
+                                self.logger.log_action_execution(
+                                    step=step,
+                                    input_ids_pos=input_ids_pos,
+                                    current_token_idx=current_token_idx,
+                                    action_type='delete',
+                                    token_name=deleted_token,
+                                    score=best_prob
+                                )
+
+                            # 记录删除后的位置变化
+                            if self.logger and self._is_main_process():
+                                self.logger.log_position_after_deletion(
+                                    step=step,
+                                    deleted_pos=input_ids_pos,
+                                    old_tokens=current_tokens,
+                                    new_tokens=new_tokens
+                                )
 
                 elif best_op_idx < 2 * vocab_size + 1:
                     # SUBSTITUTE操作
@@ -267,6 +334,7 @@ class SimpleSymbolicRegression:
 
                     current_token_idx = input_ids_pos - 1
                     if 0 <= current_token_idx < len(current_tokens):
+                        old_token = current_tokens[current_token_idx]
                         new_tokens = current_tokens.copy()
                         new_tokens[current_token_idx] = token_name
 
@@ -278,16 +346,39 @@ class SimpleSymbolicRegression:
                             new_tokens=new_tokens
                         ))
 
+                        # 记录SUBSTITUTE操作
+                        if self.logger and self._is_main_process():
+                            self.logger.log_action_execution(
+                                step=step,
+                                input_ids_pos=input_ids_pos,
+                                current_token_idx=current_token_idx,
+                                action_type='substitute',
+                                token_name=f"{old_token}→{token_name}",
+                                score=best_prob
+                            )
+
                 else:
                     # KEEP操作
                     current_token_idx = input_ids_pos - 1
                     if 0 <= current_token_idx < len(current_tokens):
+                        kept_token = current_tokens[current_token_idx]
                         proposals.append(ActionProposal(
                             action_type='keep',
                             position=input_ids_pos,
                             score=best_prob,  # 使用联合概率
                             new_tokens=current_tokens.copy()
                         ))
+
+                        # 记录KEEP操作
+                        if self.logger and self._is_main_process():
+                            self.logger.log_action_execution(
+                                step=step,
+                                input_ids_pos=input_ids_pos,
+                                current_token_idx=current_token_idx,
+                                action_type='keep',
+                                token_name=kept_token,
+                                score=best_prob
+                            )
 
         # 按分数排序
         proposals.sort(key=lambda p: p.score, reverse=True)
@@ -318,9 +409,9 @@ class SimpleSymbolicRegression:
             return actions[0].new_tokens.copy()
 
         # 多个操作：需要智能处理位置依赖
-        # 策略：从前往后应用，每次操作后更新后续操作的位置
+        # 策略：DELETE操作从后往前执行（避免位置偏移），其他操作从前往后执行
 
-        # 1. 按位置升序排序（从前往后应用）
+        # 1. 按位置升序排序
         sorted_actions = sorted(actions, key=lambda a: a.position)
 
         # 2. 初始化：从当前表达式开始
@@ -330,8 +421,46 @@ class SimpleSymbolicRegression:
         # 偏移量 = 已应用的插入数 - 已应用的删除数
         position_offset = 0
 
-        # 4. 从前往后应用操作
-        for action in sorted_actions:
+        # 4. 将操作分为 DELETE 和非 DELETE 两类
+        delete_actions = [a for a in sorted_actions if a.action_type == 'delete']
+        other_actions = [a for a in sorted_actions if a.action_type != 'delete']
+
+        # 5. DELETE 操作从后往前执行（删除后面的 token 不会影响前面的位置）
+        # 这样可以确保每个 DELETE 操作都能找到正确的 token，不会因为前面的删除而发生位置偏移
+        # 从后往前删除时，不需要 position_offset，因为每次删除都基于原始位置
+
+        # Debug: 打印初始状态
+        if os.environ.get('RANK', '0') == '0':
+            print(f"    [DEBUG REVERSE DELETE START] result_tokens={result_tokens}, delete_actions={[a.position for a in delete_actions]}")
+
+        for i, action in enumerate(reversed(delete_actions)):
+            # DELETE操作：position指向input_ids位置
+            # 需要转换为current_tokens位置：pos-1（跳过BOS）
+            # 注意：从后往前删除时，直接使用原始位置，不需要offset
+            actual_position = (action.position - 1)
+
+            # 确保位置在有效范围内
+            if actual_position < 0:
+                actual_position = 0
+            if actual_position >= len(result_tokens):
+                actual_position = len(result_tokens) - 1
+
+            # 执行删除
+            if 0 <= actual_position < len(result_tokens) and len(result_tokens) > 1:
+                deleted_token = result_tokens[actual_position]
+                del result_tokens[actual_position]
+                # Debug: 只在main process打印
+                if os.environ.get('RANK', '0') == '0':
+                    print(f"    [DEBUG REVERSE DELETE {i+1}/{len(delete_actions)}] @{action.position}→actual@{actual_position}: '{deleted_token}', 剩余{result_tokens}")
+
+        # 计算总的position_offset用于后续操作
+        position_offset = -len(delete_actions)
+
+        if os.environ.get('RANK', '0') == '0':
+            print(f"    [DEBUG REVERSE DELETE END] result_tokens={result_tokens}, position_offset={position_offset}")
+
+        # 6. 其他操作从前往后执行
+        for action in other_actions:
             # 计算实际位置：将input_ids位置转换为current_tokens位置
             # input_ids: [BOS, token1, token2, ...]
             # current_tokens: [token1, token2, ...]
@@ -346,24 +475,14 @@ class SimpleSymbolicRegression:
                     # 在位置p之后插入，插入到current_tokens的位置p（因为current_tokens不包含BOS）
                     actual_position = action.position + position_offset
             else:
-                # DELETE/SUBSTITUTE/KEEP操作：position指向input_ids位置
+                # SUBSTITUTE/KEEP操作：position指向input_ids位置
                 # 需要转换为current_tokens位置：pos-1（跳过BOS）
                 actual_position = (action.position - 1) + position_offset
 
             # 确保位置在有效范围内
             actual_position = max(0, min(actual_position, len(result_tokens)))
 
-            if action.action_type == 'delete':
-                # 删除操作
-                if 0 <= actual_position < len(result_tokens) and len(result_tokens) > 1:
-                    deleted_token = result_tokens[actual_position]
-                    del result_tokens[actual_position]
-                    position_offset -= 1  # 后续位置前移
-                    # Debug: 只在main process打印
-                    if os.environ.get('RANK', '0') == '0':
-                        print(f"    [DEBUG] Delete @{action.position}→actual@{actual_position}: '{deleted_token}', 剩余{len(result_tokens)} tokens, offset={position_offset}")
-
-            elif action.action_type == 'insert':
+            if action.action_type == 'insert':
                 # 插入操作
                 if action.token is not None:
                     # 检查当前位置是否是<gap>
@@ -625,13 +744,13 @@ class SimpleSymbolicRegression:
                                f"tokens={','.join(current_candidate.tokens)} | "
                                f"MSE={current_candidate.mse_score:.6f} | "
                                f"总操作数={len(history)}",
-                               "inference", level=1)
+                               "inference", level=3)
         else:
             if self.logger and self._is_main_process():
                 print(f"无法评估最终表达式的MSE")
                 self.logger.log("GREEDY_SEARCH_FAILED",
                                f"无法评估最终表达式 | tokens={','.join(current_candidate.tokens)}",
-                               "inference", level=1)
+                               "inference", level=3)
 
         return current_candidate
 
