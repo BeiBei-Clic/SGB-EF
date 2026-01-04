@@ -4,12 +4,8 @@ EditFlow连续流匹配的核心组件
 
 import torch
 import torch.nn.functional as F
-import json
-import os
-import time
-from typing import List, Dict, Tuple, Optional
+from typing import Tuple, Optional
 from datasets import load_dataset
-from ..symbolic.data_generator import generate_flow_samples
 
 
 def remove_gap_tokens(z_t: torch.Tensor, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -21,7 +17,7 @@ def remove_gap_tokens(z_t: torch.Tensor, tokenizer) -> Tuple[torch.Tensor, torch
     pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
     gap_token_id = tokenizer.convert_tokens_to_ids('<gap>')
     bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
-    batch_size, z_seq_len = z_t.shape
+    batch_size = z_t.shape[0]
     device = z_t.device
 
     z_gap_mask = (z_t == gap_token_id)
@@ -51,28 +47,18 @@ def remove_gap_tokens(z_t: torch.Tensor, tokenizer) -> Tuple[torch.Tensor, torch
 
 def fill_gap_tokens_with_repeats(x_ut: torch.Tensor, z_gap_mask: torch.Tensor, z_pad_mask: torch.Tensor) -> torch.Tensor:
     """用重复值填充gap token位置"""
-    batch_size, z_seq_len = z_gap_mask.shape
-    _, x_seq_len, vocab_size = x_ut.shape
-
+    batch_size = z_gap_mask.shape[0]
+    x_seq_len = x_ut.shape[1]
 
     # 计算每个位置对应的非gap位置
-
     non_gap_mask = ~z_gap_mask
-
-
     indices = non_gap_mask.cumsum(dim=1) - 1
-
-
     indices = indices.clamp(min=0, max=x_seq_len-1)
-
 
     # 收集对应的特征
     batch_indices = torch.arange(batch_size, device=x_ut.device).unsqueeze(1)
-
     result = x_ut[batch_indices, indices]
-
     result[z_pad_mask] = 0
-
 
     return result
 
@@ -247,15 +233,6 @@ class ContinuousFlowLoss:
         nan_count_z = torch.isnan(u_z).sum().item()
         inf_count_z = torch.isinf(u_z).sum().item()
 
-        # 额外检查：u_z 是否包含接近0的值（可能导致 log(0)）
-        u_z_min = float(u_z.min().item())
-        u_z_max = float(u_z.max().item())
-        u_z_mean = float(u_z.mean().item())
-        u_z_std = float(u_z.std().item())
-        u_z_has_near_zero = bool((u_z < 1e-10).any().item())
-        u_z_has_negative = bool((u_z < 0).any().item())
-        u_z_num_zeros = int((u_z == 0).sum().item())
-
         # 分布式NaN检测：如果使用accelerator，确保所有进程同步检测结果
         has_nan_or_inf = torch.tensor(1 if ((nan_count_x > 0 or inf_count_x > 0) or (nan_count_z > 0 or inf_count_z > 0)) else 0,
                                     device=u_cat_x.device)
@@ -276,7 +253,7 @@ class ContinuousFlowLoss:
                         "compute_loss", level=1)
 
         # 获取操作空间维度
-        batch_size, z_seq_len, n_ops = u_z.shape
+        _, _, n_ops = u_z.shape
 
         # 使用标准cross_entropy计算loss
         # 有了KEEP操作后，每个token位置都有一个明确的操作标签：
@@ -323,22 +300,17 @@ class ContinuousFlowLoss:
         cross_entropy = torch.stack(sample_losses)  # [batch]
 
         # 最终损失：交叉熵损失
-        ce_loss = cross_entropy.mean()
-        loss = ce_loss
-
-        return loss
+        return cross_entropy.mean()
 
 
-def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
-                       max_expr_length: int = 128, stream: bool = True,
-                       num_proc: Optional[int] = None):
+def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
+                       stream: bool = True, num_proc: Optional[int] = None):
     """
     使用 Hugging Face datasets 加载并预处理数据
 
     Args:
         data_file: 数据文件路径 (.parquet格式)
         tokenizer: 分词器
-        max_dim: 最大维度
         max_expr_length: 表达式最大长度
         stream: 是否使用流式加载（默认True，适合大文件）
         num_proc: 预处理时的进程数，None表示自动选择
@@ -360,7 +332,6 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_dim: int = 10,
     pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
     bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
     gap_token_id = tokenizer.convert_tokens_to_ids('<gap>')
-    vocab_size = len(tokenizer.get_vocab())
 
     def process_function(examples):
         """
@@ -457,7 +428,7 @@ class FlowDataset(torch.utils.data.Dataset):
         Args:
             data_file: 数据文件路径
             tokenizer: 分词器
-            max_dim: 最大维度
+            max_dim: 最大维度（保留用于向后兼容）
             max_expr_length: 表达式最大长度
             stream: 是否使用流式加载（默认True）
             num_proc: 预处理时的进程数
@@ -475,7 +446,6 @@ class FlowDataset(torch.utils.data.Dataset):
         self._hf_dataset = prepare_dataset_hf(
             data_file=data_file,
             tokenizer=tokenizer,
-            max_dim=max_dim,
             max_expr_length=max_expr_length,
             stream=stream,
             num_proc=num_proc
@@ -566,9 +536,9 @@ def custom_collate_fn(batch):
     max_n_points = 0
     original_dims = []
 
-    for i, item in enumerate(batch):
+    for item in batch:
         x_val = item['x_values']  # [n_points, current_dim]
-        y_tgt = item['y_target']  # [n_points]  # 新增：获取y_target
+        y_tgt = item['y_target']  # [n_points]
 
         # 确保x_values至少是2维的
         if x_val.dim() == 1:
@@ -587,15 +557,15 @@ def custom_collate_fn(batch):
 
     # Padding所有数据到最大形状
     x_values_padded = []
-    y_target_padded = []  # 新增：y_target的padding
+    y_target_padded = []
     residuals_padded = []
     dim_masks = []
     point_masks = []
 
-    for i, item in enumerate(batch):
+    for item in batch:
         x_val = item['x_values'].clone()  # [n_points, current_dim]
-        y_tgt = item['y_target'].clone()  # [n_points]  # 新增：克隆y_target
-        resid = item['residuals'].clone()  # [n_points]  # 保留：用于向后兼容
+        y_tgt = item['y_target'].clone()  # [n_points]
+        resid = item['residuals'].clone()  # [n_points]
 
         # 确保x_values至少是2维的
         if x_val.dim() == 1:
@@ -635,7 +605,7 @@ def custom_collate_fn(batch):
         point_mask[:current_n_points] = 1.0
 
         x_values_padded.append(x_val)          # [max_n_points, max_dim]
-        y_target_padded.append(y_tgt)          # [max_n_points]  # 新增
+        y_target_padded.append(y_tgt)          # [max_n_points]
         residuals_padded.append(resid)         # [max_n_points]
         dim_masks.append(dim_mask)             # [max_dim]
         point_masks.append(point_mask)         # [max_n_points]
