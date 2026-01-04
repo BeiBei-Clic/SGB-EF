@@ -7,6 +7,7 @@ import os
 import time
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -386,6 +387,47 @@ class EditFlowManager:
             self.logger.tensor_values(f"substitute_logits_batch{batch_idx}", output['substitute_logits'][sample_idx],
                                      context=context, level=2, max_elements=100)
 
+            # 记录SUBSTITUTE操作的候选token（前5个位置）
+            rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
+            substitute_logits = output['substitute_logits'][sample_idx]
+            x_t_sample = x_t[sample_idx]
+
+            for pos in range(min(5, x_t_sample.shape[0])):
+                if x_t_sample[pos].item() == self.tokenizer.pad_token_id:
+                    break
+
+                lambda_sub = rates_probs[pos, 2].item()
+                if lambda_sub > 0.01:  # 只记录有意义的替换概率
+                    self.logger.log_training_substitute_candidates(
+                        batch_idx=batch_idx,
+                        sample_idx=sample_idx,
+                        position=pos,
+                        x_t_value=x_t_sample[pos].item(),
+                        lambda_sub=lambda_sub,
+                        substitute_logits=substitute_logits[pos],
+                        tokenizer=self.tokenizer,
+                        top_k=5,
+                        context=context,
+                        level=2
+                    )
+
+            # 记录INSERT操作的候选token（前3个位置）
+            insert_logits = output['insert_logits'][sample_idx]
+            for pos in range(min(3, insert_logits.shape[0])):
+                lambda_ins = rates_probs[pos, 0].item()
+                if lambda_ins > 0.01:  # 只记录有意义的插入概率
+                    self.logger.log_training_insert_candidates(
+                        batch_idx=batch_idx,
+                        sample_idx=sample_idx,
+                        position=pos,
+                        lambda_ins=lambda_ins,
+                        insert_logits=insert_logits[pos],
+                        tokenizer=self.tokenizer,
+                        top_k=5,
+                        context=context,
+                        level=2
+                    )
+
         return {
             'pred_rates': pred_rates,
             'pred_ins_logits': output['insert_logits'],
@@ -457,6 +499,29 @@ class EditFlowManager:
             self.logger.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx],
                                      context=context, level=2, max_elements=50)
 
+            # 记录每个位置的操作概率分布（前10个位置）
+            for pos in range(min(10, x_t.shape[1])):
+                if x_t[sample_idx, pos].item() == self.tokenizer.pad_token_id:
+                    break
+
+                lambda_ins_val = lambda_ins[sample_idx, pos, 0].item()
+                lambda_del_val = lambda_del[sample_idx, pos, 0].item()
+                lambda_sub_val = lambda_sub[sample_idx, pos, 0].item()
+                lambda_keep_val = rates_probs[sample_idx, pos, 3].item()
+
+                self.logger.log_training_action_probabilities(
+                    batch_idx=batch_idx,
+                    sample_idx=sample_idx,
+                    position=pos,
+                    x_t_value=x_t[sample_idx, pos].item(),
+                    lambda_ins=lambda_ins_val,
+                    lambda_del=lambda_del_val,
+                    lambda_sub=lambda_sub_val,
+                    lambda_keep=lambda_keep_val,
+                    context=context,
+                    level=2
+                )
+
             self.logger.log_u_mask_split(f"GT_u_mask", u_mask_x[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
                                         effective_vocab_size, context=context, level=2)
 
@@ -469,6 +534,58 @@ class EditFlowManager:
                 max_ops=20,
                 pad_token_id=self.tokenizer.pad_token_id
             )
+
+            # 对比预测 vs Ground Truth（前10个位置）
+            pred_ops_ids = u_cat_x[sample_idx].argmax(dim=-1)  # [x_seq_len]
+
+            for pos in range(min(10, x_t.shape[1])):
+                if x_t[sample_idx, pos].item() == self.tokenizer.pad_token_id:
+                    break
+
+                # 解码Ground Truth操作
+                gt_op_id = u_mask_x[sample_idx, pos].argmax().item()
+                vocab_size = effective_vocab_size
+
+                if gt_op_id < vocab_size:
+                    gt_token = self.tokenizer.convert_ids_to_tokens([gt_op_id])[0]
+                    gt_op = f"INSERT(token_id={gt_op_id}→{gt_token})"
+                elif gt_op_id == vocab_size:
+                    gt_op = "DELETE"
+                elif gt_op_id < 2 * vocab_size + 1:
+                    sub_token_id = gt_op_id - vocab_size - 1
+                    sub_token = self.tokenizer.convert_ids_to_tokens([sub_token_id])[0]
+                    gt_op = f"SUBSTITUTE(token_id={sub_token_id}→{sub_token})"
+                else:
+                    gt_op = "KEEP"
+
+                # 解码预测操作
+                pred_op_id = pred_ops_ids[pos].item()
+
+                if pred_op_id < vocab_size:
+                    pred_token = self.tokenizer.convert_ids_to_tokens([pred_op_id])[0]
+                    pred_op = f"INSERT(token_id={pred_op_id}→{pred_token})"
+                elif pred_op_id == vocab_size:
+                    pred_op = "DELETE"
+                elif pred_op_id < 2 * vocab_size + 1:
+                    sub_token_id = pred_op_id - vocab_size - 1
+                    sub_token = self.tokenizer.convert_ids_to_tokens([sub_token_id])[0]
+                    pred_op = f"SUBSTITUTE(token_id={sub_token_id}→{sub_token})"
+                else:
+                    pred_op = "KEEP"
+
+                is_match = (gt_op_id == pred_op_id)
+
+                self.logger.log_training_pred_vs_gt(
+                    batch_idx=batch_idx,
+                    sample_idx=sample_idx,
+                    position=pos,
+                    x_t_value=x_t[sample_idx, pos].item(),
+                    gt_operation=gt_op,
+                    pred_operation=pred_op,
+                    is_match=is_match,
+                    context=context,
+                    level=2
+                )
 
             self.logger.tensor_values(f"pred_u_cat_x_batch{batch_idx}_first5pos", u_cat_x[sample_idx, :5, :],
                                      context=context, level=2, max_elements=100)

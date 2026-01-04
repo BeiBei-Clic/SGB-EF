@@ -149,121 +149,145 @@ class SimpleSymbolicRegression:
                 condition=condition
             )
 
-            # 提取结果
-            rates_logits = output['rates_logits']
-            rates_probs = F.softmax(rates_logits, dim=-1)
+            # 提取结果（使用logits，和训练时一致）
+            rates_logits = output['rates_logits']  # [1, seq_len, 4]
+            insert_logits = output['insert_logits']  # [1, seq_len, vocab_size]
+            substitute_logits = output['substitute_logits']  # [1, seq_len, vocab_size]
 
+            # 计算操作概率（仅用于日志记录）
+            rates_probs = F.softmax(rates_logits, dim=-1)
             lambda_ins = rates_probs[0, :, 0].cpu().numpy()  # 插入概率
             lambda_del = rates_probs[0, :, 1].cpu().numpy()  # 删除概率
             lambda_sub = rates_probs[0, :, 2].cpu().numpy()  # 替换概率
             lambda_keep = rates_probs[0, :, 3].cpu().numpy()  # 保持概率
 
-            insert_probs = output['insert_probs']
-            substitute_probs = output['substitute_probs']
+            # 计算token概率（仅用于日志记录）
+            insert_probs = F.softmax(insert_logits, dim=-1)
+            substitute_probs = F.softmax(substitute_logits, dim=-1)
 
             effective_length = int(attention_mask[0].sum().item())
-            seq_len = min(effective_length, lambda_ins.shape[0])
 
-            # 生成INSERT操作提案
-            if 0 < lambda_ins.shape[0] and lambda_ins[0] > self.min_action_score:
-                top_k_tokens = top_k if top_k else insert_probs.shape[2]
-                top_tokens = torch.topk(insert_probs[0, 0], min(top_k_tokens, insert_probs.shape[2]))
+            # 记录每个位置的操作概率分布
+            if self.logger and self._is_main_process():
+                for pos in range(len(current_tokens) + 1):  # +1 因为有BOS token
+                    if pos < lambda_ins.shape[0]:
+                        self.logger.log_action_probabilities(
+                            step=step,
+                            position=pos,
+                            expr_len=len(current_tokens),
+                            lambda_ins=lambda_ins[pos],
+                            lambda_del=lambda_del[pos],
+                            lambda_sub=lambda_sub[pos],
+                            lambda_keep=lambda_keep[pos]
+                        )
+            # 获取词汇表大小
+            vocab_size = self.tokenizer.vocab_size
 
-                for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
-                    token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
+            # 为每个位置选择最佳操作（在联合logit空间，和训练时完全一致）
+            for pos in range(len(current_tokens) + 1):
+                input_ids_pos = pos  # 位置索引（包含BOS token）
 
-                    if valid_variables is not None:
-                        if token_name.startswith('x') and token_name not in valid_variables:
-                            continue
+                if input_ids_pos >= rates_logits.shape[1]:
+                    continue
 
-                    new_tokens = current_tokens.copy()
-                    new_tokens.insert(0, token_name)
+                # 重构训练时的logit空间（editflow_manager.py:460-467）
+                # ins_logits = insert_logits + ins_logits_rate
+                ins_logits = insert_logits[0, input_ids_pos] + rates_logits[0, input_ids_pos, 0]
+                # del_logits = del_logits_rate (DELETE无token logits)
+                del_logits = rates_logits[0, input_ids_pos, 1]
+                # sub_logits = substitute_logits + sub_logits_rate
+                sub_logits = substitute_logits[0, input_ids_pos] + rates_logits[0, input_ids_pos, 2]
+                # keep_logits = keep_logits_rate (KEEP无token logits)
+                keep_logits = rates_logits[0, input_ids_pos, 3]
+
+                # 拼接所有操作logits：[INSERT...v] [DELETE] [SUBSTITUTE...v] [KEEP]
+                all_logits = torch.cat([ins_logits, del_logits.unsqueeze(0),
+                                        sub_logits, keep_logits.unsqueeze(0)])
+                # 维度: [2*vocab_size+2]
+
+                # Softmax得到概率分布
+                all_probs = F.softmax(all_logits, dim=0)
+
+                # 找到最大概率的操作
+                best_op_idx = all_logits.argmax()
+                best_prob = all_probs[best_op_idx].item()
+
+                # 解码操作类型和token
+                if best_op_idx < vocab_size:
+                    # INSERT操作
+                    token_id = int(best_op_idx)  # 转换为int
+                    # 直接使用ids_to_tokens，避免PreTrainedTokenizer的convert_ids_to_tokens干扰
+                    token_name = self.tokenizer.ids_to_tokens.get(token_id, '<unk>')
+
+                    # 变量验证
+                    if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
+                        continue
+
+                    # 生成新tokens
+                    if pos == 0:
+                        new_tokens = current_tokens.copy()
+                        new_tokens.insert(0, token_name)
+                    else:
+                        new_tokens = current_tokens.copy()
+                        new_tokens.insert(pos, token_name)
 
                     proposals.append(ActionProposal(
                         action_type='insert',
-                        position=0,
+                        position=input_ids_pos,
                         token=token_name,
-                        score=lambda_ins[0] * prob.item(),
+                        score=best_prob,  # 使用联合概率
                         new_tokens=new_tokens
                     ))
 
-            # 遍历每个token位置生成INSERT
-            for current_token_pos in range(len(current_tokens)):
-                input_ids_pos = current_token_pos + 1
-                if input_ids_pos < lambda_ins.shape[0] and lambda_ins[input_ids_pos] > self.min_action_score:
-                    insert_pos = current_token_pos + 1
-                    top_k_tokens = top_k if top_k else insert_probs.shape[2]
-                    top_tokens = torch.topk(insert_probs[0, input_ids_pos], min(top_k_tokens, insert_probs.shape[2]))
+                elif best_op_idx == vocab_size:
+                    # DELETE操作
+                    if len(current_tokens) > 1:
+                        current_token_idx = input_ids_pos - 1
+                        if 0 <= current_token_idx < len(current_tokens):
+                            new_tokens = current_tokens.copy()
+                            del new_tokens[current_token_idx]
 
-                    for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
-                        token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
+                            proposals.append(ActionProposal(
+                                action_type='delete',
+                                position=input_ids_pos,
+                                score=best_prob,  # 使用联合概率
+                                new_tokens=new_tokens
+                            ))
 
-                        if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
-                            continue
+                elif best_op_idx < 2 * vocab_size + 1:
+                    # SUBSTITUTE操作
+                    token_id = int(best_op_idx - vocab_size - 1)  # 转换为int
 
-                        new_tokens = current_tokens.copy()
-                        new_tokens.insert(insert_pos, token_name)
+                    # 直接使用ids_to_tokens，避免PreTrainedTokenizer的convert_ids_to_tokens干扰
+                    token_name = self.tokenizer.ids_to_tokens.get(token_id, '<unk>')
 
-                        proposals.append(ActionProposal(
-                            action_type='insert',
-                            position=insert_pos,
-                            token=token_name,
-                            score=lambda_ins[input_ids_pos] * prob.item(),
-                            new_tokens=new_tokens
-                        ))
+                    # 变量验证
+                    if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
+                        continue
 
-            # 生成SUBSTITUTE操作提案
-            seq_len = min(effective_length, lambda_sub.shape[0])
-            for pos in range(1, seq_len):
-                current_token_idx = pos - 1
-                if pos < lambda_sub.shape[0] and current_token_idx < len(current_tokens) and lambda_sub[pos] > self.min_action_score:
-                    top_k_tokens = top_k if top_k else substitute_probs.shape[2]
-                    top_tokens = torch.topk(substitute_probs[0, pos], min(top_k_tokens, substitute_probs.shape[2]))
-
-                    for token_idx, prob in zip(top_tokens.indices, top_tokens.values):
-                        token_name = self.tokenizer.convert_ids_to_tokens([token_idx.item()])[0]
-
-                        if valid_variables is not None and token_name.startswith('x') and token_name not in valid_variables:
-                            continue
-
+                    current_token_idx = input_ids_pos - 1
+                    if 0 <= current_token_idx < len(current_tokens):
                         new_tokens = current_tokens.copy()
                         new_tokens[current_token_idx] = token_name
 
                         proposals.append(ActionProposal(
                             action_type='substitute',
-                            position=pos,
+                            position=input_ids_pos,
                             token=token_name,
-                            score=lambda_sub[pos] * prob.item(),
+                            score=best_prob,  # 使用联合概率
                             new_tokens=new_tokens
                         ))
 
-            # 生成DELETE操作提案
-            seq_len = min(effective_length, lambda_del.shape[0])
-            for pos in range(1, seq_len):
-                current_token_idx = pos - 1
-                if pos < lambda_del.shape[0] and current_token_idx < len(current_tokens) and lambda_del[pos] > self.min_action_score:
-                    if len(current_tokens) > 1:
-                        new_tokens = current_tokens.copy()
-                        del new_tokens[current_token_idx]
-
+                else:
+                    # KEEP操作
+                    current_token_idx = input_ids_pos - 1
+                    if 0 <= current_token_idx < len(current_tokens):
                         proposals.append(ActionProposal(
-                            action_type='delete',
-                            position=pos,
-                            score=lambda_del[pos],
-                            new_tokens=new_tokens
+                            action_type='keep',
+                            position=input_ids_pos,
+                            score=best_prob,  # 使用联合概率
+                            new_tokens=current_tokens.copy()
                         ))
-
-            # 生成KEEP操作提案
-            seq_len = min(effective_length, lambda_keep.shape[0])
-            for pos in range(1, seq_len):
-                current_token_idx = pos - 1
-                if pos < lambda_keep.shape[0] and current_token_idx < len(current_tokens) and lambda_keep[pos] > self.min_action_score:
-                    proposals.append(ActionProposal(
-                        action_type='keep',
-                        position=pos,
-                        score=lambda_keep[pos],
-                        new_tokens=current_tokens.copy()
-                    ))
 
         # 按分数排序
         proposals.sort(key=lambda p: p.score, reverse=True)
@@ -494,10 +518,9 @@ class SimpleSymbolicRegression:
                     print(f"没有找到有效操作,提前终止")
                 break
 
-            # 方案B改进：按位置选择最佳操作，再按操作类型优先级选择
-            # 优先级: delete > substitute > keep > insert
-            # 这样避免跨操作类型的分数比较（如delete vs keep）
+            # 按位置选择最佳操作（联合logit空间已经让所有操作公平竞争）
             position_best = {}  # {position: best_proposal}
+
             for proposal in proposals:
                 pos = proposal.position
                 if pos not in position_best or proposal.score > position_best[pos].score:

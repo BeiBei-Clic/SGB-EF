@@ -531,6 +531,238 @@ class Logger:
                 f"每个位置的最佳操作 | {' | '.join(positions_info)}",
                 "greedy_search", level=level)
 
+    def log_action_probabilities(self, step, position, expr_len,
+                                 lambda_ins, lambda_del, lambda_sub, lambda_keep,
+                                 context="greedy_search", level=3):
+        """记录操作概率分布
+
+        Args:
+            step (int): 当前推理步数
+            position (int): token 位置
+            expr_len (int): 表达式长度
+            lambda_ins (float): 插入概率
+            lambda_del (float): 删除概率
+            lambda_sub (float): 替换概率
+            lambda_keep (float): 保持概率
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        self.log(
+            "ACTION_PROBABILITIES",
+            f"step={step} | 位置{position} | expr_len={expr_len} | "
+            f"lambda_ins={lambda_ins:.6f} | "
+            f"lambda_del={lambda_del:.6f} | "
+            f"lambda_sub={lambda_sub:.6f} | "
+            f"lambda_keep={lambda_keep:.6f}",
+            context, level=level
+        )
+
+    def log_insert_candidates(self, step, position, position_desc, lambda_ins,
+                             top_token_ids, top_probs, tokenizer, top_k=5,
+                             context="greedy_search", level=3):
+        """记录 INSERT 操作的候选 token
+
+        Args:
+            step (int): 当前推理步数
+            position (int): 位置索引
+            position_desc (str): 位置描述（如 "位置0(开头插入)"）
+            lambda_ins (float): 插入概率
+            top_token_ids (torch.Tensor): top-k token IDs
+            top_probs (torch.Tensor): top-k token 概率
+            tokenizer: tokenizer 对象，用于转换 token ID 到 token 名称
+            top_k (int): 记录前 k 个候选
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        candidates_info = []
+        for idx, (token_idx, prob) in enumerate(zip(top_token_ids[:top_k], top_probs[:top_k])):
+            token_id = token_idx.item() if isinstance(token_idx, torch.Tensor) else token_idx
+            prob_val = prob.item() if isinstance(prob, torch.Tensor) else prob
+            score = lambda_ins * prob_val
+            token_name = tokenizer.convert_ids_to_tokens([token_id])[0]
+            candidates_info.append(f"{idx+1}.{token_name}(prob={prob_val:.6f},score={score:.6f})")
+
+        self.log(
+            "INSERT_CANDIDATES",
+            f"step={step} | {position_desc} | lambda_ins={lambda_ins:.6f} | "
+            f"top_{len(candidates_info)}: {' | '.join(candidates_info)}",
+            context, level=level
+        )
+
+    def log_substitute_candidates(self, step, position, current_token, lambda_sub,
+                                  top_token_ids, top_probs, tokenizer, top_k=5,
+                                  context="greedy_search", level=3):
+        """记录 SUBSTITUTE 操作的候选 token
+
+        Args:
+            step (int): 当前推理步数
+            position (int): 位置索引
+            current_token (str): 当前 token
+            lambda_sub (float): 替换概率
+            top_token_ids (torch.Tensor): top-k token IDs
+            top_probs (torch.Tensor): top-k token 概率
+            tokenizer: tokenizer 对象，用于转换 token ID 到 token 名称
+            top_k (int): 记录前 k 个候选
+            context (str): 上下文标识
+            level (int): 日志级别
+        """
+        if not self._should_log(level):
+            return
+
+        candidates_info = []
+        for idx, (token_idx, prob) in enumerate(zip(top_token_ids[:top_k], top_probs[:top_k])):
+            token_id = token_idx.item() if isinstance(token_idx, torch.Tensor) else token_idx
+            prob_val = prob.item() if isinstance(prob, torch.Tensor) else prob
+            score = lambda_sub * prob_val
+            token_name = tokenizer.convert_ids_to_tokens([token_id])[0]
+            candidates_info.append(f"{idx+1}.{token_name}(prob={prob_val:.6f},score={score:.6f})")
+
+        self.log(
+            "SUBSTITUTE_CANDIDATES",
+            f"step={step} | 位置{position}(当前={current_token}) | lambda_sub={lambda_sub:.6f} | "
+            f"top_{len(candidates_info)}: {' | '.join(candidates_info)}",
+            context, level=level
+        )
+
+    # ==================== 训练监控日志 ====================
+
+    def log_training_action_probabilities(self, batch_idx, sample_idx, position, x_t_value,
+                                         lambda_ins, lambda_del, lambda_sub, lambda_keep,
+                                         context="", level=2):
+        """记录训练时每个位置的操作概率分布
+
+        Args:
+            batch_idx (int): batch 索引
+            sample_idx (int): sample 索引
+            position (int): token 位置
+            x_t_value (int): 当前位置的 token ID
+            lambda_ins (float): 插入概率
+            lambda_del (float): 删除概率
+            lambda_sub (float): 替换概率
+            lambda_keep (float): 保持概率
+            context (str): 上下文标识
+            level (int): 日志级别 (默认2=训练调试)
+        """
+        if not self._should_log(level):
+            return
+
+        self.log(
+            "TRAIN_ACTION_PROBS",
+            f"batch{batch_idx}_sample{sample_idx} | pos{position}(x_t={x_t_value}) | "
+            f"lambda_ins={lambda_ins:.6f} | lambda_del={lambda_del:.6f} | "
+            f"lambda_sub={lambda_sub:.6f} | lambda_keep={lambda_keep:.6f}",
+            context, level=level
+        )
+
+    def log_training_substitute_candidates(self, batch_idx, sample_idx, position, x_t_value,
+                                          lambda_sub, substitute_logits, tokenizer, top_k=5,
+                                          context="", level=2):
+        """记录训练时 SUBSTITUTE 操作的候选 token
+
+        Args:
+            batch_idx (int): batch 索引
+            sample_idx (int): sample 索引
+            position (int): token 位置
+            x_t_value (int): 当前位置的 token ID
+            lambda_sub (float): 替换概率
+            substitute_logits (torch.Tensor): [vocab_size] 替换操作的 logits
+            tokenizer: tokenizer 对象
+            top_k (int): 记录前 k 个候选
+            context (str): 上下文标识
+            level (int): 日志级别 (默认2=训练调试)
+        """
+        if not self._should_log(level):
+            return
+
+        import torch.nn.functional as F
+        substitute_probs = F.softmax(substitute_logits, dim=-1)
+        top_probs, top_indices = torch.topk(substitute_probs, k=min(top_k, substitute_logits.shape[0]))
+
+        candidates_info = []
+        for idx, (token_idx, prob) in enumerate(zip(top_indices, top_probs)):
+            token_id = token_idx.item() if isinstance(token_idx, torch.Tensor) else token_idx
+            prob_val = prob.item() if isinstance(prob, torch.Tensor) else prob
+            token_name = tokenizer.convert_ids_to_tokens([token_id])[0]
+            candidates_info.append(f"{token_name}(prob={prob_val:.6f})")
+
+        self.log(
+            "TRAIN_SUBSTITUTE_CANDIDATES",
+            f"batch{batch_idx}_sample{sample_idx} | pos{position}(x_t={x_t_value}) | "
+            f"lambda_sub={lambda_sub:.6f} | top_{len(candidates_info)}: [{', '.join(candidates_info)}]",
+            context, level=level
+        )
+
+    def log_training_insert_candidates(self, batch_idx, sample_idx, position,
+                                      lambda_ins, insert_logits, tokenizer, top_k=5,
+                                      context="", level=2):
+        """记录训练时 INSERT 操作的候选 token
+
+        Args:
+            batch_idx (int): batch 索引
+            sample_idx (int): sample 索引
+            position (int): token 位置
+            lambda_ins (float): 插入概率
+            insert_logits (torch.Tensor): [vocab_size] 插入操作的 logits
+            tokenizer: tokenizer 对象
+            top_k (int): 记录前 k 个候选
+            context (str): 上下文标识
+            level (int): 日志级别 (默认2=训练调试)
+        """
+        if not self._should_log(level):
+            return
+
+        import torch.nn.functional as F
+        insert_probs = F.softmax(insert_logits, dim=-1)
+        top_probs, top_indices = torch.topk(insert_probs, k=min(top_k, insert_logits.shape[0]))
+
+        candidates_info = []
+        for idx, (token_idx, prob) in enumerate(zip(top_indices, top_probs)):
+            token_id = token_idx.item() if isinstance(token_idx, torch.Tensor) else token_idx
+            prob_val = prob.item() if isinstance(prob, torch.Tensor) else prob
+            token_name = tokenizer.convert_ids_to_tokens([token_id])[0]
+            candidates_info.append(f"{token_name}(prob={prob_val:.6f})")
+
+        self.log(
+            "TRAIN_INSERT_CANDIDATES",
+            f"batch{batch_idx}_sample{sample_idx} | pos{position} | "
+            f"lambda_ins={lambda_ins:.6f} | top_{len(candidates_info)}: [{', '.join(candidates_info)}]",
+            context, level=level
+        )
+
+    def log_training_pred_vs_gt(self, batch_idx, sample_idx, position, x_t_value,
+                               gt_operation, pred_operation, is_match,
+                               context="", level=2):
+        """记录训练时预测 vs Ground Truth 的对比
+
+        Args:
+            batch_idx (int): batch 索引
+            sample_idx (int): sample 索引
+            position (int): token 位置
+            x_t_value (int): 当前位置的 token ID
+            gt_operation (str): Ground Truth 操作描述
+            pred_operation (str): 预测操作描述
+            is_match (bool): 是否匹配
+            context (str): 上下文标识
+            level (int): 日志级别 (默认2=训练调试)
+        """
+        if not self._should_log(level):
+            return
+
+        match_symbol = "✓" if is_match else "✗"
+
+        self.log(
+            "TRAIN_PRED_VS_GT",
+            f"batch{batch_idx}_sample{sample_idx} | pos{position}(x_t={x_t_value}) | "
+            f"GT:{gt_operation} | PRED:{pred_operation} | {match_symbol}",
+            context, level=level
+        )
+
     # ==================== 崩溃日志 ====================
 
     def log_crash(self, step_name, batch_idx, dimension, error, extra_info=None):
