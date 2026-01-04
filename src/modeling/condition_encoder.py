@@ -1,12 +1,11 @@
 """
 条件编码器 - 使用SetTransformer架构编码残差点集
-基于NeSymReS的SetTransformer实现
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class MAB(nn.Module):
@@ -34,29 +33,16 @@ class MAB(nn.Module):
         K, V = self.fc_k(K), self.fc_v(K)
 
         dim_split = self.dim_V // self.num_heads
-        Q_ = torch.cat(Q.split(dim_split, 2), 0)
-        K_ = torch.cat(K.split(dim_split, 2), 0)
-        V_ = torch.cat(V.split(dim_split, 2), 0)
+        Q_, K_, V_ = torch.cat(Q.split(dim_split, 2), 0), torch.cat(K.split(dim_split, 2), 0), torch.cat(V.split(dim_split, 2), 0)
 
-        # 计算attention scores
-        A = Q_.bmm(K_.transpose(1,2))/math.sqrt(self.dim_V)
-
-        # 应用attention mask
-        batch_size, n_k = attention_mask.shape
-        n_q = Q.size(1)
-
-        # 扩展mask: (batch_size, n_k) -> (batch_size, 1, n_k) -> (batch_size, n_q, n_k)
-        mask_expanded = attention_mask.unsqueeze(1).expand(-1, n_q, -1)
-
-        # 重复每个头: (batch_size, n_q, n_k) -> (batch_size * num_heads, n_q, n_k)
-        mask_expanded = mask_expanded.repeat(self.num_heads, 1, 1)
-
-        # 将0位置设为极小值
-        # 使用-1e4以兼容fp16（fp16范围约-65504到+65504）
-        # 使用float类型确保在autocast下正确转换
-        A = A.masked_fill(mask_expanded == 0, -1e4)
-
+        # 计算注意力并应用mask
+        A = Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V)
+        A = A.masked_fill(
+            attention_mask.unsqueeze(1).expand(-1, Q.size(1), -1).repeat(self.num_heads, 1, 1) == 0,
+            -1e4
+        )
         A = torch.softmax(A, 2)
+
         O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
         O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
         O = O + F.relu(self.fc_o(O))
@@ -84,14 +70,9 @@ class ISAB(nn.Module):
         self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
     def forward(self, X, attention_mask):
-        # mab0:诱导向量I作为Q，X作为K/V，需要对X应用mask
         H = self.mab0(self.I.repeat(X.size(0), 1, 1), X, attention_mask)
-        # mab1:X作为Q，H作为K/V，H是诱导向量不需要mask（全是有效）
-        # 创建全1mask用于mab1（因为H没有padding）
-        batch_size = X.size(0)
-        num_inds = H.size(1)
-        mask_for_H = torch.ones(batch_size, num_inds, device=X.device, dtype=X.dtype)
-        return self.mab1(X, H, mask_for_H)
+        # H是诱导向量，没有padding，创建全1mask
+        return self.mab1(X, H, torch.ones(X.size(0), H.size(1), device=X.device, dtype=X.dtype))
 
 
 class PMA(nn.Module):
@@ -103,7 +84,6 @@ class PMA(nn.Module):
         self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
 
     def forward(self, X, attention_mask):
-        # seed向量S作为Q，X作为K/V，需要对X应用mask
         return self.mab(self.S.repeat(X.size(0), 1, 1), X, attention_mask)
 
 
@@ -111,40 +91,26 @@ class SetTransformerConditionEncoder(nn.Module):
     """使用SetTransformer架构编码残差点集为条件向量"""
 
     def __init__(self,
-                 max_input_dim: int = 3,  # 支持的最大输入维度
+                 max_input_dim: int = 3,
                  dim_hidden: int = 128,
                  num_heads: int = 4,
                  num_inds: int = 32,
                  num_layers: int = 3,
-                 num_seeds: int = 32,  # 修改：从 1 改为 32，输出多个特征向量
-                 dim_output: int = 128,  # 保留参数以兼容旧代码，但不再使用
+                 num_seeds: int = 32,
+                 dim_output: int = 128,
                  ln: bool = True,
                  input_normalization: bool = True,
                  verbose: bool = False):
         super().__init__()
 
         if verbose:
-            print(f"初始化SetTransformer条件编码器:")
-            print(f"  最大输入维度: {max_input_dim}")
-            print(f"  隐藏层维度: {dim_hidden}")
-            print(f"  注意力头数: {num_heads}")
-            print(f"  诱导点数: {num_inds}")
-            print(f"  层数: {num_layers}")
-            print(f"  输出序列长度: {num_seeds}")
-            print(f"  输出向量维度: {dim_hidden}")
+            print(f"初始化SetTransformer条件编码器: max_input_dim={max_input_dim}, dim_hidden={dim_hidden}, num_heads={num_heads}, num_inds={num_inds}, num_layers={num_layers}, num_seeds={num_seeds}")
 
         self.max_input_dim = max_input_dim
         self.dim_hidden = dim_hidden
-        self.num_seeds = num_seeds  # 保存输出序列长度
-        # self.output_dim = dim_output  # 不再需要，输出是序列而非单个向量
-
-        # 输入特征维度：max_input_dim x + 1 residual
-        encoded_feature_dim = max_input_dim + 1
 
         # 输入投影层
-        self.input_projection = nn.Linear(encoded_feature_dim, dim_hidden)
-
-        # 添加权重初始化以避免梯度爆炸
+        self.input_projection = nn.Linear(max_input_dim + 1, dim_hidden)
         self._init_weights()
 
         # SetTransformer层
@@ -154,86 +120,48 @@ class SetTransformerConditionEncoder(nn.Module):
             for _ in range(num_layers - 1)
         ])
 
-        # 聚合层 - 输出序列而非单个向量
+        # 聚合层
         self.pooling = PMA(dim_hidden, num_heads, num_seeds, ln=ln)
-
-        # 不再需要 output_projection，因为我们直接输出序列
-        # self.output_projection = nn.Sequential(
-        #     nn.Linear(dim_hidden * num_seeds, dim_hidden),
-        #     nn.LayerNorm(dim_hidden),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(dim_hidden, dim_output)
-        # )
 
     def _init_weights(self):
         """初始化权重以避免梯度爆炸"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # 使用较小的初始化
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(self, x_values: torch.Tensor, y_target: torch.Tensor, point_mask: torch.Tensor) -> torch.Tensor:
         """
-        使用SetTransformer编码目标值点集（修改：接受目标值而非残差）
+        使用SetTransformer编码目标值点集
 
         Args:
-            x_values: (batch_size, num_points, input_dim) x值列表，input_dim可以是1,2,3,4...任意维度
-            y_target: (batch_size, num_points) 目标值（而非残差）
-            point_mask: (batch_size, num_points) 点掩码，1表示真实点，0表示填充点
+            x_values: (batch_size, num_points, input_dim) x值
+            y_target: (batch_size, num_points) 目标值
+            point_mask: (batch_size, num_points) 点掩码，1表示真实点，0表示填充
 
         Returns:
-            condition: (batch_size, num_seeds, dim_hidden) 条件序列，不再是单个向量
-
-        关键改进：
-        - 使用目标值y_target作为条件，而非残差(y_target - y_curr)
-        - 优势：目标值在整个推理过程中恒定，作为"北极星"指引方向
-        - 避免了残差在推理过程中不断变化导致的分布漂移问题
+            condition: (batch_size, num_seeds, dim_hidden) 条件序列
         """
         batch_size, num_points = y_target.shape
-        input_dim = x_values.shape[2]  # 可以是1,2,3,4...任意维度
+        input_dim = x_values.shape[2]
 
-        # 检查输入维度是否在支持范围内
         if input_dim > self.max_input_dim:
             raise ValueError(f"输入维度 {input_dim} 超过了支持的最大维度 {self.max_input_dim}")
 
-        # 修复：构建固定对齐的输入特征
-        # 目标格式：[x0, x1, ..., xN, 0, ..., 0, y_target]
-        #           ↑ 0..input_dim-1  ↑ input_dim..max_input_dim-1  ↑ max_input_dim
-        # 保证y_target始终在最后一列（索引max_input_dim），避免语义混乱
-        input_features = torch.zeros(
-            batch_size, num_points, self.max_input_dim + 1,
-            device=x_values.device, dtype=x_values.dtype
-        )
-
-        # 填充x值到前面的列
-        input_features[:, :, :input_dim] = x_values  # (batch_size, num_points, input_dim)
-
-        # 填充目标值到最后一列（固定位置）
-        input_features[:, :, -1] = y_target  # (batch_size, num_points)
-
-        # 中间的列保持为0（自动padding）
+        # 构建输入特征：[x0, x1, ..., xN, 0, ..., 0, y_target]
+        input_features = torch.zeros(batch_size, num_points, self.max_input_dim + 1, device=x_values.device, dtype=x_values.dtype)
+        input_features[:, :, :input_dim] = x_values
+        input_features[:, :, -1] = y_target
 
         # 输入嵌入
-        x = self.input_projection(input_features)  # (batch_size, num_points, dim_hidden)
-        # 使用温和的激活函数，避免极端输出
-        x = torch.nn.functional.gelu(x) # 缩小输出范围
+        x = F.gelu(self.input_projection(input_features))
 
-        # 通过SetTransformer层，传递point_mask
+        # 通过SetTransformer层
         x = self.first_layer(x, point_mask)
         for layer in self.middle_layers:
             x = layer(x, point_mask)
 
-        # 聚合 - 输出序列而非单个向量
-        x = self.pooling(x, point_mask)  # (batch_size, num_seeds, dim_hidden)
+        # 聚合
+        return self.pooling(x, point_mask)
 
-        # 不再展平和投影，直接返回序列
-        # 这样每个 seed 都代表不同的特征簇，可以用于真正的交叉注意力
-        # x = x.view(batch_size, -1)  # 删除这行
-        # condition = self.output_projection(x)  # 删除这行
-
-        return x  # (batch_size, num_seeds, dim_hidden)
-
-# ConditionEncoder 封装类已移除，直接使用 SetTransformerConditionEncoder

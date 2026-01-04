@@ -3,29 +3,19 @@
 使用Hugging Face transformers库中的LlamaModel作为骨干网络
 """
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 from transformers import LlamaConfig, LlamaModel
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict
 
 
 class CrossAttentionConditionInjection(nn.Module):
     """
-    交叉注意力条件注入 - 条件信息注入的唯一方式
+    交叉注意力条件注入
 
-    设计说明:
-    - 不再使用Prefix Padding，避免与LLaMA自注意力的冗余
-    - Query 来自 LLaMA 的隐藏状态序列
-    - Key/Value 来自条件编码器输出的特征向量
-    - 每个 Query 可以从条件序列中动态选择需要的信息
-
-    数学原理:
-    - Query: LLaMA处理后的每个位置表示
-    - Key/Value: SetTransformer提取的条件特征
-    - 输出: 加权后的条件信息，通过残差连接注入
+    Query来自LLaMA隐藏状态，Key/Value来自条件编码器输出。
+    通过残差连接将条件信息注入到LLaMA输出中。
     """
     def __init__(self, hidden_dim, num_heads=8):
         super().__init__()
@@ -42,37 +32,27 @@ class CrossAttentionConditionInjection(nn.Module):
     def forward(self, hidden_states, condition):
         """
         Args:
-            hidden_states: (batch_size, seq_len, hidden_dim) LLaMA 输出序列
+            hidden_states: (batch_size, seq_len, hidden_dim) LLaMA输出序列
             condition: (batch_size, num_cond_tokens, hidden_dim) 条件序列
 
         Returns:
             output: (batch_size, seq_len, hidden_dim) 注入条件后的序列
         """
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size, seq_len = hidden_states.shape[:2]
         num_cond_tokens = condition.shape[1]
 
-        # Query 来自 LLaMA 隐藏状态
+        # Query来自LLaMA隐藏状态，Key/Value来自条件序列
         q = self.q_proj(hidden_states)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.transpose(1, 2)  # (batch_size, num_heads, seq_len, head_dim)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Key/Value 来自条件序列
-        k = self.cond_to_k(condition)
-        k = k.view(batch_size, num_cond_tokens, self.num_heads, self.head_dim)
-        k = k.transpose(1, 2)  # (batch_size, num_heads, num_cond_tokens, head_dim)
+        # Key/Value来自条件序列
+        k = self.cond_to_k(condition).view(batch_size, num_cond_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.cond_to_v(condition).view(batch_size, num_cond_tokens, self.num_heads, self.head_dim).transpose(1, 2)
 
-        v = self.cond_to_v(condition)
-        v = v.view(batch_size, num_cond_tokens, self.num_heads, self.head_dim)
-        v = v.transpose(1, 2)  # (batch_size, num_heads, num_cond_tokens, head_dim)
-
-        # 计算注意力分数
+        # 计算注意力
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)
-
-        # 合并多头
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.hidden_dim)
+        attn_output = torch.matmul(F.softmax(attn_scores, dim=-1), v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
 
         return self.out_proj(attn_output)
 
@@ -82,17 +62,9 @@ class LlamaEditFlowBackbone(nn.Module):
     基于LLaMA的EditFlow骨干网络
 
     核心特性:
-    - 使用LlamaModel作为基础transformer
-    - RoPE旋转位置编码
-    - SwiGLU激活函数
-    - 时间步注入
-    - 交叉注意力条件注入（Cross-Attention，非Prefix）
-    - 五头输出（插入率、删除率、替换率、插入词汇分布、替换词汇分布）
-
-    条件注入策略:
-    条件信息仅通过CrossAttention机制注入，不使用Prefix Padding。
-    这样可以避免双重条件注入的冗余，简化模型架构，减少参数量。
-    LLaMA的强大自注意力机制已经足够处理输入序列内部的复杂关系。
+    - 使用LlamaModel作为基础transformer（RoPE位置编码、SwiGLU激活函数）
+    - 交叉注意力条件注入（非Prefix方式）
+    - 五头输出：操作类型概率、插入词汇分布、替换词汇分布
     """
 
     def __init__(
@@ -109,21 +81,19 @@ class LlamaEditFlowBackbone(nn.Module):
     ):
         super().__init__()
 
-        # 1. 定义LLaMA配置（用于backbone模型）
         self.llama_config = LlamaConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_dim,
-            intermediate_size=hidden_dim * 4,  # SwiGLU的中间维度
+            intermediate_size=hidden_dim * 4,
             num_hidden_layers=n_layers,
             num_attention_heads=n_heads,
-            max_position_embeddings=max_seq_len,  # 条件通过交叉注意力注入，无需预留空间
+            max_position_embeddings=max_seq_len,
             rms_norm_eps=1e-6,
             initializer_range=0.02,
-            use_cache=False,  # 非自回归不需要缓存
-            hidden_act="silu",  # SwiGLU使用SiLU
-            is_causal=False,  # 启用双向注意力（EditFlow需要非自回归的双向注意力）
+            use_cache=False,
+            hidden_act="silu",
+            is_causal=False,
         )
-
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
@@ -134,41 +104,26 @@ class LlamaEditFlowBackbone(nn.Module):
         self.use_condition_injection = use_condition_injection
 
         if verbose:
-            print(f"初始化LlamaEditFlowBackbone:")
-            print(f"  词表大小: {vocab_size}")
-            print(f"  隐藏维度: {hidden_dim}")
-            print(f"  层数: {n_layers}")
-            print(f"  注意力头数: {n_heads}")
-            print(f"  条件维度: {condition_dim}")
+            print(f"初始化LlamaEditFlowBackbone: vocab_size={vocab_size}, hidden_dim={hidden_dim}, n_layers={n_layers}")
 
-        # 2. 基础LLaMA骨干网络
+        # 基础LLaMA骨干网络
         self.backbone = LlamaModel(self.llama_config)
 
-        # 3. 条件投影 (SetTransformer输出 -> hidden_dim)
-        # 注意：条件仅通过交叉注意力注入，不再作为前缀token
-        if condition_dim != hidden_dim:
-            self.cond_proj = nn.Linear(condition_dim, hidden_dim)
-        else:
-            self.cond_proj = nn.Identity()
+        # 条件投影
+        self.cond_proj = nn.Linear(condition_dim, hidden_dim) if condition_dim != hidden_dim else nn.Identity()
 
-        # 4. 交叉注意力条件注入
+        # 交叉注意力条件注入
         if use_condition_injection:
             self.condition_injection = CrossAttentionConditionInjection(hidden_dim, n_heads)
+            self.condition_layer_norm = nn.LayerNorm(hidden_dim)
 
-        # 5. 层归一化
-        self.condition_layer_norm = nn.LayerNorm(hidden_dim)
-
-        # 6. 编辑流五大输出头 (论文公式13-15)
-
-        # 预测操作类型概率 (Rates) - 使用softmax归一化，确保四种操作互斥
+        # 编辑流输出头
         self.rates_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 4)  # 输出4维：[ins_logit, del_logit, sub_logit, keep_logit]
+            nn.Linear(hidden_dim // 2, 4)
         )
-
-        # 预测分布 (Distributions)
         self.ins_vocab_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
@@ -198,87 +153,51 @@ class LlamaEditFlowBackbone(nn.Module):
             attention_mask: (batch_size, seq_len) 注意力掩码
 
         Returns:
-            dict: 包含以下键:
-                - 'rates': (ins_rate, del_rate, sub_rate) 每个都是 (batch_size, seq_len, 1)
-                - 'insert_logits': (batch_size, seq_len, vocab_size)
-                - 'substitute_logits': (batch_size, seq_len, vocab_size)
-                - 'insert_probs': (batch_size, seq_len, vocab_size) softmax后的概率
-                - 'substitute_probs': (batch_size, seq_len, vocab_size) softmax后的概率
+            dict: 包含 rates_logits, insert_logits, substitute_logits, insert_probs, substitute_probs
         """
         batch_size, seq_len = input_ids.shape
 
-        # 默认条件：空的序列（1个token，全零）
+        # 处理条件
         if condition is None:
             condition = torch.zeros(batch_size, 1, self.condition_dim, device=input_ids.device)
-
-        # A. 获取token embedding
-        inputs_embeds = self.backbone.embed_tokens(input_ids)  # (batch_size, seq_len, hidden_dim)
-
-        # B. 处理条件并投影
-        if condition.dim() == 2:
-            # 旧格式: (batch_size, condition_dim)
+        elif condition.dim() == 2:
             condition = condition.unsqueeze(1)
 
-        condition_proj = self.cond_proj(condition)  # (batch_size, num_cond_tokens, hidden_dim)
+        condition_proj = self.cond_proj(condition)
 
-        # C. 通过LLaMA骨干（使用双向注意力）
-        # 注意：LLaMA默认使用因果掩码，但EditFlow需要双向注意力
-        # 因此我们需要创建全1的attention_mask来禁用因果掩码
-        if attention_mask is not None:
-            # 将0/1掩码转换为LLaMA需要的格式
-            # LLaMA使用bool掩码，True表示可以attend
-            attention_mask = attention_mask.bool()
-        else:
-            attention_mask = torch.ones(batch_size, seq_len,
-                                       device=input_ids.device, dtype=torch.bool)
-
-        # E. LLaMA前向传播（直接使用inputs_embeds，不拼接条件token）
-        outputs = self.backbone(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True
+        # 处理attention_mask（EditFlow需要双向注意力）
+        attention_mask = attention_mask.bool() if attention_mask is not None else torch.ones(
+            batch_size, seq_len, device=input_ids.device, dtype=torch.bool
         )
 
-        # F. 获取隐藏状态
-        hidden_states = outputs.last_hidden_state  # (batch_size, seq_len, hidden_dim)
+        # LLaMA前向传播
+        hidden_states = self.backbone(
+            inputs_embeds=self.backbone.embed_tokens(input_ids),
+            attention_mask=attention_mask,
+        ).last_hidden_state
 
-        # G. 条件注入（通过交叉注意力）
+        # 条件注入（通过交叉注意力）
         if self.use_condition_injection:
             hidden_states = self.condition_layer_norm(
                 hidden_states + self.condition_injection(hidden_states, condition_proj)
             )
 
-        # H. 计算五大输出
-
-        # 操作类型预测（返回原始logits，不经过softmax）
-        # 这样训练时可以直接在logit空间操作，避免log(概率)的数学错误
-        rates_logits = self.rates_head(hidden_states)  # (batch_size, seq_len, 4)
-
-        # 词汇分布预测
+        # 计算输出
+        rates_logits = self.rates_head(hidden_states)
         ins_logits = self.ins_vocab_head(hidden_states)
         sub_logits = self.sub_vocab_head(hidden_states)
 
         # 应用注意力掩码
-        if attention_mask is not None:
-            invalid_mask = ~attention_mask.bool().unsqueeze(-1)
-            # 使用dtype的真正负无穷值，确保softmax后概率接近0
-            float_type = ins_logits.dtype
-            min_val = torch.finfo(float_type).min / 2  # 留出余量避免数值问题
-            ins_logits = ins_logits.masked_fill(invalid_mask, min_val)
-            sub_logits = sub_logits.masked_fill(invalid_mask, min_val)
-            # 将rates_logits的无效位置也设为负无穷
-            # rates_logits形状: (batch, seq_len, 4)，需要扩展invalid_mask到 (batch, seq_len, 4)
-            invalid_mask_rates = invalid_mask.expand(-1, -1, 4)  # (batch, seq_len, 4)
-            rates_logits = rates_logits.masked_fill(invalid_mask_rates, min_val)
-
-        # 计算概率分布
-        insert_probs = F.softmax(ins_logits, dim=-1)
-        substitute_probs = F.softmax(sub_logits, dim=-1)
+        invalid_mask = ~attention_mask.unsqueeze(-1)
+        min_val = torch.finfo(ins_logits.dtype).min / 2
+        ins_logits = ins_logits.masked_fill(invalid_mask, min_val)
+        sub_logits = sub_logits.masked_fill(invalid_mask, min_val)
+        rates_logits = rates_logits.masked_fill(invalid_mask.expand(-1, -1, 4), min_val)
 
         return {
-            'rates_logits': rates_logits,  # 返回原始logits而不是概率
+            'rates_logits': rates_logits,
             'insert_logits': ins_logits,
             'substitute_logits': sub_logits,
-            'insert_probs': insert_probs,
-            'substitute_probs': substitute_probs,
- }
+            'insert_probs': F.softmax(ins_logits, dim=-1),
+            'substitute_probs': F.softmax(sub_logits, dim=-1),
+        }
