@@ -97,6 +97,76 @@ class EditFlowManager:
         total_batches = gathered_batches.sum().item()
         return gathered_losses.sum().item() / total_batches if total_batches > 0 else default_value
 
+    def _gather_metrics_across_processes(self, num_batches, total_loss, total_grad_norm):
+        """跨进程收集训练指标（批次数、总损失、总梯度范数）
+
+        Args:
+            num_batches: 当前进程的批次数
+            total_loss: 当前进程的总损失
+            total_grad_norm: 当前进程的总梯度范数
+
+        Returns:
+            tuple: (gathered_batches, gathered_total_losses, gathered_total_grad_norms)
+        """
+        if self.accelerator.num_processes > 1:
+            gathered_batches = self.accelerator.gather(
+                torch.tensor(num_batches, device=self.device)
+            )
+            gathered_total_losses = self.accelerator.gather(
+                torch.tensor(total_loss, device=self.device)
+            )
+            gathered_total_grad_norms = self.accelerator.gather(
+                torch.tensor(total_grad_norm, device=self.device)
+            )
+        else:
+            gathered_batches = torch.tensor([num_batches], device=self.device)
+            gathered_total_losses = torch.tensor([total_loss], device=self.device)
+            gathered_total_grad_norms = torch.tensor([total_grad_norm], device=self.device)
+
+        return gathered_batches, gathered_total_losses, gathered_total_grad_norms
+
+    def _format_gpu_metrics_summary(self, gathered_batches, gathered_total_losses,
+                                    gathered_total_grad_norms, include_lr=False, lr=None):
+        """格式化GPU指标统计摘要
+
+        Args:
+            gathered_batches: 各进程的批次数
+            gathered_total_losses: 各进程的总损失
+            gathered_total_grad_norms: 各进程的总梯度范数
+            include_lr: 是否包含学习率信息
+            lr: 学习率值（当include_lr=True时使用）
+
+        Returns:
+            tuple: (gpu_metrics_list, global_total_batches, global_avg_loss, global_avg_grad_norm)
+        """
+        gpu_metrics = []
+        global_total_batches = 0
+        global_total_loss = 0.0
+        global_total_grad_norm = 0.0
+
+        for gpu_idx in range(self.accelerator.num_processes):
+            gpu_batches = gathered_batches[gpu_idx].item()
+            gpu_total_loss = gathered_total_losses[gpu_idx].item()
+            gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
+
+            gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
+            gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
+
+            gpu_metrics.append(
+                f"  [GPU {gpu_idx}] batches={gpu_batches} | "
+                f"total_loss={gpu_total_loss:.2f} | avg_loss={gpu_avg_loss:.6f} | "
+                f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
+            )
+
+            global_total_batches += gpu_batches
+            global_total_loss += gpu_total_loss
+            global_total_grad_norm += gpu_total_grad_norm
+
+        global_avg_loss = global_total_loss / global_total_batches if global_total_batches > 0 else 0.0
+        global_avg_grad_norm = global_total_grad_norm / self.accelerator.num_processes if self.accelerator.num_processes > 0 else 0.0
+
+        return gpu_metrics, global_total_batches, global_avg_loss, global_avg_grad_norm
+
 
     def prepare_data(self, tokenizer):
         """准备训练数据，使用 Hugging Face datasets 加载"""
@@ -145,40 +215,53 @@ class EditFlowManager:
 
         # 分割训练集和测试集
         if use_stream:
-            split_ratio = 1 - self.args.test_split
-            train_size = int(self.args.num_samples * split_ratio)
-            test_size = self.args.num_samples - train_size
+            # 当样本数很少（≤batch_size）时，让所有样本同时用于训练和测试
+            if self.args.num_samples <= self.args.batch_size:
+                if self.accelerator.is_local_main_process:
+                    print(f"流式模式: 样本数({self.args.num_samples}) ≤ batch_size({self.args.batch_size})")
+                    print(f"        所有样本将同时用于训练和测试")
 
-            if self.accelerator.is_local_main_process:
-                print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
+                # 训练集和测试集都使用完整数据
+                train_dataset = full_dataset
+                test_dataset = full_dataset
+                train_size_estimate = self.args.num_samples
+                test_size_estimate = self.args.num_samples
+            else:
+                # 正常分割逻辑
+                split_ratio = 1 - self.args.test_split
+                train_size = int(self.args.num_samples * split_ratio)
+                test_size = self.args.num_samples - train_size
 
-            # 流式模式：使用skip+take进行数据分割
-            # train_dataset: 从头开始读取train_size个样本
-            train_dataset = FlowDataset(
-                data_file=cache_filename,
-                tokenizer=tokenizer,
-                max_dim=self.args.max_dim,
-                max_expr_length=self.args.max_expr_length,
-                stream=True,
-                num_proc=num_proc,
-                logger=self.logger,
-                skip=0,          # 不跳过任何样本
-                take=train_size  # 读取train_size个样本
-            )
-            # test_dataset: 跳过前train_size个样本，读取test_size个样本
-            test_dataset = FlowDataset(
-                data_file=cache_filename,
-                tokenizer=tokenizer,
-                max_dim=self.args.max_dim,
-                max_expr_length=self.args.max_expr_length,
-                stream=True,
-                num_proc=num_proc,
-                logger=self.logger,
-                skip=train_size,  # 跳过训练集样本
-                take=test_size    # 读取test_size个样本
-            )
-            train_size_estimate = train_size
-            test_size_estimate = test_size
+                if self.accelerator.is_local_main_process:
+                    print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
+
+                # 流式模式：使用skip+take进行数据分割
+                # train_dataset: 从头开始读取train_size个样本
+                train_dataset = FlowDataset(
+                    data_file=cache_filename,
+                    tokenizer=tokenizer,
+                    max_dim=self.args.max_dim,
+                    max_expr_length=self.args.max_expr_length,
+                    stream=True,
+                    num_proc=num_proc,
+                    logger=self.logger,
+                    skip=0,          # 不跳过任何样本
+                    take=train_size  # 读取train_size个样本
+                )
+                # test_dataset: 跳过前train_size个样本，读取test_size个样本
+                test_dataset = FlowDataset(
+                    data_file=cache_filename,
+                    tokenizer=tokenizer,
+                    max_dim=self.args.max_dim,
+                    max_expr_length=self.args.max_expr_length,
+                    stream=True,
+                    num_proc=num_proc,
+                    logger=self.logger,
+                    skip=train_size,  # 跳过训练集样本
+                    take=test_size    # 读取test_size个样本
+                )
+                train_size_estimate = train_size
+                test_size_estimate = test_size
         else:
             total_size = len(full_dataset)
             train_size = int(total_size * (1 - self.args.test_split))
@@ -190,13 +273,15 @@ class EditFlowManager:
             train_indices = indices[:train_size]
             test_indices = indices[train_size:]
 
-            if total_size == 1:
+            # 当样本数很少（≤batch_size）时，让所有样本同时用于训练和测试
+            if total_size <= self.args.batch_size:
                 if self.accelerator.is_local_main_process:
-                    print("警告: 只有1个样本，将同时用于训练和测试")
+                    print(f"非流式模式: 样本数({total_size}) ≤ batch_size({self.args.batch_size})")
+                    print(f"         所有样本将同时用于训练和测试")
                 train_dataset = full_dataset
                 test_dataset = full_dataset
-                train_size_estimate = 1
-                test_size_estimate = 1
+                train_size_estimate = total_size
+                test_size_estimate = total_size
             else:
                 train_dataset = Subset(full_dataset, train_indices)
                 test_dataset = Subset(full_dataset, test_indices)
@@ -380,36 +465,21 @@ class EditFlowManager:
         vocab_size = self.tokenizer.vocab_size
         batch_size, seq_len = z0_token_ids.shape
 
-        # 记录debug信息
-        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
-            context = debug_info.get('context', '')
-            batch_idx = debug_info.get('batch_idx', 0)
-            sample_idx = 0
-            self.logger.tensor_values(f"z0_token_ids_batch{batch_idx}", z0_token_ids[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"z1_token_ids_batch{batch_idx}", z1_token_ids[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"condition_embeddings_batch{batch_idx}", condition_embeddings[sample_idx],
-                                     context=context, level=2, max_elements=100)
+        # 记录输入debug信息
+        self._log_forward_debug_input(debug_info, z0_token_ids, z1_token_ids, condition_embeddings, 0)
 
         # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
             z0_token_ids, self.tokenizer
         )
 
-        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
-            context = debug_info.get('context', '')
-            batch_idx = debug_info.get('batch_idx', 0)
-            self.logger.tensor_values(f"x_t_batch{batch_idx}", x_t[0],
-                                     context=context, level=2, max_elements=50)
+        # 记录x_t debug信息
+        self._log_forward_debug_xt(debug_info, x_t)
 
         attention_mask = (~x_pad_mask).float()
 
-        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
-            context = debug_info.get('context', '')
-            batch_idx = debug_info.get('batch_idx', 0)
-            self.logger.tensor_values(f"attention_mask_batch{batch_idx}", attention_mask[0],
-                                     context=context, level=2, max_elements=50)
+        # 记录attention_mask debug信息
+        self._log_forward_debug_attention_mask(debug_info, attention_mask)
 
         # 调用模型
         output = model(
@@ -418,57 +488,8 @@ class EditFlowManager:
 
         pred_rates = output['rates_logits']
 
-        if debug_info and self.accelerator.is_local_main_process and self.debug_mode:
-            context = debug_info.get('context', '')
-            batch_idx = debug_info.get('batch_idx', 0)
-            sample_idx = 0
-            self.logger.tensor_values(f"pred_rates_batch{batch_idx}", pred_rates[sample_idx],
-                                     context=context, level=2, max_elements=100)
-            self.logger.tensor_values(f"insert_logits_batch{batch_idx}", output['insert_logits'][sample_idx],
-                                     context=context, level=2, max_elements=100)
-            self.logger.tensor_values(f"substitute_logits_batch{batch_idx}", output['substitute_logits'][sample_idx],
-                                     context=context, level=2, max_elements=100)
-
-            # 记录SUBSTITUTE操作的候选token（前5个位置）
-            rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
-            substitute_logits = output['substitute_logits'][sample_idx]
-            x_t_sample = x_t[sample_idx]
-
-            for pos in range(min(5, x_t_sample.shape[0])):
-                if x_t_sample[pos].item() == self.tokenizer.pad_token_id:
-                    break
-
-                lambda_sub = rates_probs[pos, 2].item()
-                if lambda_sub > 0.01:  # 只记录有意义的替换概率
-                    self.logger.log_training_substitute_candidates(
-                        batch_idx=batch_idx,
-                        sample_idx=sample_idx,
-                        position=pos,
-                        x_t_value=x_t_sample[pos].item(),
-                        lambda_sub=lambda_sub,
-                        substitute_logits=substitute_logits[pos],
-                        tokenizer=self.tokenizer,
-                        top_k=5,
-                        context=context,
-                        level=2
-                    )
-
-            # 记录INSERT操作的候选token（前3个位置）
-            insert_logits = output['insert_logits'][sample_idx]
-            for pos in range(min(3, insert_logits.shape[0])):
-                lambda_ins = rates_probs[pos, 0].item()
-                if lambda_ins > 0.01:  # 只记录有意义的插入概率
-                    self.logger.log_training_insert_candidates(
-                        batch_idx=batch_idx,
-                        sample_idx=sample_idx,
-                        position=pos,
-                        lambda_ins=lambda_ins,
-                        insert_logits=insert_logits[pos],
-                        tokenizer=self.tokenizer,
-                        top_k=5,
-                        context=context,
-                        level=2
-                    )
+        # 记录输出debug信息
+        self._log_forward_debug_output(debug_info, pred_rates, output, x_t)
 
         return {
             'pred_rates': pred_rates,
@@ -482,6 +503,98 @@ class EditFlowManager:
             'attention_mask': attention_mask,
             'vocab_size': vocab_size,
         }
+
+    def _log_forward_debug_input(self, debug_info, z0_token_ids, z1_token_ids, condition_embeddings, sample_idx):
+        """记录前向传播输入的debug信息"""
+        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
+            return
+
+        context = debug_info.get('context', '')
+        batch_idx = debug_info.get('batch_idx', 0)
+
+        self.logger.tensor_values(f"z0_token_ids_batch{batch_idx}", z0_token_ids[sample_idx],
+                                 context=context, level=2, max_elements=50)
+        self.logger.tensor_values(f"z1_token_ids_batch{batch_idx}", z1_token_ids[sample_idx],
+                                 context=context, level=2, max_elements=50)
+        self.logger.tensor_values(f"condition_embeddings_batch{batch_idx}", condition_embeddings[sample_idx],
+                                 context=context, level=2, max_elements=100)
+
+    def _log_forward_debug_xt(self, debug_info, x_t):
+        """记录x_t的debug信息"""
+        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
+            return
+
+        context = debug_info.get('context', '')
+        batch_idx = debug_info.get('batch_idx', 0)
+        self.logger.tensor_values(f"x_t_batch{batch_idx}", x_t[0],
+                                 context=context, level=2, max_elements=50)
+
+    def _log_forward_debug_attention_mask(self, debug_info, attention_mask):
+        """记录attention_mask的debug信息"""
+        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
+            return
+
+        context = debug_info.get('context', '')
+        batch_idx = debug_info.get('batch_idx', 0)
+        self.logger.tensor_values(f"attention_mask_batch{batch_idx}", attention_mask[0],
+                                 context=context, level=2, max_elements=50)
+
+    def _log_forward_debug_output(self, debug_info, pred_rates, output, x_t):
+        """记录前向传播输出的debug信息"""
+        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
+            return
+
+        context = debug_info.get('context', '')
+        batch_idx = debug_info.get('batch_idx', 0)
+        sample_idx = 0
+
+        self.logger.tensor_values(f"pred_rates_batch{batch_idx}", pred_rates[sample_idx],
+                                 context=context, level=2, max_elements=100)
+        self.logger.tensor_values(f"insert_logits_batch{batch_idx}", output['insert_logits'][sample_idx],
+                                 context=context, level=2, max_elements=100)
+        self.logger.tensor_values(f"substitute_logits_batch{batch_idx}", output['substitute_logits'][sample_idx],
+                                 context=context, level=2, max_elements=100)
+
+        # 记录SUBSTITUTE操作的候选token（前5个位置）
+        rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
+        substitute_logits = output['substitute_logits'][sample_idx]
+        x_t_sample = x_t[sample_idx]
+
+        for pos in range(min(5, x_t_sample.shape[0])):
+            if x_t_sample[pos].item() == self.tokenizer.pad_token_id:
+                break
+
+            lambda_sub = rates_probs[pos, 2].item()
+            if lambda_sub > 0.01:  # 只记录有意义的替换概率
+                self.logger.log_training_substitute_candidates(
+                    batch_idx=batch_idx,
+                    sample_idx=sample_idx,
+                    position=pos,
+                    x_t_value=x_t_sample[pos].item(),
+                    lambda_sub=lambda_sub,
+                    substitute_logits=substitute_logits[pos],
+                    tokenizer=self.tokenizer,
+                    top_k=5,
+                    context=context,
+                    level=2
+                )
+
+        # 记录INSERT操作的候选token（前3个位置）
+        insert_logits = output['insert_logits'][sample_idx]
+        for pos in range(min(3, insert_logits.shape[0])):
+            lambda_ins = rates_probs[pos, 0].item()
+            if lambda_ins > 0.01:  # 只记录有意义的插入概率
+                self.logger.log_training_insert_candidates(
+                    batch_idx=batch_idx,
+                    sample_idx=sample_idx,
+                    position=pos,
+                    lambda_ins=lambda_ins,
+                    insert_logits=insert_logits[pos],
+                    tokenizer=self.tokenizer,
+                    top_k=5,
+                    context=context,
+                    level=2
+                )
 
     def compute_loss(self, forward_results, criterion, debug_info=None):
         pred_rates = forward_results['pred_rates']
@@ -820,24 +933,10 @@ class EditFlowManager:
         # 跨进程收集并计算平均损失
         avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
 
-        # 在所有进程上收集数据（必须在所有进程上调用，否则会死锁）
+        # 在所有进程上收集训练指标
         num_processes = self.accelerator.num_processes
-        if num_processes > 1:
-            # 收集所有进程的批次数、总损失、总梯度范数
-            gathered_batches = self.accelerator.gather(
-                torch.tensor(num_batches, device=self.device)
-            )
-            gathered_total_losses = self.accelerator.gather(
-                torch.tensor(total_loss, device=self.device)
-            )
-            gathered_total_grad_norms = self.accelerator.gather(
-                torch.tensor(local_total_grad_norm, device=self.device)
-            )
-        else:
-            # 单GPU训练，不需要gather
-            gathered_batches = torch.tensor([num_batches], device=self.device)
-            gathered_total_losses = torch.tensor([total_loss], device=self.device)
-            gathered_total_grad_norms = torch.tensor([local_total_grad_norm], device=self.device)
+        gathered_batches, gathered_total_losses, gathered_total_grad_norms = \
+            self._gather_metrics_across_processes(num_batches, total_loss, local_total_grad_norm)
 
         # 数据消耗监控：记录实际处理的 batch 数（只在主进程）
         if self.accelerator.is_local_main_process:
@@ -851,31 +950,9 @@ class EditFlowManager:
 
             # 根据是否分布式训练，显示不同的日志格式
             if num_processes > 1:
-                # 构建每个GPU的详细信息
-                gpu_metrics = []
-                global_total_loss = 0.0
-                global_total_grad_norm = 0.0
-
-                for gpu_idx in range(num_processes):
-                    gpu_batches = gathered_batches[gpu_idx].item()
-                    gpu_total_loss = gathered_total_losses[gpu_idx].item()
-                    gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
-
-                    gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
-                    gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
-
-                    gpu_metrics.append(
-                        f"  [GPU {gpu_idx}] batches={gpu_batches} | "
-                        f"total_loss={gpu_total_loss:.2f} | avg_loss={gpu_avg_loss:.6f} | "
-                        f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
-                    )
-
-                    global_total_loss += gpu_total_loss
-                    global_total_grad_norm += gpu_total_grad_norm
-
-                # 计算全局平均值
-                global_avg_loss = global_total_loss / total_batches_all_processes if total_batches_all_processes > 0 else 0.0
-                global_avg_grad_norm = global_total_grad_norm / num_processes if num_processes > 0 else 0.0
+                # 使用辅助方法格式化GPU指标（返回的total_batches_all_processes应该与之前计算的一致）
+                gpu_metrics, _, global_avg_loss, global_avg_grad_norm = \
+                    self._format_gpu_metrics_summary(gathered_batches, gathered_total_losses, gathered_total_grad_norms)
 
                 # 构建完整的日志消息
                 gpu_metrics_summary = "\n" + "\n".join(gpu_metrics)
@@ -1098,67 +1175,28 @@ class EditFlowManager:
                 train_dataloader, train_dataset, epoch, "Mixed"
             )
 
-            # 在所有进程上收集数据（必须在所有进程上调用，否则会死锁）
-            if self.accelerator.num_processes > 1:
-                # 收集所有进程的批次数、总损失、总梯度范数
-                gathered_batches = self.accelerator.gather(
-                    torch.tensor(num_batches, device=self.device)
-                )
-                gathered_total_losses = self.accelerator.gather(
-                    torch.tensor(total_loss, device=self.device)
-                )
-                gathered_total_grad_norms = self.accelerator.gather(
-                    torch.tensor(total_grad_norm, device=self.device)
-                )
-            else:
-                # 单GPU训练，不需要gather
-                gathered_batches = torch.tensor([num_batches], device=self.device)
-                gathered_total_losses = torch.tensor([total_loss], device=self.device)
-                gathered_total_grad_norms = torch.tensor([total_grad_norm], device=self.device)
+            # 在所有进程上收集训练指标
+            gathered_batches, gathered_total_losses, gathered_total_grad_norms = \
+                self._gather_metrics_across_processes(num_batches, total_loss, total_grad_norm)
 
             # 只在主进程上打印和记录日志
             if self.accelerator.is_local_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
 
                 if self.accelerator.num_processes > 1:
-                    # 构建每个GPU的详细信息
-                    gpu_details = []
-                    global_total_batches = 0
-                    global_total_loss = 0.0
-
-                    for gpu_idx in range(self.accelerator.num_processes):
-                        gpu_batches = gathered_batches[gpu_idx].item()
-                        gpu_total_loss = gathered_total_losses[gpu_idx].item()
-                        gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
-
-                        # 计算平均值
-                        gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
-                        gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
-
-                        gpu_details.append(
-                            f"  [GPU {gpu_idx}] batches={gpu_batches} | "
-                            f"total_loss={gpu_total_loss:.2f} | avg_loss={gpu_avg_loss:.6f} | "
-                            f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
-                        )
-
-                        global_total_batches += gpu_batches
-                        global_total_loss += gpu_total_loss
-
-                    # 全局汇总信息
-                    global_avg_loss = global_total_loss / global_total_batches if global_total_batches > 0 else 0.0
+                    # 使用辅助方法格式化GPU指标
+                    gpu_details, global_total_batches, global_avg_loss, _ = \
+                        self._format_gpu_metrics_summary(gathered_batches, gathered_total_losses, gathered_total_grad_norms)
 
                     # 构建完整的日志消息
                     gpu_summary = "\n" + "\n".join(gpu_details) + "\n--- 全局汇总 --- | " + \
                                  f"total_batches={global_total_batches} | avg_train_loss={global_avg_loss:.6f} | " + \
                                  f"lr={current_lr:.2e}"
 
-                    # 控制台输出
-                    print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成 [分布式训练]")
-                    for gpu_detail in gpu_details:
-                        print(gpu_detail)
-                    print(f"--- 全局汇总 --- | avg_train_loss={global_avg_loss:.4f} | total_batches={global_total_batches} | lr={current_lr:.2e}\n")
+                    # 控制台输出（简化版）
+                    print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成 | avg_train_loss={global_avg_loss:.4f} | total_batches={global_total_batches} | lr={current_lr:.2e}")
 
-                    # 日志文件记录
+                    # 日志文件记录（包含详细的GPU信息）
                     self.logger.log(
                         "EPOCH_COMPLETE",
                         f"Epoch {epoch+1}/{self.args.num_epochs} [分布式训练详细] |\n" + gpu_summary,

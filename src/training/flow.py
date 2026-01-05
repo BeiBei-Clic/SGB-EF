@@ -93,6 +93,7 @@ class ContinuousFlowLoss:
         n_ops = 2 * vocab_size + 2  # 插入(vocab_size) + 删除(1) + 替换(vocab_size) + KEEP(1)
 
         pad_token = tokenizer.convert_tokens_to_ids('<pad>')
+        bos_token = tokenizer.convert_tokens_to_ids('<s>')
 
         # 初始化输出掩码（在X空间）
         u_mask = torch.zeros((batch_size, x_seq_len, n_ops), dtype=torch.int, device=z_t.device)
@@ -100,55 +101,41 @@ class ContinuousFlowLoss:
         # 对每个样本进行处理
         for b in range(batch_size):
             # === 步骤1：构建Z空间到X空间的位置映射表 ===
-            # 位置说明：X空间位置0=BOS token，位置1,2,3...=序列中的实际token
             z_to_x_map = {}  # {z_pos: x_pos or None}
-            insert_positions = []  # 记录所有gap位置，用于后续INSERT操作映射
+            insert_positions = []  # 记录所有gap位置
 
-            # 🔧 修复：BOS位置也应该参与映射，这样gap位置才能找到之前的非gap位置
-            # 修改前：跳过BOS位置，导致gap找不到之前的非gap，INSERT标记错误
-            # 修改后：BOS映射到X空间位置0（位置0=BOS），gap可以正确找到BOS作为插入点
-            bos_token = tokenizer.convert_tokens_to_ids('<s>')
-
-            # 从X空间位置0开始映射（位置0是BOS token）
             x_index = 0
-
             for z_pos in range(z_seq_len):
                 token_t = z_t[b, z_pos].item()
 
-                # 跳过pad位置
                 if token_t == pad_token:
                     z_to_x_map[z_pos] = None
                     continue
 
-                # 🔧 修复：BOS token也要映射到X空间，这样gap位置才能找到BOS作为插入点
-                # 修改前：BOS不映射，导致gap找不到之前的非gap位置
-                # 修改后：BOS映射到X空间位置0（位置0=BOS，这是序列的开始位置）
+                # BOS映射到X空间位置0，确保gap可以找到BOS作为插入点
                 if token_t == bos_token:
-                    z_to_x_map[z_pos] = x_index  # BOS映射到X空间位置0
+                    z_to_x_map[z_pos] = x_index
                     x_index += 1
                     continue
 
                 if token_t != gap_token:
-                    # 非gap位置：映射到X空间位置
                     z_to_x_map[z_pos] = x_index
                     x_index += 1
                 else:
-                    # gap位置：不占用X空间位置，但记录为插入点
+                    # gap位置：记录为插入点
                     z_to_x_map[z_pos] = None
                     insert_positions.append(z_pos)
 
-            # === 步骤2：第一遍处理 - 处理所有非gap位置的操作 ===
+            # === 步骤2：处理非gap位置的操作（SUBSTITUTE/DELETE/KEEP） ===
             for z_pos in range(z_seq_len):
                 token_t = z_t[b, z_pos].item()
                 token_1 = z_1[b, z_pos].item()
 
-                # 跳过pad位置
                 if token_t == pad_token or token_1 == pad_token:
                     continue
 
-                # 只处理非gap位置（SUBSTITUTE/DELETE/KEEP）
                 if token_t == gap_token:
-                    continue  # gap位置的INSERT操作在第二遍处理
+                    continue  # gap位置的INSERT操作在步骤3处理
 
                 x_pos = z_to_x_map[z_pos]
                 if x_pos is None or x_pos >= x_seq_len:
@@ -156,59 +143,37 @@ class ContinuousFlowLoss:
 
                 # 判断操作类型
                 if token_1 == gap_token:
-                    # DELETE操作
-                    u_mask[b, x_pos, vocab_size] = 1  # DELETE在位置vocab_size
+                    u_mask[b, x_pos, vocab_size] = 1  # DELETE
                 elif token_t != token_1:
-                    # SUBSTITUTE操作
-                    u_mask[b, x_pos, token_1 + vocab_size + 1] = 1  # SUBSTITUTE在vocab_size+1之后
+                    u_mask[b, x_pos, token_1 + vocab_size + 1] = 1  # SUBSTITUTE
                 else:
-                    # KEEP操作
-                    u_mask[b, x_pos, -1] = 1  # KEEP在最后一位
+                    u_mask[b, x_pos, -1] = 1  # KEEP
 
-            # === 步骤3：第二遍处理 - 处理所有gap位置的INSERT操作 ===
+            # === 步骤3：处理gap位置的INSERT操作 ===
             for gap_z_pos in insert_positions:
                 token_t = z_t[b, gap_z_pos].item()
                 token_1 = z_1[b, gap_z_pos].item()
 
-                # 跳过pad位置
                 if token_t == pad_token or token_1 == pad_token:
                     continue
 
-                # 只处理 gap → 非gap 的INSERT操作
                 if token_t == gap_token and token_1 != gap_token:
-                    # INSERT操作语义：在某个位置之后插入token
-                    # 例如：gap在位置1，表示在位置0的元素之后插入
-                    # Z空间: [..., token_A, <gap>, token_B, ...]
-                    #      → [..., token_A, NEW_TOKEN, token_B, ...]
-                    # X空间: [..., token_A, token_B, ...]
-                    #   INSERT在位置0 → [..., token_A, NEW_TOKEN, token_B, ...]
-
-                    # 确定INSERT操作的目标X空间位置
-                    # 策略：INSERT操作映射到gap之前的第一个非gap位置
-                    # 表示"在该位置之后插入"
-
-                    # 找到gap之前的第一个非gap位置的X空间索引
+                    # INSERT操作：在gap之前的第一个非gap位置之后插入token_1
                     insert_x_pos = None
                     for prev_z_pos in range(gap_z_pos - 1, -1, -1):
                         if z_to_x_map[prev_z_pos] is not None:
                             insert_x_pos = z_to_x_map[prev_z_pos]
                             break
 
-                    # 如果gap之前没有非gap位置，插入到x_t的开头（位置0）
-                    # 这表示在序列最前面插入（位置0是BOS，所以实际是在BOS之后插入）
+                    # 如果gap之前没有非gap位置，插入到开头
                     if insert_x_pos is None:
                         insert_x_pos = 0
 
-                    # 标记INSERT操作
+                    # 标记INSERT操作（INSERT优先级高于KEEP）
                     if 0 <= insert_x_pos < x_seq_len:
-                        # 检查该位置是否已有KEEP操作
                         if u_mask[b, insert_x_pos, -1].item() == 1:
-                            # 如果有KEEP操作，移除KEEP，因为INSERT优先级更高
-                            u_mask[b, insert_x_pos, -1] = 0
-
-                        # 标记INSERT操作：u_mask[b, insert_x_pos, token_1] = 1
-                        # 语义：在位置insert_x_pos的元素之后插入token_1
-                        u_mask[b, insert_x_pos, token_1] = 1  # INSERT在0~vocab_size-1
+                            u_mask[b, insert_x_pos, -1] = 0  # 移除KEEP
+                        u_mask[b, insert_x_pos, token_1] = 1  # INSERT
 
         return u_mask
 

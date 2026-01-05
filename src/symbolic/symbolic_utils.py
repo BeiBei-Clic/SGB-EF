@@ -13,11 +13,12 @@ from src.utils.logger import Logger
 # 创建全局 Logger 实例
 _logger = Logger(enabled=True)
 
-
 # 运算符定义
 UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
 BINARY_OPS = ['add', 'sub', 'mul', 'div', 'pow']
 
+
+# ==================== 表达式生成与转换 ====================
 
 def simplify_expr(expr: sp.Expr) -> sp.Expr:
     """化简表达式"""
@@ -131,6 +132,8 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
 
     return expr
 
+
+# ==================== 表达式简化 ====================
 
 def reduce_expression(expr: sp.Expr) -> sp.Expr:
     """对表达式进行一次删减操作，返回简化后的表达式"""
@@ -274,8 +277,19 @@ def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool =
 
     return reduction_sequence
 
-def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
-    """使用Levenshtein距离计算两个token序列的对齐，返回包含gap token的等长序列"""
+
+# ==================== 序列对齐 ====================
+
+def _build_dp_matrix(tokens1: List[str], tokens2: List[str]) -> List[List[int]]:
+    """构建编辑距离DP矩阵
+
+    Args:
+        tokens1: 第一个token序列
+        tokens2: 第二个token序列
+
+    Returns:
+        完成的DP矩阵
+    """
     m, n = len(tokens1), len(tokens2)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
 
@@ -292,6 +306,14 @@ def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tu
                 dp[i][j] = dp[i-1][j-1]  # 匹配，无代价
             else:
                 dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])  # 插入、删除、替换
+
+    return dp
+
+
+def levenshtein_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tuple[List[str], List[str]]:
+    """使用Levenshtein距离计算两个token序列的对齐，返回包含gap token的等长序列"""
+    dp = _build_dp_matrix(tokens1, tokens2)
+    m, n = len(tokens1), len(tokens2)
 
     # 回溯构建对齐序列
     z1, z2 = [], []
@@ -345,18 +367,7 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
     m, n = len(tokens1), len(tokens2)
 
     # 步骤1：构建标准编辑距离DP矩阵
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if tokens1[i-1] == tokens2[j-1]:
-                dp[i][j] = dp[i-1][j-1]  # 匹配，代价不变
-            else:
-                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+    dp = _build_dp_matrix(tokens1, tokens2)
 
     # 步骤2：随机回溯（关键修改！）
     # 在每一步，收集所有最优方向，然后随机选择一个
@@ -400,6 +411,8 @@ def randomized_alignment_with_gap(tokens1: List[str], tokens2: List[str]) -> Tup
     # 步骤3：反转序列，因为我们是反向构建的
     return list(reversed(z1)), list(reversed(z2))
 
+
+# ==================== 表达式计算与评估 ====================
 
 def tree_to_expr(tree_str: str) -> sp.Expr:
     """将前序遍历字符串转换为SymPy表达式"""

@@ -414,18 +414,32 @@ class SimpleSymbolicRegression:
         # 2. 初始化：从当前表达式开始
         result_tokens = current_tokens.copy()
 
-        # 3. 用于追踪位置偏移量
-        # 偏移量 = 已应用的插入数 - 已应用的删除数
-        position_offset = 0
-
-        # 4. 将操作分为 DELETE 和非 DELETE 两类
+        # 3. 将操作分为 DELETE 和非 DELETE 两类
         delete_actions = [a for a in sorted_actions if a.action_type == 'delete']
         other_actions = [a for a in sorted_actions if a.action_type != 'delete']
 
-        # 5. DELETE 操作从后往前执行（删除后面的 token 不会影响前面的位置）
-        # 这样可以确保每个 DELETE 操作都能找到正确的 token，不会因为前面的删除而发生位置偏移
-        # 从后往前删除时，不需要 position_offset，因为每次删除都基于原始位置
+        # 4. 执行DELETE操作（从后往前）
+        result_tokens = self._execute_delete_actions(result_tokens, delete_actions)
 
+        # 5. 执行其他操作（从前往后）
+        position_offset = -len(delete_actions)
+        result_tokens = self._execute_other_actions(
+            result_tokens, other_actions, position_offset
+        )
+
+        return result_tokens
+
+    def _execute_delete_actions(self, result_tokens: List[str],
+                               delete_actions: List[ActionProposal]) -> List[str]:
+        """执行DELETE操作（从后往前，避免位置偏移）
+
+        Args:
+            result_tokens: 当前token列表
+            delete_actions: DELETE操作列表
+
+        Returns:
+            执行DELETE后的token列表
+        """
         # Debug: 打印初始状态
         if os.environ.get('RANK', '0') == '0':
             print(f"    [DEBUG REVERSE DELETE START] result_tokens={result_tokens}, delete_actions={[a.position for a in delete_actions]}")
@@ -433,7 +447,6 @@ class SimpleSymbolicRegression:
         for i, action in enumerate(reversed(delete_actions)):
             # DELETE操作：position指向input_ids位置（位置0=BOS，位置1,2,3...=实际token）
             # 需要转换为current_tokens位置：pos-1（因为current_tokens不包含BOS）
-            # 注意：从后往前删除时，直接使用原始位置，不需要offset
             actual_position = (action.position - 1)
 
             # 确保位置在有效范围内
@@ -450,30 +463,34 @@ class SimpleSymbolicRegression:
                 if os.environ.get('RANK', '0') == '0':
                     print(f"    [DEBUG REVERSE DELETE {i+1}/{len(delete_actions)}] @{action.position}→actual@{actual_position}: '{deleted_token}', 剩余{result_tokens}")
 
-        # 计算总的position_offset用于后续操作
-        position_offset = -len(delete_actions)
-
         if os.environ.get('RANK', '0') == '0':
-            print(f"    [DEBUG REVERSE DELETE END] result_tokens={result_tokens}, position_offset={position_offset}")
+            print(f"    [DEBUG REVERSE DELETE END] result_tokens={result_tokens}")
 
-        # 6. 其他操作从前往后执行
+        return result_tokens
+
+    def _execute_other_actions(self, result_tokens: List[str],
+                              other_actions: List[ActionProposal],
+                              position_offset: int) -> List[str]:
+        """执行非DELETE操作（从前往后）
+
+        Args:
+            result_tokens: 当前token列表
+            other_actions: 非DELETE操作列表
+            position_offset: 初始位置偏移量
+
+        Returns:
+            执行操作后的token列表
+        """
         for action in other_actions:
             # 计算实际位置：将input_ids位置转换为current_tokens位置
-            # input_ids位置：位置0=BOS，位置1,2,3...=实际token
-            # current_tokens：不包含BOS，所以需要转换
             if action.action_type == 'insert':
                 # INSERT操作：position表示在哪个input_ids位置之后插入
-                # INSERT(0)在BOS之后插入 → current_tokens索引0
-                # INSERT(p)在位置p之后插入 → current_tokens索引p（如果p=0）或p-1之后（如果p>0）
                 if action.position == 0:
-                    # 在BOS（位置0）之后插入，插入到current_tokens开头
                     actual_position = 0 + position_offset
                 else:
-                    # 在位置p之后插入，插入到current_tokens的位置p（因为current_tokens不包含BOS）
                     actual_position = action.position + position_offset
             else:
                 # SUBSTITUTE/KEEP操作：position指向input_ids位置
-                # 需要转换为current_tokens位置：pos-1（跳过BOS）
                 actual_position = (action.position - 1) + position_offset
 
             # 确保位置在有效范围内
@@ -482,23 +499,22 @@ class SimpleSymbolicRegression:
             if action.action_type == 'insert':
                 # 插入操作
                 if action.token is not None:
-                    # 检查当前位置是否是<gap>
                     if (0 <= actual_position < len(result_tokens) and
                         result_tokens[actual_position] == '<gap>'):
-                        # 如果是gap，直接替换（gap只是占位符，插入会消耗gap）
+                        # 如果是gap，直接替换
                         result_tokens[actual_position] = action.token
                     else:
-                        # 如果不是gap，在actual_position之前插入
+                        # 如果不是gap，插入
                         result_tokens.insert(actual_position, action.token)
                         position_offset += 1  # 后续位置后移
 
             elif action.action_type == 'substitute':
-                # 替换操作：不影响位置偏移
+                # 替换操作
                 if 0 <= actual_position < len(result_tokens) and action.token is not None:
                     result_tokens[actual_position] = action.token
 
             elif action.action_type == 'keep':
-                # KEEP操作：保持当前token不变，不执行任何修改
+                # KEEP操作：保持不变
                 pass
 
         return result_tokens
