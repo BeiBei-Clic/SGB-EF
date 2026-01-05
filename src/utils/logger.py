@@ -27,7 +27,7 @@ class Logger:
     SAMPLE_LOG = "logs/sample_generation.log"
     CRASH_LOG = "logs/training_crash.log"
 
-    MAX_LOG_LINES = 100000
+    MAX_LOG_LINES = 100000000
     _log_line_count = {}
 
     def __init__(self, accelerator=None, enabled=True, debug_mode=False):

@@ -47,14 +47,6 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
     np.random.seed(seed_val)
 
     process_prefix = f"[B{batch_idx+1}]"
-    debug_log_path = f"logs/worker_batch_{batch_idx+1}_pid_{os.getpid()}.log"
-    os.makedirs("logs", exist_ok=True)
-
-    def debug_log(msg):
-        """写入调试日志"""
-        with open(debug_log_path, "a") as f:
-            f.write(f"{msg}\n")
-
     batch_samples = []
     dimension_count = {}
     sample_count = 0
@@ -95,18 +87,16 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
             else:
                 fail_count += 1
                 if fail_count % 100 == 0:
-                    debug_log(f"样本失败 {fail_count}次 | 连续失败{consecutive_fails}次")
+                    pass
                 _sample_logger.sample_failed(sample_id, "No samples generated")
                 continue
 
         except TimeoutError:
             fail_count += 1
-            debug_log(f"超时 | TIMEOUT={SAMPLE_TIMEOUT}s | fail_count={fail_count}")
             _sample_logger.sample_timeout(sample_id, SAMPLE_TIMEOUT)
             continue
 
         except Exception as e:
-            debug_log(f"异常 | {type(e).__name__}: {str(e)[:100]}")
             _sample_logger.sample_error(sample_id, type(e).__name__, str(e))
 
             if batch_samples:
@@ -115,21 +105,16 @@ def generate_batch_worker(args: Tuple) -> Tuple[int, List[Dict], Dict[int, int]]
                     with open(batch_filename, 'w', encoding='utf-8') as f:
                         for sample in batch_samples:
                             f.write(json.dumps(sample, ensure_ascii=False) + '\n')
-                    debug_log(f"异常保存 | 已保存{len(batch_samples)}个样本")
                 except Exception as save_error:
-                    debug_log(f"保存失败 | {save_error}")
+                    pass
 
-            debug_log(f"批次失败 | {type(e).__name__}: {str(e)[:100]}")
             return batch_idx, -1, {}
-
-    debug_log(f"批次完成 | 成功{sample_count}个样本 | 尝试{attempt_count}次 | 失败{fail_count}次")
 
     if batch_samples:
         os.makedirs(os.path.dirname(batch_filename), exist_ok=True)
         with open(batch_filename, 'w', encoding='utf-8') as f:
             for sample in batch_samples:
                 f.write(json.dumps(sample, ensure_ascii=False) + '\n')
-        debug_log(f"保存成功 | 样本数={len(batch_samples)}")
 
     return batch_idx, len(batch_samples), dimension_count
 
@@ -312,15 +297,6 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
                     main_file.write(json.dumps(sample, ensure_ascii=False) + '\n')
 
                 os.remove(batch_filename)
-
-                batch_number = batch_idx + 1
-                import glob
-                worker_log_pattern = f"logs/worker_batch_{batch_number}_pid_*.log"
-                for log_file in glob.glob(worker_log_pattern):
-                    try:
-                        os.remove(log_file)
-                    except Exception:
-                        pass
 
     os.makedirs(os.path.dirname(index_filename), exist_ok=True)
     with open(index_filename, 'w', encoding='utf-8') as f:
