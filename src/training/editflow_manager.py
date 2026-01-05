@@ -655,6 +655,7 @@ class EditFlowManager:
 
         total_loss = 0.0
         num_batches = 0
+        local_total_grad_norm = 0.0  # 累积本进程的梯度范数，用于跨进程GPU信息汇总
 
         # 数据验证：在第一个 epoch 开始时验证数据能正确加载
         # 注意：不在 epoch=0 时立即验证，而是在第一个 batch 加载时验证
@@ -799,6 +800,7 @@ class EditFlowManager:
 
                 total_loss += loss.item()
                 num_batches += 1
+                local_total_grad_norm += grad_norm  # 累积梯度范数
 
                 batch_total_time = time.time() - batch_start_time
 
@@ -818,19 +820,96 @@ class EditFlowManager:
         # 跨进程收集并计算平均损失
         avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
 
-        # 数据消耗监控：记录实际处理的 batch 数
+        # 在所有进程上收集数据（必须在所有进程上调用，否则会死锁）
+        num_processes = self.accelerator.num_processes
+        if num_processes > 1:
+            # 收集所有进程的批次数、总损失、总梯度范数
+            gathered_batches = self.accelerator.gather(
+                torch.tensor(num_batches, device=self.device)
+            )
+            gathered_total_losses = self.accelerator.gather(
+                torch.tensor(total_loss, device=self.device)
+            )
+            gathered_total_grad_norms = self.accelerator.gather(
+                torch.tensor(local_total_grad_norm, device=self.device)
+            )
+        else:
+            # 单GPU训练，不需要gather
+            gathered_batches = torch.tensor([num_batches], device=self.device)
+            gathered_total_losses = torch.tensor([total_loss], device=self.device)
+            gathered_total_grad_norms = torch.tensor([local_total_grad_norm], device=self.device)
+
+        # 数据消耗监控：记录实际处理的 batch 数（只在主进程）
         if self.accelerator.is_local_main_process:
             expected_batches = dataset_size // self.args.batch_size
             actual_batches = num_batches
+            total_batches_all_processes = gathered_batches.sum().item()
 
-            self.logger.log(
-                "EPOCH_BATCH_COUNT",
-                f"Epoch {epoch+1} 完成 | 预期批次数={expected_batches} | "
-                f"实际批次数={actual_batches} | 数据集大小={dataset_size} | "
-                f"批次大小={self.args.batch_size}",
-                f"epoch{epoch+1}_dim{dimension}_monitor",
-                level=1
-            )
+            # 计算样本覆盖率
+            total_samples_processed = total_batches_all_processes * self.args.batch_size
+            coverage_rate = (total_samples_processed / dataset_size * 100) if dataset_size > 0 else 0.0
+
+            # 根据是否分布式训练，显示不同的日志格式
+            if num_processes > 1:
+                # 构建每个GPU的详细信息
+                gpu_metrics = []
+                global_total_loss = 0.0
+                global_total_grad_norm = 0.0
+
+                for gpu_idx in range(num_processes):
+                    gpu_batches = gathered_batches[gpu_idx].item()
+                    gpu_total_loss = gathered_total_losses[gpu_idx].item()
+                    gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
+
+                    gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
+                    gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
+
+                    gpu_metrics.append(
+                        f"  [GPU {gpu_idx}] batches={gpu_batches} | "
+                        f"total_loss={gpu_total_loss:.2f} | avg_loss={gpu_avg_loss:.6f} | "
+                        f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
+                    )
+
+                    global_total_loss += gpu_total_loss
+                    global_total_grad_norm += gpu_total_grad_norm
+
+                # 计算全局平均值
+                global_avg_loss = global_total_loss / total_batches_all_processes if total_batches_all_processes > 0 else 0.0
+                global_avg_grad_norm = global_total_grad_norm / num_processes if num_processes > 0 else 0.0
+
+                # 构建完整的日志消息
+                gpu_metrics_summary = "\n" + "\n".join(gpu_metrics)
+                data_allocation_summary = (
+                    f"\n--- 数据分配 --- | 进程数={num_processes} | 数据集大小={dataset_size} | "
+                    f"批次大小={self.args.batch_size} | 预期单进程批次数={expected_batches} | "
+                    f"覆盖率={coverage_rate:.1f}%"
+                )
+                global_summary = (
+                    f"\n--- 全局汇总 --- | 总批次数={total_batches_all_processes} | "
+                    f"avg_loss={global_avg_loss:.6f} | avg_grad_norm={global_avg_grad_norm:.3f}"
+                )
+
+                self.logger.log(
+                    "EPOCH_BATCH_COUNT",
+                    f"Epoch {epoch+1} 完成 [分布式训练详细] |" +
+                    gpu_metrics_summary +
+                    data_allocation_summary +
+                    global_summary,
+                    f"epoch{epoch+1}_dim{dimension}_detailed",
+                    level=1
+                )
+            else:
+                # 单GPU训练
+                avg_grad_norm = local_total_grad_norm / num_batches if num_batches > 0 else 0.0
+                self.logger.log(
+                    "EPOCH_BATCH_COUNT",
+                    f"Epoch {epoch+1} 完成 | 预期批次数={expected_batches} | "
+                    f"实际批次数={actual_batches} | 总损失={total_loss:.2f} | "
+                    f"平均损失={avg_loss:.6f} | 平均梯度范数={avg_grad_norm:.3f} | "
+                    f"数据集大小={dataset_size} | 批次大小={self.args.batch_size}",
+                    f"epoch{epoch+1}_dim{dimension}_monitor",
+                    level=1
+                )
 
             # 警告：如果实际批次数远少于预期，可能是数据加载问题
             if epoch > 0 and actual_batches == 0:
@@ -848,7 +927,8 @@ class EditFlowManager:
                     f"epoch{epoch+1}_warning"
                 )
 
-        return avg_loss, num_batches
+        # 返回平均损失、批次数、总损失和总梯度范数（用于GPU级别信息汇总）
+        return avg_loss, num_batches, total_loss, local_total_grad_norm
 
     def evaluate(self, model, condition_encoder, criterion, test_dataloader, test_dataset):
         """测试集评估"""
@@ -976,18 +1056,125 @@ class EditFlowManager:
             print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
             self.logger.log("TRAINING_START", f"开始训练 | num_epochs={self.args.num_epochs} | model_params={model_params:,} | encoder_params={encoder_params:,}", level=1)
 
+            # 分布式训练说明
+            if self.accelerator.num_processes > 1:
+                train_dataset_size = len(train_dataset)
+                test_dataset_size = len(test_dataset)
+
+                # 计算每个进程预期处理的样本数和批次数
+                samples_per_process = train_dataset_size // self.accelerator.num_processes
+                batches_per_process = samples_per_process // self.args.batch_size
+                total_batches_all_processes = batches_per_process * self.accelerator.num_processes
+                coverage_rate = (total_batches_all_processes * self.args.batch_size / train_dataset_size * 100) if train_dataset_size > 0 else 0.0
+
+                print("\n" + "="*70)
+                print("📊 分布式训练配置说明")
+                print("="*70)
+                print(f"进程数 (GPU数):        {self.accelerator.num_processes}")
+                print(f"训练集总样本数:        {train_dataset_size}")
+                print(f"每个进程分配样本数:    {samples_per_process} (整数除法)")
+                print(f"每个进程预期批次数:    {batches_per_process}")
+                print(f"所有进程总批次数:      {total_batches_all_processes}")
+                print(f"样本覆盖率:            {coverage_rate:.1f}%")
+                print(f"\n注意：由于整数除法，约 {train_dataset_size % self.accelerator.num_processes} 个样本")
+                print(f"      ({train_dataset_size - total_batches_all_processes * self.args.batch_size} 个) 不会被训练")
+                print("="*70 + "\n")
+
+                self.logger.log(
+                    "DISTRIBUTED_TRAINING_INFO",
+                    f"分布式训练配置 | 进程数={self.accelerator.num_processes} | "
+                    f"训练集大小={train_dataset_size} | 每进程样本数={samples_per_process} | "
+                    f"每进程批次数={batches_per_process} | 总批次数={total_batches_all_processes} | "
+                    f"覆盖率={coverage_rate:.1f}%",
+                    "distributed_setup",
+                    level=1
+                )
+
         eval_every = self.args.eval_every
 
         for epoch in range(self.args.num_epochs):
-            avg_loss, num_batches = self.train_epoch(
+            avg_loss, num_batches, total_loss, total_grad_norm = self.train_epoch(
                 model, condition_encoder, criterion, optimizer,
                 train_dataloader, train_dataset, epoch, "Mixed"
             )
 
+            # 在所有进程上收集数据（必须在所有进程上调用，否则会死锁）
+            if self.accelerator.num_processes > 1:
+                # 收集所有进程的批次数、总损失、总梯度范数
+                gathered_batches = self.accelerator.gather(
+                    torch.tensor(num_batches, device=self.device)
+                )
+                gathered_total_losses = self.accelerator.gather(
+                    torch.tensor(total_loss, device=self.device)
+                )
+                gathered_total_grad_norms = self.accelerator.gather(
+                    torch.tensor(total_grad_norm, device=self.device)
+                )
+            else:
+                # 单GPU训练，不需要gather
+                gathered_batches = torch.tensor([num_batches], device=self.device)
+                gathered_total_losses = torch.tensor([total_loss], device=self.device)
+                gathered_total_grad_norms = torch.tensor([total_grad_norm], device=self.device)
+
+            # 只在主进程上打印和记录日志
             if self.accelerator.is_local_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}, 学习率: {current_lr:.2e}")
-                self.logger.log("EPOCH_COMPLETE", f"Epoch {epoch+1}/{self.args.num_epochs} | train_loss={avg_loss:.4f} | lr={current_lr:.2e} | batches={num_batches}", level=1)
+
+                if self.accelerator.num_processes > 1:
+                    # 构建每个GPU的详细信息
+                    gpu_details = []
+                    global_total_batches = 0
+                    global_total_loss = 0.0
+
+                    for gpu_idx in range(self.accelerator.num_processes):
+                        gpu_batches = gathered_batches[gpu_idx].item()
+                        gpu_total_loss = gathered_total_losses[gpu_idx].item()
+                        gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
+
+                        # 计算平均值
+                        gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
+                        gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
+
+                        gpu_details.append(
+                            f"  [GPU {gpu_idx}] batches={gpu_batches} | "
+                            f"total_loss={gpu_total_loss:.2f} | avg_loss={gpu_avg_loss:.6f} | "
+                            f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
+                        )
+
+                        global_total_batches += gpu_batches
+                        global_total_loss += gpu_total_loss
+
+                    # 全局汇总信息
+                    global_avg_loss = global_total_loss / global_total_batches if global_total_batches > 0 else 0.0
+
+                    # 构建完整的日志消息
+                    gpu_summary = "\n" + "\n".join(gpu_details) + "\n--- 全局汇总 --- | " + \
+                                 f"total_batches={global_total_batches} | avg_train_loss={global_avg_loss:.6f} | " + \
+                                 f"lr={current_lr:.2e}"
+
+                    # 控制台输出
+                    print(f"\nEpoch {epoch+1}/{self.args.num_epochs} 完成 [分布式训练]")
+                    for gpu_detail in gpu_details:
+                        print(gpu_detail)
+                    print(f"--- 全局汇总 --- | avg_train_loss={global_avg_loss:.4f} | total_batches={global_total_batches} | lr={current_lr:.2e}\n")
+
+                    # 日志文件记录
+                    self.logger.log(
+                        "EPOCH_COMPLETE",
+                        f"Epoch {epoch+1}/{self.args.num_epochs} [分布式训练详细] |\n" + gpu_summary,
+                        f"epoch{epoch+1}_complete",
+                        level=1
+                    )
+                else:
+                    # 单GPU训练
+                    avg_grad_norm = total_grad_norm / num_batches if num_batches > 0 else 0.0
+                    print(f"Epoch {epoch+1}/{self.args.num_epochs} 完成, 训练损失: {avg_loss:.4f}, 梯度范数: {avg_grad_norm:.3f}, 学习率: {current_lr:.2e}")
+                    self.logger.log(
+                        "EPOCH_COMPLETE",
+                        f"Epoch {epoch+1}/{self.args.num_epochs} | train_loss={avg_loss:.4f} | "
+                        f"avg_grad_norm={avg_grad_norm:.3f} | lr={current_lr:.2e} | batches={num_batches}",
+                        level=1
+                    )
 
             scheduler.step()
 
