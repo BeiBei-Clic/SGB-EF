@@ -17,12 +17,27 @@ def with_timeout(func, timeout_seconds, *args, **kwargs):
         old_handler = signal.signal(signal.SIGALRM, timeout_handler)
         signal.alarm(int(timeout_seconds))
 
+        cleanup_done = False
+
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            # 函数正常完成，立即清理（关键改进）
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+            cleanup_done = True
+            return result
         except TimeoutError:
             raise TimeoutError(f"函数 {func.__name__} 在 {timeout_seconds} 秒后超时")
         finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
+            # 只处理未清理的情况（异常时）
+            if not cleanup_done:
+                try:
+                    signal.alarm(0)
+                except:
+                    pass
+                try:
+                    signal.signal(signal.SIGALRM, old_handler)
+                except:
+                    pass
     else:
         return func(*args, **kwargs)
