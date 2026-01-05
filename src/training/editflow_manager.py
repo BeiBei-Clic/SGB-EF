@@ -139,7 +139,8 @@ class EditFlowManager:
             max_dim=self.args.max_dim,
             max_expr_length=self.args.max_expr_length,
             stream=use_stream,
-            num_proc=num_proc
+            num_proc=num_proc,
+            logger=self.logger
         )
 
         # 分割训练集和测试集
@@ -151,8 +152,31 @@ class EditFlowManager:
             if self.accelerator.is_local_main_process:
                 print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
 
-            train_dataset = full_dataset
-            test_dataset = full_dataset
+            # 流式模式：使用skip+take进行数据分割
+            # train_dataset: 从头开始读取train_size个样本
+            train_dataset = FlowDataset(
+                data_file=cache_filename,
+                tokenizer=tokenizer,
+                max_dim=self.args.max_dim,
+                max_expr_length=self.args.max_expr_length,
+                stream=True,
+                num_proc=num_proc,
+                logger=self.logger,
+                skip=0,          # 不跳过任何样本
+                take=train_size  # 读取train_size个样本
+            )
+            # test_dataset: 跳过前train_size个样本，读取test_size个样本
+            test_dataset = FlowDataset(
+                data_file=cache_filename,
+                tokenizer=tokenizer,
+                max_dim=self.args.max_dim,
+                max_expr_length=self.args.max_expr_length,
+                stream=True,
+                num_proc=num_proc,
+                logger=self.logger,
+                skip=train_size,  # 跳过训练集样本
+                take=test_size    # 读取test_size个样本
+            )
             train_size_estimate = train_size
             test_size_estimate = test_size
         else:
@@ -217,12 +241,30 @@ class EditFlowManager:
             drop_last=test_drop_last
         )
 
+        # 准备 DataLoader 用于分布式训练
+        # 对于 IterableDataset（stream mode），accelerate 会自动分片到多个进程
+        # 如果希望每个进程看到完整数据集，请使用 --dataset_stream=False（非流式模式）
         train_dataloader, test_dataloader = self.accelerator.prepare(
             train_dataloader, test_dataloader
         )
 
         if self.accelerator.is_local_main_process:
             print(f"数据准备完成: 训练集约 {train_size_estimate} 样本, 测试集约 {test_size_estimate} 样本")
+
+            # 验证DataLoader的batch数量
+            expected_train_batches = train_size_estimate // self.args.batch_size
+            expected_test_batches = test_size_estimate // self.args.batch_size
+
+            self.logger.log(
+                "DATALOADER_VERIFY",
+                f"DataLoader创建完成 | 预期训练批次数={expected_train_batches} | "
+                f"预期测试批次数={expected_test_batches} | "
+                f"num_workers={num_workers} | is_stream_mode={is_stream_mode} | "
+                f"train_shuffle={train_shuffle} | "
+                f"支持set_epoch={hasattr(train_dataset, 'set_epoch')}",
+                "data_loading",
+                level=1
+            )
 
         return train_dataloader, train_dataset, test_dataloader, test_dataset
 
@@ -599,8 +641,39 @@ class EditFlowManager:
         model.train()
         condition_encoder.train()
 
+        # 关键修复：对于流式数据集，在每个 epoch 开始时调用 set_epoch
+        # 这会重置迭代器并使用新的随机种子重新洗牌数据
+        if hasattr(dataset, 'set_epoch'):
+            dataset.set_epoch(epoch)
+            if self.accelerator.is_local_main_process:
+                self.logger.log(
+                    "DATASET_SET_EPOCH",
+                    f"调用 dataset.set_epoch({epoch}) | 迭代器已重置，数据已重新洗牌",
+                    f"epoch{epoch+1}_data_reset",
+                    level=1
+                )
+
         total_loss = 0.0
         num_batches = 0
+
+        # 数据验证：在第一个 epoch 开始时验证数据能正确加载
+        # 注意：不在 epoch=0 时立即验证，而是在第一个 batch 加载时验证
+        # 这样可以避免 IterableDataset 初始化时序问题
+
+        # 计算数据集信息
+        dataset_size = len(dataset)
+        num_batches_estimate = dataset_size // self.args.batch_size
+
+        # 记录epoch开始和数据集信息
+        if self.accelerator.is_local_main_process:
+            self.logger.log(
+                "EPOCH_START",
+                f"开始 Epoch {epoch+1}/{self.args.num_epochs} | 维度={dimension} | "
+                f"数据集大小={dataset_size} | 预计批次数={num_batches_estimate} | "
+                f"批次大小={self.args.batch_size}",
+                f"epoch{epoch+1}_dim{dimension}",
+                level=1
+            )
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.num_epochs} - Dim {dimension}",
                           disable=not self.accelerator.is_local_main_process)
@@ -610,6 +683,17 @@ class EditFlowManager:
 
         for batch_idx, batch in enumerate(progress_bar):
             batch_start_time = time.time()
+
+            # 记录数据加载进度（不受debug控制，始终记录）
+            if self.accelerator.is_local_main_process:
+                progress_pct = (batch_idx + 1) / num_batches_estimate * 100 if num_batches_estimate > 0 else 0
+                self.logger.log(
+                    "BATCH_LOAD_START",
+                    f"开始加载 Batch {batch_idx+1}/{num_batches_estimate} | "
+                    f"进度={progress_pct:.1f}% | timestamp={time.time():.2f}",
+                    f"epoch{epoch+1}_dim{dimension}_batch{batch_idx}",
+                    level=1
+                )
 
             if self.accelerator.is_local_main_process and self.debug_mode:
                 self.logger.log("BATCH_START", f"开始处理 Batch {batch_idx} | timestamp={time.time():.2f}",
@@ -734,6 +818,36 @@ class EditFlowManager:
         # 跨进程收集并计算平均损失
         avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
 
+        # 数据消耗监控：记录实际处理的 batch 数
+        if self.accelerator.is_local_main_process:
+            expected_batches = dataset_size // self.args.batch_size
+            actual_batches = num_batches
+
+            self.logger.log(
+                "EPOCH_BATCH_COUNT",
+                f"Epoch {epoch+1} 完成 | 预期批次数={expected_batches} | "
+                f"实际批次数={actual_batches} | 数据集大小={dataset_size} | "
+                f"批次大小={self.args.batch_size}",
+                f"epoch{epoch+1}_dim{dimension}_monitor",
+                level=1
+            )
+
+            # 警告：如果实际批次数远少于预期，可能是数据加载问题
+            if epoch > 0 and actual_batches == 0:
+                self.logger.error(
+                    "NO_DATA_LOADED",
+                    f"严重错误：Epoch {epoch+1} 没有处理任何 batch！"
+                    f"这通常意味着 IterableDataset 迭代器已耗尽且未正确重置。",
+                    f"epoch{epoch+1}_critical"
+                )
+            elif epoch > 0 and actual_batches < expected_batches * 0.5:
+                self.logger.error(
+                    "INSUFFICIENT_DATA",
+                    f"警告：Epoch {epoch+1} 实际批次数({actual_batches}) "
+                    f"远少于预期({expected_batches})，可能存在数据加载问题。",
+                    f"epoch{epoch+1}_warning"
+                )
+
         return avg_loss, num_batches
 
     def evaluate(self, model, condition_encoder, criterion, test_dataloader, test_dataset):
@@ -741,11 +855,46 @@ class EditFlowManager:
         model.eval()
         condition_encoder.eval()
 
+        # 关键修复：对于流式测试集，也调用 set_epoch 重置迭代器
+        if hasattr(test_dataset, 'set_epoch'):
+            test_dataset.set_epoch(0)  # 测试集使用固定 epoch
+            if self.accelerator.is_local_main_process:
+                self.logger.log(
+                    "TEST_DATASET_RESET",
+                    "测试集迭代器已重置",
+                    "evaluation",
+                    level=1
+                )
+
         total_loss = 0.0
         num_batches = 0
 
+        # 计算测试集信息
+        test_size = len(test_dataset)
+        test_num_batches_estimate = test_size // self.args.batch_size
+
+        # 记录测试开始
+        if self.accelerator.is_local_main_process:
+            self.logger.log(
+                "EVAL_START",
+                f"开始测试集评估 | 测试集大小={test_size} | "
+                f"预计批次数={test_num_batches_estimate} | 批次大小={self.args.batch_size}",
+                "evaluation",
+                level=1
+            )
+
         with torch.no_grad():
-            for batch in test_dataloader:
+            for batch_idx, batch in enumerate(test_dataloader):
+                # 记录测试数据加载进度
+                if self.accelerator.is_local_main_process:
+                    progress_pct = (batch_idx + 1) / test_num_batches_estimate * 100 if test_num_batches_estimate > 0 else 0
+                    self.logger.log(
+                        "TEST_BATCH_LOAD",
+                        f"测试 Batch {batch_idx+1}/{test_num_batches_estimate} | "
+                        f"进度={progress_pct:.1f}% | timestamp={time.time():.2f}",
+                        f"evaluation_batch{batch_idx}",
+                        level=1
+                    )
                 x_values = batch['x_values'].to(self.device)
                 y_target = batch['y_target'].to(self.device)
                 z0_token_ids = batch['z0_token_ids'].to(self.device)

@@ -165,7 +165,7 @@ def generate_single_sample(
                 continue
 
             residuals = y_target - y_curr
-            _sample_logger.residuals_before_clip(sample_id, i+1, residuals.min(), residuals.max(), residuals.mean())
+            # 已删除residuals_before_clip日志记录（无意义的统计量）
 
             THRESHOLD = 100.0
             max_residual = np.max(np.abs(residuals))

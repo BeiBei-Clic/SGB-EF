@@ -305,7 +305,8 @@ class ContinuousFlowLoss:
 
 
 def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
-                       stream: bool = True, num_proc: Optional[int] = None):
+                       stream: bool = True, num_proc: Optional[int] = None,
+                       skip: Optional[int] = None, take: Optional[int] = None):
     """
     使用 Hugging Face datasets 加载并预处理数据
 
@@ -315,6 +316,8 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
         max_expr_length: 表达式最大长度
         stream: 是否使用流式加载（默认True，适合大文件）
         num_proc: 预处理时的进程数，None表示自动选择
+        skip: 跳过前N个样本（在map之前应用）
+        take: 读取N个样本后停止（在map之前应用）
 
     Returns:
         dataset: Hugging Face Dataset 对象
@@ -328,6 +331,12 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
     else:
         # 一次性加载：适合小文件，后续处理更快
         raw_dataset = load_dataset("parquet", data_files=data_files, split="train")
+
+    # 在map之前应用skip和take（更可靠，避免在已处理的数据集上操作）
+    if skip is not None:
+        raw_dataset = raw_dataset.skip(skip)
+    if take is not None:
+        raw_dataset = raw_dataset.take(take)
 
     # 获取token相关信息
     pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
@@ -390,6 +399,8 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
             batched=True,
             remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens']
         )
+        # 添加 shuffle 以提高数据多样性和支持 set_epoch
+        tokenized_dataset = tokenized_dataset.shuffle(seed=42, buffer_size=10000)
     else:
         # 非流式模式：使用多进程加速
         tokenized_dataset = raw_dataset.map(
@@ -399,6 +410,8 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
             remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens'],
             desc="Preprocessing dataset"
         )
+        # 非流式模式也添加 shuffle
+        tokenized_dataset = tokenized_dataset.shuffle(seed=42)
 
     # 设置格式为torch，这样DataLoader拿到的直接是Tensor
     if stream:
@@ -422,7 +435,8 @@ class FlowDataset(torch.utils.data.Dataset):
 
     def __init__(self, data_file: str, tokenizer, max_dim: int = 10,
                  max_expr_length: int = 128, stream: bool = True,
-                 num_proc: Optional[int] = None):
+                 num_proc: Optional[int] = None, logger=None,
+                 skip: Optional[int] = None, take: Optional[int] = None):
         """
         使用 Hugging Face datasets 的数据集包装器
 
@@ -433,6 +447,9 @@ class FlowDataset(torch.utils.data.Dataset):
             max_expr_length: 表达式最大长度
             stream: 是否使用流式加载（默认True）
             num_proc: 预处理时的进程数
+            logger: 日志记录器
+            skip: 跳过前N个样本（用于test数据集）
+            take: 读取N个样本后停止（用于train/test分割）
         """
         self.tokenizer = tokenizer
         self.max_dim = max_dim
@@ -442,6 +459,13 @@ class FlowDataset(torch.utils.data.Dataset):
         self.bos_token = tokenizer.convert_tokens_to_ids('<s>')
         self.gap_token = tokenizer.convert_tokens_to_ids('<gap>')
         self.stream = stream  # 保存stream模式标志
+        self.logger = logger  # 保存logger引用
+        self._skip = skip  # 保存skip参数
+        self._take = take  # 保存take参数
+
+        # 保存数据集参数，用于后续重新加载
+        self._data_file = data_file
+        self._num_proc = num_proc
 
         # 使用 Hugging Face datasets 加载数据
         self._hf_dataset = prepare_dataset_hf(
@@ -474,17 +498,55 @@ class FlowDataset(torch.utils.data.Dataset):
                     self._dataset_length = 1000000  # 默认值
 
     def __len__(self):
-        """返回数据集大小"""
+        """返回数据集大小（考虑skip和take限制）"""
+        if self._take is not None:
+            # 如果设置了take，返回take值（最多不超过数据集总大小）
+            return min(self._take, self._dataset_length)
         return self._dataset_length
 
     def __iter__(self):
         """流式模式下的迭代器"""
+        mode = "非流式" if self._data_list is not None else "流式"
+        if self.logger:
+            self.logger.log(
+                "DATA_ITER_START",
+                f"创建数据迭代器 | 模式={mode} | 数据集大小={self._dataset_length} | "
+                f"skip={self._skip} | take={self._take}",
+                "data_loading",
+                level=1
+            )
+
         if self._data_list is not None:
-            # 非流式模式：迭代缓存列表
-            return iter(self._data_list)
+            # 非流式模式：迭代缓存列表（应用skip和take）
+            start_idx = self._skip if self._skip is not None else 0
+            end_idx = (start_idx + self._take) if self._take is not None else None
+            return iter(self._data_list[start_idx:end_idx])
         else:
-            # 流式模式：直接迭代Hugging Face dataset
-            return self._hf_dataset.__iter__()
+            # 流式模式：每次重新创建Hugging Face dataset以确保迭代器可重用
+            # skip和take在prepare_dataset_hf内部的map之前应用，更可靠
+            hf_dataset = prepare_dataset_hf(
+                data_file=self._data_file,
+                tokenizer=self.tokenizer,
+                max_expr_length=self.max_expr_length,
+                stream=True,
+                num_proc=self._num_proc,
+                skip=self._skip,
+                take=self._take
+            )
+            return hf_dataset.__iter__()
+
+    def set_epoch(self, epoch):
+        """设置 epoch 号，用于重置迭代器并重新洗牌（Hugging Face datasets 标准方法）
+
+        Args:
+            epoch: 当前 epoch 号（从0开始）
+        """
+        # 直接调用底层 Hugging Face dataset 的 set_epoch 方法
+        if hasattr(self._hf_dataset, 'set_epoch'):
+            self._hf_dataset.set_epoch(epoch)
+        else:
+            # 如果 _hf_dataset 不支持 set_epoch（已经是列表形式），则不需要处理
+            pass
 
     def __getitem__(self, idx):
         """获取单个样本（仅非流式模式）"""

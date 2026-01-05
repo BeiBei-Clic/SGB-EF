@@ -234,13 +234,13 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] {step}" + (f" | {details}" if details else "")
         self._write(msg, self.SAMPLE_LOG)
 
-    def expression_generate(self, sample_id, expr_str, gen_time_ms):
+    def expression_generate(self, sample_id, expr_str, gen_time_ms=None):
         """记录表达式生成"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] GENERATE_RANDOM_EXPR '{expr_str}' | time={gen_time_ms:.1f}ms"
+        msg = f"{timestamp} [{sample_id}] GENERATE_RANDOM_EXPR '{expr_str}'"
         self._write(msg, self.SAMPLE_LOG)
 
     def expression_validation(self, sample_id, expr_str, expr_len, token_count):
@@ -252,34 +252,32 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] EXPR_VALIDATION_PASSED '{expr_str}' len={expr_len} tokens={token_count}"
         self._write(msg, self.SAMPLE_LOG)
 
-    def expression_convert(self, sample_id, token_count, convert_time_ms):
+    def expression_convert(self, sample_id, token_count, convert_time_ms=None):
         """记录表达式转换"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] EXPR_TO_TREE tokens={token_count} | time={convert_time_ms:.1f}ms"
+        msg = f"{timestamp} [{sample_id}] EXPR_TO_TREE tokens={token_count}"
         self._write(msg, self.SAMPLE_LOG)
 
-    def reduction_sequence(self, sample_id, step_count, time_ms):
+    def reduction_sequence(self, sample_id, step_count, time_ms=None):
         """记录删减序列生成"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] REDUCE_SEQUENCE {step_count} steps | time={time_ms:.1f}ms"
+        msg = f"{timestamp} [{sample_id}] REDUCE_SEQUENCE {step_count} steps"
         self._write(msg, self.SAMPLE_LOG)
 
-    def corrupt_expression(self, sample_id, step, orig_expr, corrupt_expr, time_ms):
+    def corrupt_expression(self, sample_id, step, orig_expr, corrupt_expr, time_ms=None):
         """记录表达式破坏"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg1 = f"{timestamp} [{sample_id}] CORRUPT_EXPRESSION step{step} | time={time_ms:.1f}ms"
-        msg2 = f"{timestamp} [{sample_id}] CORRUPT_RESULT step{step} '{orig_expr}' → '{corrupt_expr}'"
-        self._write(msg1, self.SAMPLE_LOG)
-        self._write(msg2, self.SAMPLE_LOG)
+        msg = f"{timestamp} [{sample_id}] CORRUPT_RESULT step{step} '{orig_expr}' → '{corrupt_expr}'"
+        self._write(msg, self.SAMPLE_LOG)
 
     def skip_duplicate(self, sample_id, step):
         """记录跳过重复表达式"""
@@ -299,42 +297,37 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] SKIP_COMPLEX step{step} expr='{expr_str}'"
         self._write(msg, self.SAMPLE_LOG)
 
-    def eval_curr_expression(self, sample_id, step, success, time_ms, expr_str=""):
+    def eval_curr_expression(self, sample_id, step, success, time_ms=None, expr_str=""):
         """记录当前表达式评估"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
         expr_info = f" expr='{expr_str}'" if expr_str else ""
-        msg = f"{timestamp} [{sample_id}] EVAL_CURR_EXPRESSION step{step} success={success} | time={time_ms:.1f}ms{expr_info}"
+        msg = f"{timestamp} [{sample_id}] EVAL_CURR_EXPRESSION step{step} success={success}{expr_info}"
         self._write(msg, self.SAMPLE_LOG)
 
-    def convert_to_trees(self, sample_id, step, target_tokens, curr_tokens, time_ms):
+    def convert_to_trees(self, sample_id, step, target_tokens, curr_tokens, time_ms=None):
         """记录转换为树"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] CONVERT_TO_TREES step{step} | time={time_ms:.1f}ms target_tokens={target_tokens} curr_tokens={curr_tokens}"
+        msg = f"{timestamp} [{sample_id}] CONVERT_TO_TREES step{step} target_tokens={target_tokens} curr_tokens={curr_tokens}"
         self._write(msg, self.SAMPLE_LOG)
 
-    def levenshtein_alignment(self, sample_id, step, z0_len, z1_len, time_ms):
+    def levenshtein_alignment(self, sample_id, step, z0_len, z1_len, time_ms=None):
         """记录对齐操作"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] LEVENSHTEIN_ALIGNMENT step{step} | time={time_ms:.1f}ms z0_len={z0_len} z1_len={z1_len}"
+        msg = f"{timestamp} [{sample_id}] LEVENSHTEIN_ALIGNMENT step{step} z0_len={z0_len} z1_len={z1_len}"
         self._write(msg, self.SAMPLE_LOG)
 
     def residuals_before_clip(self, sample_id, step, min_val, max_val, mean_val):
-        """记录裁剪前的residuals统计"""
-        if not self.enabled:
-            return
-
-        timestamp = self._get_timestamp()
-        msg = f"{timestamp} [{sample_id}] RESIDUALS_BEFORE_CLIP step{step} | min={min_val:.6f} max={max_val:.6f} mean={mean_val:.6f}"
-        self._write(msg, self.SAMPLE_LOG)
+        """记录裁剪前的residuals统计（已废弃，保留方法以避免调用错误）"""
+        pass
 
     def skip_clipped(self, sample_id, step, clip_count, total_count, threshold):
         """记录跳过裁剪的样本"""
@@ -385,14 +378,14 @@ class Logger:
         msg = f"{timestamp} [{sample_id}] TIMEOUT: Sample generation exceeded {timeout_seconds}s"
         self._write(msg, self.SAMPLE_LOG)
 
-    def expression_eval(self, sample_id, expr_str, eval_time_ms, success=True, error_msg=""):
+    def expression_eval(self, sample_id, expr_str, eval_time_ms=None, success=True, error_msg=""):
         """记录表达式评估结果"""
         if not self.enabled:
             return
 
         timestamp = self._get_timestamp()
         status = "OK" if success else f"FAIL: {error_msg}"
-        msg = f"{timestamp} [{sample_id}] EVAL {status} {eval_time_ms:.1f}ms"
+        msg = f"{timestamp} [{sample_id}] EVAL {status}"
         self._write(msg, self.SAMPLE_LOG)
 
     # ==================== 编辑操作日志 ====================
