@@ -35,33 +35,26 @@ class EditFlowManager:
     """
 
     # 类常量：训练和推理配置参数
-    GRADIENT_CLIP_NORM = 10.0  # 提高到10.0，避免过度裁剪
+    GRADIENT_CLIP_NORM = 10.0
     NUMERICAL_CLIP_THRESHOLD = 1e6
     MAX_EXPRESSION_LENGTH = 50
-    MIN_ACTION_SCORE = 0.01  # 最小操作分数阈值
+    MIN_ACTION_SCORE = 0.01
 
     def __init__(self, args):
         self.args = args
 
         # 初始化 Accelerate - 自动处理分布式训练设置
         # 注意：mixed_precision 由 accelerate launch 命令行参数控制
-        # 不要在代码中硬编码，否则会覆盖命令行的 --mixed_precision=bf16 设置
         self.accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             log_with=args.log_with
         )
 
-        # 设置随机种子
         set_seed(args.seed)
-
-        # 保存debug模式标志
         self.debug_mode = args.debug
-
-        # 初始化统一日志管理器，传入debug_mode参数
         self.logger = Logger(self.accelerator, enabled=True, debug_mode=self.debug_mode)
-
-        # 设备信息
         self.device = self.accelerator.device
+
         if self.accelerator.is_local_main_process:
             print("=== EditFlow符号回归预训练 (使用 Accelerate 加速) ===")
             print(f"样本数: {self.args.num_samples}")
@@ -76,7 +69,6 @@ class EditFlowManager:
             print(f"条件嵌入模型: {self.args.condition_model_name}")
             print(f"梯度累积步数: {self.args.gradient_accumulation_steps}")
             print(f"FP16混合精度: {self.args.use_fp16}")
-
             print(f"\nAccelerate 初始化完成")
             print(f"  设备: {self.device}")
             print(f"  分布式训练: {self.accelerator.distributed_type}")
@@ -84,7 +76,6 @@ class EditFlowManager:
             print(f"  混合精度: {self.accelerator.mixed_precision}")
             print(f"  调试模式: {'启用' if self.debug_mode else '禁用'}")
 
-        # 记录训练开始日志
         self.logger.training_start(self.args)
 
     def _gather_average_loss(self, total_loss, num_batches, default_value=0.0):
@@ -203,95 +194,123 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"使用 Hugging Face datasets 加载数据 (stream={use_stream})...")
 
-        full_dataset = FlowDataset(
-            data_file=cache_filename,
-            tokenizer=tokenizer,
-            max_dim=self.args.max_dim,
-            max_expr_length=self.args.max_expr_length,
-            stream=use_stream,
-            num_proc=num_proc,
-            logger=self.logger
+        # 分割训练集和测试集
+        train_dataset, test_dataset, train_size_estimate, test_size_estimate = self._split_train_test(
+            cache_filename, tokenizer, use_stream, num_proc
         )
 
-        # 分割训练集和测试集
-        if use_stream:
-            # 当样本数很少（≤batch_size）时，让所有样本同时用于训练和测试
-            if self.args.num_samples <= self.args.batch_size:
-                if self.accelerator.is_local_main_process:
-                    print(f"流式模式: 样本数({self.args.num_samples}) ≤ batch_size({self.args.batch_size})")
-                    print(f"        所有样本将同时用于训练和测试")
-
-                # 训练集和测试集都使用完整数据
-                train_dataset = full_dataset
-                test_dataset = full_dataset
-                train_size_estimate = self.args.num_samples
-                test_size_estimate = self.args.num_samples
-            else:
-                # 正常分割逻辑
-                split_ratio = 1 - self.args.test_split
-                train_size = int(self.args.num_samples * split_ratio)
-                test_size = self.args.num_samples - train_size
-
-                if self.accelerator.is_local_main_process:
-                    print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
-
-                # 流式模式：使用skip+take进行数据分割
-                # train_dataset: 从头开始读取train_size个样本
-                train_dataset = FlowDataset(
-                    data_file=cache_filename,
-                    tokenizer=tokenizer,
-                    max_dim=self.args.max_dim,
-                    max_expr_length=self.args.max_expr_length,
-                    stream=True,
-                    num_proc=num_proc,
-                    logger=self.logger,
-                    skip=0,          # 不跳过任何样本
-                    take=train_size  # 读取train_size个样本
-                )
-                # test_dataset: 跳过前train_size个样本，读取test_size个样本
-                test_dataset = FlowDataset(
-                    data_file=cache_filename,
-                    tokenizer=tokenizer,
-                    max_dim=self.args.max_dim,
-                    max_expr_length=self.args.max_expr_length,
-                    stream=True,
-                    num_proc=num_proc,
-                    logger=self.logger,
-                    skip=train_size,  # 跳过训练集样本
-                    take=test_size    # 读取test_size个样本
-                )
-                train_size_estimate = train_size
-                test_size_estimate = test_size
-        else:
-            total_size = len(full_dataset)
-            train_size = int(total_size * (1 - self.args.test_split))
-
-            from torch.utils.data import Subset
-            indices = list(range(total_size))
-            np.random.shuffle(indices)
-
-            train_indices = indices[:train_size]
-            test_indices = indices[train_size:]
-
-            # 当样本数很少（≤batch_size）时，让所有样本同时用于训练和测试
-            if total_size <= self.args.batch_size:
-                if self.accelerator.is_local_main_process:
-                    print(f"非流式模式: 样本数({total_size}) ≤ batch_size({self.args.batch_size})")
-                    print(f"         所有样本将同时用于训练和测试")
-                train_dataset = full_dataset
-                test_dataset = full_dataset
-                train_size_estimate = total_size
-                test_size_estimate = total_size
-            else:
-                train_dataset = Subset(full_dataset, train_indices)
-                test_dataset = Subset(full_dataset, test_indices)
-                train_size_estimate = len(train_indices)
-                test_size_estimate = len(test_indices)
-
-            if self.accelerator.is_local_main_process:
-                print(f"非流式模式: 训练集 {train_size_estimate} 样本, 测试集 {test_size_estimate} 样本")
-
         # 创建DataLoader
+        train_dataloader, test_dataloader = self._create_dataloaders(
+            train_dataset, test_dataset
+        )
+
+        # 准备分布式训练
+        if self.accelerator.is_local_main_process:
+            print(f"正在准备分布式训练 (accelerator.prepare)...")
+
+        train_dataloader, test_dataloader = self.accelerator.prepare(
+            train_dataloader, test_dataloader
+        )
+
+        if self.accelerator.is_local_main_process:
+            is_stream_mode = getattr(train_dataset, 'stream', False)
+            train_shuffle = not is_stream_mode
+            num_workers = 0 if is_stream_mode else self.accelerator.num_processes
+            expected_train_batches = train_size_estimate // self.args.batch_size
+            expected_test_batches = test_size_estimate // self.args.batch_size
+
+            print(f"✓ 分布式训练准备完成")
+            print(f"数据准备完成: 训练集约 {train_size_estimate} 样本, 测试集约 {test_size_estimate} 样本")
+
+            self.logger.log(
+                "DATALOADER_VERIFY",
+                f"DataLoader创建完成 | 预期训练批次数={expected_train_batches} | "
+                f"预期测试批次数={expected_test_batches} | "
+                f"num_workers={num_workers} | is_stream_mode={is_stream_mode} | "
+                f"train_shuffle={train_shuffle} | "
+                f"支持set_epoch={hasattr(train_dataset, 'set_epoch')}",
+                "data_loading",
+                level=1
+            )
+
+        return train_dataloader, train_dataset, test_dataloader, test_dataset
+
+    def _split_train_test(self, cache_filename, tokenizer, use_stream, num_proc):
+        """分割训练集和测试集"""
+        # 当样本数很少时，让所有样本同时用于训练和测试
+        if self.args.num_samples <= self.args.batch_size:
+            return self._create_full_datasets(cache_filename, tokenizer, use_stream, num_proc)
+
+        # 正常分割逻辑
+        if use_stream:
+            return self._split_stream_mode(cache_filename, tokenizer, num_proc)
+        else:
+            return self._split_nonstream_mode(cache_filename, tokenizer, num_proc)
+
+    def _create_full_datasets(self, cache_filename, tokenizer, use_stream, num_proc):
+        """样本数很少时，创建完整的训练集和测试集"""
+        if self.accelerator.is_local_main_process:
+            mode_str = "流式" if use_stream else "非流式"
+            print(f"{mode_str}模式: 样本数({self.args.num_samples}) ≤ batch_size({self.args.batch_size})")
+            print(f"        所有样本将同时用于训练和测试")
+
+        full_dataset = FlowDataset(
+            data_file=cache_filename, tokenizer=tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
+            stream=use_stream, num_proc=num_proc, logger=self.logger
+        )
+        return full_dataset, full_dataset, self.args.num_samples, self.args.num_samples
+
+    def _split_stream_mode(self, cache_filename, tokenizer, num_proc):
+        """流式模式下的数据分割"""
+        split_ratio = 1 - self.args.test_split
+        train_size = int(self.args.num_samples * split_ratio)
+        test_size = self.args.num_samples - train_size
+
+        if self.accelerator.is_local_main_process:
+            print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
+
+        train_dataset = FlowDataset(
+            data_file=cache_filename, tokenizer=tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
+            stream=True, num_proc=num_proc, logger=self.logger,
+            skip=0, take=train_size
+        )
+        test_dataset = FlowDataset(
+            data_file=cache_filename, tokenizer=tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
+            stream=True, num_proc=num_proc, logger=self.logger,
+            skip=train_size, take=test_size
+        )
+        return train_dataset, test_dataset, train_size, test_size
+
+    def _split_nonstream_mode(self, cache_filename, tokenizer, num_proc):
+        """非流式模式下的数据分割"""
+        full_dataset = FlowDataset(
+            data_file=cache_filename, tokenizer=tokenizer,
+            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
+            stream=False, num_proc=num_proc, logger=self.logger
+        )
+
+        total_size = len(full_dataset)
+        train_size = int(total_size * (1 - self.args.test_split))
+
+        from torch.utils.data import Subset
+        indices = list(range(total_size))
+        np.random.shuffle(indices)
+
+        train_indices = indices[:train_size]
+        test_indices = indices[train_size:]
+
+        if self.accelerator.is_local_main_process:
+            print(f"非流式模式: 训练集 {len(train_indices)} 样本, 测试集 {len(test_indices)} 样本")
+
+        train_dataset = Subset(full_dataset, train_indices)
+        test_dataset = Subset(full_dataset, test_indices)
+        return train_dataset, test_dataset, len(train_indices), len(test_indices)
+
+    def _create_dataloaders(self, train_dataset, test_dataset):
+        """创建训练和测试DataLoader"""
         is_stream_mode = getattr(train_dataset, 'stream', False)
         train_size = len(train_dataset)
         test_size = len(test_dataset)
@@ -307,62 +326,27 @@ class EditFlowManager:
         train_shuffle = not is_stream_mode
         num_workers = 0 if is_stream_mode else self.accelerator.num_processes
 
+        if self.accelerator.is_local_main_process:
+            print(f"正在创建 DataLoader (batch_size={self.args.batch_size}, num_workers={num_workers}, shuffle={train_shuffle})...")
+
         train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=train_shuffle,
-            num_workers=num_workers,
-            collate_fn=custom_collate_fn,
-            drop_last=train_drop_last,
-            pin_memory=True
+            train_dataset, batch_size=self.args.batch_size, shuffle=train_shuffle,
+            num_workers=num_workers, collate_fn=custom_collate_fn,
+            drop_last=train_drop_last, pin_memory=True
         )
 
         test_dataloader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=custom_collate_fn,
-            drop_last=test_drop_last
-        )
-
-        # 准备 DataLoader 用于分布式训练
-        # 对于 IterableDataset（stream mode），accelerate 会自动分片到多个进程
-        # 如果希望每个进程看到完整数据集，请使用 --dataset_stream=False（非流式模式）
-        train_dataloader, test_dataloader = self.accelerator.prepare(
-            train_dataloader, test_dataloader
+            test_dataset, batch_size=self.args.batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=custom_collate_fn, drop_last=test_drop_last
         )
 
         if self.accelerator.is_local_main_process:
-            print(f"数据准备完成: 训练集约 {train_size_estimate} 样本, 测试集约 {test_size_estimate} 样本")
+            print(f"✓ DataLoader 创建完成")
 
-            # 验证DataLoader的batch数量
-            expected_train_batches = train_size_estimate // self.args.batch_size
-            expected_test_batches = test_size_estimate // self.args.batch_size
-
-            self.logger.log(
-                "DATALOADER_VERIFY",
-                f"DataLoader创建完成 | 预期训练批次数={expected_train_batches} | "
-                f"预期测试批次数={expected_test_batches} | "
-                f"num_workers={num_workers} | is_stream_mode={is_stream_mode} | "
-                f"train_shuffle={train_shuffle} | "
-                f"支持set_epoch={hasattr(train_dataset, 'set_epoch')}",
-                "data_loading",
-                level=1
-            )
-
-        return train_dataloader, train_dataset, test_dataloader, test_dataset
+        return train_dataloader, test_dataloader
 
     def setup_models(self, checkpoint_path=None):
-        """
-        初始化模型和tokenizer，支持从检查点加载
-
-        Args:
-            checkpoint_path: 检查点文件路径，如果为None则创建新模型
-
-        Returns:
-            model, condition_encoder, criterion, optimizer, scheduler, tokenizer
-        """
+        """初始化模型和tokenizer，支持从检查点加载"""
         if self.accelerator.is_local_main_process:
             print("初始化tokenizer和模型...")
 
@@ -421,11 +405,7 @@ class EditFlowManager:
 
         # 添加学习率调度器（余弦退火）
         from torch.optim.lr_scheduler import CosineAnnealingLR
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=self.args.num_epochs,
-            eta_min=1e-6
-        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.args.num_epochs, eta_min=1e-6)
 
         # 加载检查点
         load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer, verbose=self.accelerator.is_local_main_process)
@@ -437,9 +417,7 @@ class EditFlowManager:
             print(f"  设备: {self.accelerator.device}")
             print(f"  混合精度: {self.accelerator.mixed_precision}")
 
-        model, condition_encoder, optimizer = self.accelerator.prepare(
-            model, condition_encoder, optimizer
-        )
+        model, condition_encoder, optimizer = self.accelerator.prepare(model, condition_encoder, optimizer)
 
         # 如果有checkpoint，使用Accelerate的load_state方法加载完整状态
         if checkpoint_path:
@@ -457,39 +435,34 @@ class EditFlowManager:
 
   
     def forward_pass(self, model, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
-        """
-        修改后的前向传播：移除中间状态插值，直接预测从z0到z1的编辑操作
-        这将模型从"连续流匹配"转变为"迭代优化"架构
-        """
+        """前向传播：直接预测从z0到z1的编辑操作"""
         batch_size = z0_token_ids.size(0)
         vocab_size = self.tokenizer.vocab_size
         batch_size, seq_len = z0_token_ids.shape
 
-        # 记录输入debug信息
-        self._log_forward_debug_input(debug_info, z0_token_ids, z1_token_ids, condition_embeddings, 0)
-
         # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
-        x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(
-            z0_token_ids, self.tokenizer
-        )
-
-        # 记录x_t debug信息
-        self._log_forward_debug_xt(debug_info, x_t)
-
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(z0_token_ids, self.tokenizer)
         attention_mask = (~x_pad_mask).float()
 
-        # 记录attention_mask debug信息
-        self._log_forward_debug_attention_mask(debug_info, attention_mask)
-
         # 调用模型
-        output = model(
-            input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask
-        )
-
+        output = model(input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask)
         pred_rates = output['rates_logits']
 
-        # 记录输出debug信息
-        self._log_forward_debug_output(debug_info, pred_rates, output, x_t)
+        # 记录debug信息（使用Logger的通用函数）
+        if debug_info:
+            debug_info['sample_idx'] = 0
+            self.logger.log_forward_debug(
+                debug_info,
+                self.tokenizer,
+                z0_token_ids=z0_token_ids,
+                z1_token_ids=z1_token_ids,
+                condition_embeddings=condition_embeddings,
+                x_t=x_t,
+                attention_mask=attention_mask,
+                pred_rates=pred_rates,
+                insert_logits=output['insert_logits'],
+                substitute_logits=output['substitute_logits']
+            )
 
         return {
             'pred_rates': pred_rates,
@@ -503,98 +476,6 @@ class EditFlowManager:
             'attention_mask': attention_mask,
             'vocab_size': vocab_size,
         }
-
-    def _log_forward_debug_input(self, debug_info, z0_token_ids, z1_token_ids, condition_embeddings, sample_idx):
-        """记录前向传播输入的debug信息"""
-        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
-            return
-
-        context = debug_info.get('context', '')
-        batch_idx = debug_info.get('batch_idx', 0)
-
-        self.logger.tensor_values(f"z0_token_ids_batch{batch_idx}", z0_token_ids[sample_idx],
-                                 context=context, level=2, max_elements=50)
-        self.logger.tensor_values(f"z1_token_ids_batch{batch_idx}", z1_token_ids[sample_idx],
-                                 context=context, level=2, max_elements=50)
-        self.logger.tensor_values(f"condition_embeddings_batch{batch_idx}", condition_embeddings[sample_idx],
-                                 context=context, level=2, max_elements=100)
-
-    def _log_forward_debug_xt(self, debug_info, x_t):
-        """记录x_t的debug信息"""
-        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
-            return
-
-        context = debug_info.get('context', '')
-        batch_idx = debug_info.get('batch_idx', 0)
-        self.logger.tensor_values(f"x_t_batch{batch_idx}", x_t[0],
-                                 context=context, level=2, max_elements=50)
-
-    def _log_forward_debug_attention_mask(self, debug_info, attention_mask):
-        """记录attention_mask的debug信息"""
-        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
-            return
-
-        context = debug_info.get('context', '')
-        batch_idx = debug_info.get('batch_idx', 0)
-        self.logger.tensor_values(f"attention_mask_batch{batch_idx}", attention_mask[0],
-                                 context=context, level=2, max_elements=50)
-
-    def _log_forward_debug_output(self, debug_info, pred_rates, output, x_t):
-        """记录前向传播输出的debug信息"""
-        if not (debug_info and self.accelerator.is_local_main_process and self.debug_mode):
-            return
-
-        context = debug_info.get('context', '')
-        batch_idx = debug_info.get('batch_idx', 0)
-        sample_idx = 0
-
-        self.logger.tensor_values(f"pred_rates_batch{batch_idx}", pred_rates[sample_idx],
-                                 context=context, level=2, max_elements=100)
-        self.logger.tensor_values(f"insert_logits_batch{batch_idx}", output['insert_logits'][sample_idx],
-                                 context=context, level=2, max_elements=100)
-        self.logger.tensor_values(f"substitute_logits_batch{batch_idx}", output['substitute_logits'][sample_idx],
-                                 context=context, level=2, max_elements=100)
-
-        # 记录SUBSTITUTE操作的候选token（前5个位置）
-        rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
-        substitute_logits = output['substitute_logits'][sample_idx]
-        x_t_sample = x_t[sample_idx]
-
-        for pos in range(min(5, x_t_sample.shape[0])):
-            if x_t_sample[pos].item() == self.tokenizer.pad_token_id:
-                break
-
-            lambda_sub = rates_probs[pos, 2].item()
-            if lambda_sub > 0.01:  # 只记录有意义的替换概率
-                self.logger.log_training_substitute_candidates(
-                    batch_idx=batch_idx,
-                    sample_idx=sample_idx,
-                    position=pos,
-                    x_t_value=x_t_sample[pos].item(),
-                    lambda_sub=lambda_sub,
-                    substitute_logits=substitute_logits[pos],
-                    tokenizer=self.tokenizer,
-                    top_k=5,
-                    context=context,
-                    level=2
-                )
-
-        # 记录INSERT操作的候选token（前3个位置）
-        insert_logits = output['insert_logits'][sample_idx]
-        for pos in range(min(3, insert_logits.shape[0])):
-            lambda_ins = rates_probs[pos, 0].item()
-            if lambda_ins > 0.01:  # 只记录有意义的插入概率
-                self.logger.log_training_insert_candidates(
-                    batch_idx=batch_idx,
-                    sample_idx=sample_idx,
-                    position=pos,
-                    lambda_ins=lambda_ins,
-                    insert_logits=insert_logits[pos],
-                    tokenizer=self.tokenizer,
-                    top_k=5,
-                    context=context,
-                    level=2
-                )
 
     def compute_loss(self, forward_results, criterion, debug_info=None):
         pred_rates = forward_results['pred_rates']
@@ -612,7 +493,7 @@ class EditFlowManager:
         sub_logits_rate = pred_rates[:, :, 2:3]
         keep_logits_rate = pred_rates[:, :, 3:4]
 
-        # 在logit空间相加：log P(operation AND token) = log P(operation) + log P(token|operation)
+        # 在logit空间相加
         ins_logits = forward_results['pred_ins_logits'] + ins_logits_rate
         sub_logits = forward_results['pred_sub_logits'] + sub_logits_rate
         del_logits = del_logits_rate
@@ -628,122 +509,9 @@ class EditFlowManager:
         u_mask_x = criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, self.tokenizer, x_t)
         u_mask = fill_gap_tokens_with_repeats(u_mask_x, z_gap_mask, z_pad_mask)
 
-        # 记录debug信息
+        # 记录debug信息（使用Logger的方法）
         if self.accelerator.is_local_main_process and self.debug_mode:
-            context = debug_info.get('context', '') if debug_info else ''
-            batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
-            sample_idx = 0
-
-            self.logger.tensor_values(f"GT_z0_batch{batch_idx}", z0[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"GT_z1_batch{batch_idx}", z1_token_ids[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"GT_x_t_batch{batch_idx}", x_t[sample_idx],
-                                     context=context, level=2, max_elements=50)
-
-            import torch.nn.functional as F
-            rates_probs = F.softmax(pred_rates, dim=-1)
-            lambda_ins = rates_probs[:, :, 0:1]
-            lambda_del = rates_probs[:, :, 1:2]
-            lambda_sub = rates_probs[:, :, 2:3]
-
-            self.logger.tensor_values(f"pred_lambda_ins_batch{batch_idx}", lambda_ins[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"pred_lambda_del_batch{batch_idx}", lambda_del[sample_idx],
-                                     context=context, level=2, max_elements=50)
-            self.logger.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx],
-                                     context=context, level=2, max_elements=50)
-
-            # 记录每个位置的操作概率分布（前10个位置）
-            for pos in range(min(10, x_t.shape[1])):
-                if x_t[sample_idx, pos].item() == self.tokenizer.pad_token_id:
-                    break
-
-                lambda_ins_val = lambda_ins[sample_idx, pos, 0].item()
-                lambda_del_val = lambda_del[sample_idx, pos, 0].item()
-                lambda_sub_val = lambda_sub[sample_idx, pos, 0].item()
-                lambda_keep_val = rates_probs[sample_idx, pos, 3].item()
-
-                self.logger.log_training_action_probabilities(
-                    batch_idx=batch_idx,
-                    sample_idx=sample_idx,
-                    position=pos,
-                    x_t_value=x_t[sample_idx, pos].item(),
-                    lambda_ins=lambda_ins_val,
-                    lambda_del=lambda_del_val,
-                    lambda_sub=lambda_sub_val,
-                    lambda_keep=lambda_keep_val,
-                    context=context,
-                    level=2
-                )
-
-            self.logger.log_u_mask_split(f"GT_u_mask", u_mask_x[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
-                                        effective_vocab_size, context=context, level=2)
-
-            self.logger.log_edit_operations(
-                u_mask_x[sample_idx],
-                x_t[sample_idx],
-                effective_vocab_size,
-                context=context,
-                level=2,
-                max_ops=20,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-
-            # 对比预测 vs Ground Truth（前10个位置）
-            pred_ops_ids = u_cat_x[sample_idx].argmax(dim=-1)  # [x_seq_len]
-
-            for pos in range(min(10, x_t.shape[1])):
-                if x_t[sample_idx, pos].item() == self.tokenizer.pad_token_id:
-                    break
-
-                # 解码Ground Truth操作
-                gt_op_id = u_mask_x[sample_idx, pos].argmax().item()
-                vocab_size = effective_vocab_size
-
-                if gt_op_id < vocab_size:
-                    gt_token = self.tokenizer.convert_ids_to_tokens([gt_op_id])[0]
-                    gt_op = f"INSERT(token_id={gt_op_id}→{gt_token})"
-                elif gt_op_id == vocab_size:
-                    gt_op = "DELETE"
-                elif gt_op_id < 2 * vocab_size + 1:
-                    sub_token_id = gt_op_id - vocab_size - 1
-                    sub_token = self.tokenizer.convert_ids_to_tokens([sub_token_id])[0]
-                    gt_op = f"SUBSTITUTE(token_id={sub_token_id}→{sub_token})"
-                else:
-                    gt_op = "KEEP"
-
-                # 解码预测操作
-                pred_op_id = pred_ops_ids[pos].item()
-
-                if pred_op_id < vocab_size:
-                    pred_token = self.tokenizer.convert_ids_to_tokens([pred_op_id])[0]
-                    pred_op = f"INSERT(token_id={pred_op_id}→{pred_token})"
-                elif pred_op_id == vocab_size:
-                    pred_op = "DELETE"
-                elif pred_op_id < 2 * vocab_size + 1:
-                    sub_token_id = pred_op_id - vocab_size - 1
-                    sub_token = self.tokenizer.convert_ids_to_tokens([sub_token_id])[0]
-                    pred_op = f"SUBSTITUTE(token_id={sub_token_id}→{sub_token})"
-                else:
-                    pred_op = "KEEP"
-
-                is_match = (gt_op_id == pred_op_id)
-
-                self.logger.log_training_pred_vs_gt(
-                    batch_idx=batch_idx,
-                    sample_idx=sample_idx,
-                    position=pos,
-                    x_t_value=x_t[sample_idx, pos].item(),
-                    gt_operation=gt_op,
-                    pred_operation=pred_op,
-                    is_match=is_match,
-                    context=context,
-                    level=2
-                )
-
-            self.logger.tensor_values(f"pred_u_cat_x_batch{batch_idx}_first5pos", u_cat_x[sample_idx, :5, :],
-                                     context=context, level=2, max_elements=100)
+            self.logger.log_compute_loss_debug(debug_info, z0, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, effective_vocab_size, self.tokenizer)
 
         loss = criterion(u_cat_x, u_z, u_mask, effective_vocab_size,
                         accelerator=self.accelerator, logger=self.logger)
@@ -755,7 +523,6 @@ class EditFlowManager:
         condition_encoder.train()
 
         # 关键修复：对于流式数据集，在每个 epoch 开始时调用 set_epoch
-        # 这会重置迭代器并使用新的随机种子重新洗牌数据
         if hasattr(dataset, 'set_epoch'):
             dataset.set_epoch(epoch)
             if self.accelerator.is_local_main_process:
@@ -768,11 +535,7 @@ class EditFlowManager:
 
         total_loss = 0.0
         num_batches = 0
-        local_total_grad_norm = 0.0  # 累积本进程的梯度范数，用于跨进程GPU信息汇总
-
-        # 数据验证：在第一个 epoch 开始时验证数据能正确加载
-        # 注意：不在 epoch=0 时立即验证，而是在第一个 batch 加载时验证
-        # 这样可以避免 IterableDataset 初始化时序问题
+        local_total_grad_norm = 0.0
 
         # 计算数据集信息
         dataset_size = len(dataset)
@@ -809,126 +572,28 @@ class EditFlowManager:
                     level=1
                 )
 
-            if self.accelerator.is_local_main_process and self.debug_mode:
-                self.logger.log("BATCH_START", f"开始处理 Batch {batch_idx} | timestamp={time.time():.2f}",
-                                f"维度{dimension}_batch{batch_idx}", level=2)
+            loss, grad_norm = self._process_batch(
+                model, condition_encoder, criterion, optimizer, batch, batch_idx, epoch, dimension
+            )
 
-            with self.accelerator.accumulate([model, condition_encoder]):
-                data_load_start = time.time()
-                x_values = batch['x_values'].to(self.device)
-                y_target = batch['y_target'].to(self.device)
-                z0_token_ids = batch['z0_token_ids'].to(self.device)
-                z1_token_ids = batch['z1_token_ids'].to(self.device)
-                point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
+            total_loss += loss
+            num_batches += 1
+            local_total_grad_norm += grad_norm
 
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    data_load_time = time.time() - data_load_start
-                    self.logger.log("DATA_LOAD", f"数据加载完成 | 耗时={data_load_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
+            batch_total_time = time.time() - batch_start_time
 
-                # 编码条件
-                condition_start = time.time()
-                condition_embeddings = condition_encoder(x_values, y_target, point_mask)
-                condition_time = time.time() - condition_start
-
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("CONDITION_ENCODE", f"条件编码完成 | 耗时={condition_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
-                    context = f'维度{dimension}'
-                    self.logger.tensor_values(f"x_values_batch{batch_idx}", x_values[0],
-                                             context=context, level=2, max_elements=50)
-                    self.logger.tensor_values(f"y_target_batch{batch_idx}", y_target[0],
-                                             context=context, level=2, max_elements=50)
-
-                debug_info = {
-                    'batch_idx': batch_idx,
-                    'context': f'维度{dimension}'
+            # 更新进度条
+            if self.accelerator.is_local_main_process:
+                postfix_dict = {
+                    'loss': f'{loss:.4f}',
+                    'grad_norm': f'{grad_norm:.3f}',
+                    'time': f'{batch_total_time:.2f}s' if self.debug_mode else ''
                 }
+                progress_bar.set_postfix(postfix_dict)
 
-                # 前向传播
-                forward_start = time.time()
-                forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
-                forward_time = time.time() - forward_start
-
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("FORWARD_PASS", f"前向传播完成 | 耗时={forward_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
-
-                # NaN检查
-                nan_check_start = time.time()
-                if self.accelerator.distributed_type != "NO":
-                    pred_rates = forward_results['pred_rates']
-                    local_has_nan = torch.isnan(pred_rates).any().float()
-                    gathered_nan_results = self.accelerator.gather(local_has_nan)
-                    global_has_nan = gathered_nan_results.sum()
-
-                    if global_has_nan.item() > 0:
-                        if self.accelerator.is_local_main_process:
-                            self.logger.error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN", f"batch_idx:{batch_idx}")
-                nan_check_time = time.time() - nan_check_start
-
-                # 计算损失
-                loss_compute_start = time.time()
-                loss = self.compute_loss(forward_results, criterion, debug_info)
-                loss_compute_time = time.time() - loss_compute_start
-
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f} | 耗时={loss_compute_time:.3f}s | NaN检查耗时={nan_check_time:.3f}s",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
-
-                # 反向传播
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("BACKWARD_START", f"开始反向传播 | loss={loss.item():.6f} | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
-
-                backward_start = time.time()
-                try:
-                    self.accelerator.backward(loss)
-                    backward_time = time.time() - backward_start
-                    if self.accelerator.is_local_main_process and self.debug_mode:
-                        self.logger.log("BACKWARD_SUCCESS", f"反向传播成功 | 耗时={backward_time:.3f}s",
-                                        f"维度{dimension}_batch{batch_idx}", level=2)
-                except Exception as e:
-                    self.logger.log_crash(
-                        step_name="BACKWARD",
-                        batch_idx=batch_idx,
-                        dimension=dimension,
-                        error=e,
-                        extra_info=f"loss={loss.item():.6f}"
-                    )
-                    raise
-
-                # 梯度裁剪和优化器更新
-                all_params = list(model.parameters()) + list(condition_encoder.parameters())
-                self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
-
-                grad_norm = 0.0
-                for param in all_params:
-                    if param.grad is not None:
-                        grad_norm += float(param.grad.data.norm().item() ** 2)
-                grad_norm = float(grad_norm ** 0.5)
-
-                optimizer.step()
-                optimizer.zero_grad()
-
-                total_loss += loss.item()
-                num_batches += 1
-                local_total_grad_norm += grad_norm  # 累积梯度范数
-
-                batch_total_time = time.time() - batch_start_time
-
-                # 更新进度条
-                if self.accelerator.is_local_main_process:
-                    postfix_dict = {
-                        'loss': f'{loss.item():.4f}',
-                        'grad_norm': f'{grad_norm:.3f}' if isinstance(grad_norm, (int, float)) else f'{grad_norm:.3f}',
-                        'time': f'{batch_total_time:.2f}s' if self.debug_mode else ''
-                    }
-                    progress_bar.set_postfix(postfix_dict)
-
-                if self.accelerator.is_local_main_process and self.debug_mode:
-                    self.logger.log("BATCH_COMPLETE", f"Batch {batch_idx} 完成 | 总耗时={batch_total_time:.3f}s | timestamp={time.time():.2f}",
-                                    f"维度{dimension}_batch{batch_idx}", level=2)
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("BATCH_COMPLETE", f"Batch {batch_idx} 完成 | 总耗时={batch_total_time:.3f}s | timestamp={time.time():.2f}",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
 
         # 跨进程收集并计算平均损失
         avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
@@ -1006,6 +671,105 @@ class EditFlowManager:
 
         # 返回平均损失、批次数、总损失和总梯度范数（用于GPU级别信息汇总）
         return avg_loss, num_batches, total_loss, local_total_grad_norm
+
+    def _process_batch(self, model, condition_encoder, criterion, optimizer, batch, batch_idx, epoch, dimension):
+        """处理单个训练batch"""
+        if self.accelerator.is_local_main_process and self.debug_mode:
+            self.logger.log("BATCH_START", f"开始处理 Batch {batch_idx} | timestamp={time.time():.2f}",
+                            f"维度{dimension}_batch{batch_idx}", level=2)
+
+        with self.accelerator.accumulate([model, condition_encoder]):
+            data_load_start = time.time()
+            x_values = batch['x_values'].to(self.device)
+            y_target = batch['y_target'].to(self.device)
+            z0_token_ids = batch['z0_token_ids'].to(self.device)
+            z1_token_ids = batch['z1_token_ids'].to(self.device)
+            point_mask = batch['point_mask'].to(self.device) if 'point_mask' in batch else None
+
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("DATA_LOAD", f"数据加载完成 | 耗时={time.time() - data_load_start:.3f}s",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+
+            # 编码条件
+            condition_start = time.time()
+            condition_embeddings = condition_encoder(x_values, y_target, point_mask)
+            condition_time = time.time() - condition_start
+
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("CONDITION_ENCODE", f"条件编码完成 | 耗时={condition_time:.3f}s",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+                context = f'维度{dimension}'
+                self.logger.tensor_values(f"x_values_batch{batch_idx}", x_values[0],
+                                         context=context, level=2, max_elements=50)
+                self.logger.tensor_values(f"y_target_batch{batch_idx}", y_target[0],
+                                         context=context, level=2, max_elements=50)
+
+            debug_info = {'batch_idx': batch_idx, 'context': f'维度{dimension}'}
+
+            # 前向传播
+            forward_start = time.time()
+            forward_results = self.forward_pass(model, condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
+            forward_time = time.time() - forward_start
+
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("FORWARD_PASS", f"前向传播完成 | 耗时={forward_time:.3f}s",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+
+            # NaN检查
+            nan_check_start = time.time()
+            if self.accelerator.distributed_type != "NO":
+                pred_rates = forward_results['pred_rates']
+                local_has_nan = torch.isnan(pred_rates).any().float()
+                gathered_nan_results = self.accelerator.gather(local_has_nan)
+                global_has_nan = gathered_nan_results.sum()
+
+                if global_has_nan.item() > 0:
+                    self.logger.error("FORWARD_NAN", f"维度{dimension} 检测到前向传播NaN", f"batch_idx:{batch_idx}")
+
+            nan_check_time = time.time() - nan_check_start
+
+            # 计算损失
+            loss_compute_start = time.time()
+            loss = self.compute_loss(forward_results, criterion, debug_info)
+            loss_compute_time = time.time() - loss_compute_start
+
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f} | 耗时={loss_compute_time:.3f}s | NaN检查耗时={nan_check_time:.3f}s",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+
+            # 反向传播
+            if self.accelerator.is_local_main_process and self.debug_mode:
+                self.logger.log("BACKWARD_START", f"开始反向传播 | loss={loss.item():.6f} | timestamp={time.time():.2f}",
+                                f"维度{dimension}_batch{batch_idx}", level=2)
+
+            backward_start = time.time()
+            try:
+                self.accelerator.backward(loss)
+                backward_time = time.time() - backward_start
+                if self.accelerator.is_local_main_process and self.debug_mode:
+                    self.logger.log("BACKWARD_SUCCESS", f"反向传播成功 | 耗时={backward_time:.3f}s",
+                                    f"维度{dimension}_batch{batch_idx}", level=2)
+            except Exception as e:
+                self.logger.log_crash(
+                    step_name="BACKWARD", batch_idx=batch_idx, dimension=dimension,
+                    error=e, extra_info=f"loss={loss.item():.6f}"
+                )
+                raise
+
+            # 梯度裁剪和优化器更新
+            all_params = list(model.parameters()) + list(condition_encoder.parameters())
+            self.accelerator.clip_grad_norm_(all_params, self.GRADIENT_CLIP_NORM)
+
+            grad_norm = 0.0
+            for param in all_params:
+                if param.grad is not None:
+                    grad_norm += float(param.grad.data.norm().item() ** 2)
+            grad_norm = float(grad_norm ** 0.5)
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            return loss.item(), grad_norm
 
     def evaluate(self, model, condition_encoder, criterion, test_dataloader, test_dataset):
         """测试集评估"""
@@ -1137,8 +901,6 @@ class EditFlowManager:
             if self.accelerator.num_processes > 1:
                 train_dataset_size = len(train_dataset)
                 test_dataset_size = len(test_dataset)
-
-                # 计算每个进程预期处理的样本数和批次数
                 samples_per_process = train_dataset_size // self.accelerator.num_processes
                 batches_per_process = samples_per_process // self.args.batch_size
                 total_batches_all_processes = batches_per_process * self.accelerator.num_processes
@@ -1285,87 +1047,11 @@ class EditFlowManager:
             success, y_pred = evaluate_expression_safe(initial_expr, x_data)
             if not success:
                 self.logger.log("INITIAL_EXPR_WARN", "无法计算初始表达式的预测值，使用零初始化", "inference", level=3)
+                y_pred = [0.0] * y_data_len
         else:
             y_pred = [0.0] * y_data_len
 
         return initial_expr, current_tokens, y_pred
-
-    def _encode_condition_and_log(self, condition_encoder, x_values, y_values, condition, initial_expr, current_tokens, residuals):
-        """编码条件并记录详细日志"""
-        self.logger.log("INITIAL_DATA",
-                       f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | "
-                       f"y_target: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
-                       f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] | "
-                       f"initial_expr: {initial_expr} | initial_tokens: {current_tokens}",
-                       "inference", level=3)
-        self.logger.log("ARCHITECTURE_INFO",
-                       "使用目标值y_target作为条件（架构改进：北极星模式）",
-                       "inference", level=3)
-        self.logger.log("INITIAL_CONDITION",
-                       f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}]",
-                       "inference", level=3)
-
-        # 打印条件嵌入的前10个维度
-        condition_cpu = condition.cpu().squeeze(0)
-        condition_values = condition_cpu.detach().numpy()
-        condition_preview = condition_values.flatten()[:10] if condition_values.ndim == 2 else condition_values[:10]
-        self.logger.log("INITIAL_CONDITION_VALUES",
-                       f"condition前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
-                       "inference", level=3)
-
-    def _create_searcher(self, model, condition_encoder, tokenizer, device, n_steps):
-        """创建搜索器"""
-        self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
-
-        searcher = SimpleSymbolicRegression(
-            model=model,
-            condition_encoder=condition_encoder,
-            tokenizer=tokenizer,
-            device=device,
-            args=self.args,
-            logger=self.logger,
-            min_action_score=self.MIN_ACTION_SCORE,
-            max_expression_length=self.MAX_EXPRESSION_LENGTH,
-            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
-        )
-
-        return searcher
-
-    def _run_single_threshold_search(self, searcher, current_tokens, condition, residuals_np, x_data, y_data, x_values, n_steps):
-        """执行单阈值搜索并返回结果"""
-        if self.accelerator.is_local_main_process:
-            print(f"\n执行单最佳操作推理...")
-
-        best_candidate = searcher.greedy_search(
-            initial_tokens=current_tokens,
-            initial_condition=condition,
-            initial_residuals=residuals_np,
-            x_data=x_data,
-            y_data=y_data,
-            x_values=x_values,
-            n_steps=n_steps
-        )
-
-        final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
-
-        if best_candidate and self.accelerator.is_local_main_process:
-            mse_score = best_candidate.mse_score
-            mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
-            self.logger.log("SIMPLE_SEARCH_RESULT",
-                           f"MSE分数: {mse_str} | "
-                           f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
-                           "inference", level=3)
-
-        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
-
-        return {
-            'final_expression': final_expression,
-            'initial_tokens': current_tokens,
-            'final_tokens': best_candidate.tokens if best_candidate else [],
-            'history': best_candidate.history if best_candidate else [],
-            'position_actions_history': best_candidate.position_actions_history if best_candidate else [],
-            'mse_score': best_candidate.mse_score if best_candidate else None
-        }
 
     # ============= 主推理方法 =============
     def symbolic_regression(self, model_path, x_data, y_data, n_steps=100, input_dim=None, max_expr_length=None, initial_expr=None):
@@ -1385,7 +1071,6 @@ class EditFlowManager:
                        "inference", level=3)
 
         model, condition_encoder, _, _, _, tokenizer = self._load_inference_model(model_path)
-
         device = self.device
         model.eval()
         condition_encoder.eval()
@@ -1409,18 +1094,65 @@ class EditFlowManager:
         point_mask = torch.ones_like(y_values)
         condition = condition_encoder(x_values, y_values, point_mask)
 
-        # 记录条件信息
-        self._encode_condition_and_log(condition_encoder, x_values, y_values, condition, initial_expr, current_tokens, residuals)
+        # 记录条件信息（内联_encode_condition_and_log的逻辑）
+        self.logger.log("INITIAL_DATA",
+                       f"x_values: shape={x_values.shape} range=[{x_values.min():.4f},{x_values.max():.4f}] | "
+                       f"y_target: shape={y_values.shape} range=[{y_values.min():.4f},{y_values.max():.4f}] | "
+                       f"residuals: shape={residuals.shape} range=[{residuals.min():.4f},{residuals.max():.4f}] | "
+                       f"initial_expr: {initial_expr} | initial_tokens: {current_tokens}",
+                       "inference", level=3)
+        self.logger.log("ARCHITECTURE_INFO",
+                       "使用目标值y_target作为条件（架构改进：北极星模式）",
+                       "inference", level=3)
 
-        # 创建搜索器
-        searcher = self._create_searcher(
-            model, condition_encoder, tokenizer, device, n_steps
+        # 打印条件嵌入的前10个维度
+        condition_cpu = condition.cpu().squeeze(0)
+        condition_values = condition_cpu.detach().numpy()
+        condition_preview = condition_values.flatten()[:10] if condition_values.ndim == 2 else condition_values[:10]
+        self.logger.log("INITIAL_CONDITION",
+                       f"condition: shape={condition.shape} range=[{condition.min():.4f},{condition.max():.4f}] | "
+                       f"前10维: [{', '.join([f'{float(v):.6f}' for v in condition_preview])}]",
+                       "inference", level=3)
+
+        # 创建搜索器（内联_create_searcher的逻辑）
+        self.logger.log("SIMPLE_SEARCH_INIT", f"初始化简单推理器 | n_steps={n_steps}", "inference", level=3)
+        searcher = SimpleSymbolicRegression(
+            model=model, condition_encoder=condition_encoder, tokenizer=tokenizer,
+            device=device, args=self.args, logger=self.logger,
+            min_action_score=self.MIN_ACTION_SCORE,
+            max_expression_length=self.MAX_EXPRESSION_LENGTH,
+            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
         )
 
-        # 执行推理
+        # 执行推理（内联_run_single_threshold_search的逻辑）
+        if self.accelerator.is_local_main_process:
+            print(f"\n执行单最佳操作推理...")
+
         residuals_np = residuals.cpu().squeeze(0).numpy()
-        return self._run_single_threshold_search(
-            searcher, current_tokens, condition, residuals_np,
-            x_data, y_data, x_values, n_steps
+        best_candidate = searcher.greedy_search(
+            initial_tokens=current_tokens, initial_condition=condition,
+            initial_residuals=residuals_np, x_data=x_data, y_data=y_data,
+            x_values=x_values, n_steps=n_steps
         )
+
+        final_expression = ','.join(best_candidate.tokens) if best_candidate and best_candidate.tokens else ""
+
+        if best_candidate and self.accelerator.is_local_main_process:
+            mse_score = best_candidate.mse_score
+            mse_str = f'{mse_score:.6f}' if mse_score is not None else 'N/A'
+            self.logger.log("SIMPLE_SEARCH_RESULT",
+                           f"MSE分数: {mse_str} | "
+                           f"操作历史: {' -> '.join(best_candidate.history[-5:]) if best_candidate.history else 'N/A'}",
+                           "inference", level=3)
+
+        self.logger.log("INFERENCE_COMPLETE", f"最终表达式: {final_expression}", "inference", level=3)
+
+        return {
+            'final_expression': final_expression,
+            'initial_tokens': current_tokens,
+            'final_tokens': best_candidate.tokens if best_candidate else [],
+            'history': best_candidate.history if best_candidate else [],
+            'position_actions_history': best_candidate.position_actions_history if best_candidate else [],
+            'mse_score': best_candidate.mse_score if best_candidate else None
+        }
 

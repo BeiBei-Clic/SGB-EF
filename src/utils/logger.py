@@ -896,6 +896,196 @@ class Logger:
             context, level=level
         )
 
+    # ==================== 前向传播日志 ====================
+
+    def log_forward_debug(self, debug_info, tokenizer, **tensors):
+        """通用的前向传播debug信息记录
+
+        Args:
+            debug_info (dict): 调试信息字典，包含'context', 'batch_idx', 'sample_idx'等
+            tokenizer: tokenizer对象，用于token转换
+            **tensors: 要记录的tensor字典，可包含：
+                - z0_token_ids: 起始token序列
+                - z1_token_ids: 目标token序列
+                - condition_embeddings: 条件嵌入
+                - x_t: 移除gap后的序列
+                - attention_mask: 注意力掩码
+                - pred_rates: 预测的操作概率
+                - insert_logits: 插入操作的logits
+                - substitute_logits: 替换操作的logits
+        """
+        if not self._should_log(2):
+            return
+
+        context = debug_info.get('context', '') if debug_info else ''
+        batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
+        sample_idx = debug_info.get('sample_idx', 0) if debug_info else 0
+
+        # 记录所有传入的tensor
+        for name, tensor in tensors.items():
+            if name in ['pred_rates', 'insert_logits', 'substitute_logits']:
+                continue  # 特殊处理
+            self.tensor_values(f"{name}_batch{batch_idx}", tensor[sample_idx],
+                             context=context, level=2, max_elements=100)
+
+        # 特殊处理：记录SUBSTITUTE和INSERT操作的候选token
+        if 'pred_rates' in tensors and 'insert_logits' in tensors and 'substitute_logits' in tensors and 'x_t' in tensors:
+            import torch.nn.functional as F
+            pred_rates = tensors['pred_rates']
+            insert_logits = tensors['insert_logits']
+            substitute_logits = tensors['substitute_logits']
+            x_t_sample = tensors['x_t'][sample_idx]
+            rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
+
+            # 记录SUBSTITUTE操作的候选token（前5个位置）
+            for pos in range(min(5, x_t_sample.shape[0])):
+                if x_t_sample[pos].item() == 0:  # pad token
+                    break
+                lambda_sub = rates_probs[pos, 2].item()
+                if lambda_sub > 0.01:
+                    self.log_training_substitute_candidates(
+                        batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
+                        x_t_value=x_t_sample[pos].item(), lambda_sub=lambda_sub,
+                        substitute_logits=substitute_logits[pos], tokenizer=tokenizer,
+                        top_k=5, context=context, level=2
+                    )
+
+            # 记录INSERT操作的候选token（前3个位置）
+            for pos in range(min(3, insert_logits.shape[0])):
+                lambda_ins = rates_probs[pos, 0].item()
+                if lambda_ins > 0.01:
+                    self.log_training_insert_candidates(
+                        batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
+                        lambda_ins=lambda_ins, insert_logits=insert_logits[pos],
+                        tokenizer=tokenizer, top_k=5, context=context, level=2
+                    )
+
+    def log_compute_loss_debug(self, debug_info, z0, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, vocab_size, tokenizer):
+        """记录compute_loss的debug信息
+
+        Args:
+            debug_info (dict): 调试信息字典，包含'context', 'batch_idx'等
+            z0: 起始token序列
+            z1_token_ids: 目标token序列
+            x_t: 移除gap后的序列
+            pred_rates: 预测的操作概率
+            u_cat_x: 拼接的操作logits
+            u_mask_x: 编辑操作掩码
+            vocab_size (int): 词汇表大小
+            tokenizer: tokenizer对象，用于token转换
+        """
+        if not self._should_log(2):
+            return
+
+        import torch.nn.functional as F
+
+        context = debug_info.get('context', '') if debug_info else ''
+        batch_idx = debug_info.get('batch_idx', 0) if debug_info else 0
+        sample_idx = 0
+
+        # 记录输入tensor
+        self.tensor_values(f"GT_z0_batch{batch_idx}", z0[sample_idx], context=context, level=2, max_elements=50)
+        self.tensor_values(f"GT_z1_batch{batch_idx}", z1_token_ids[sample_idx], context=context, level=2, max_elements=50)
+        self.tensor_values(f"GT_x_t_batch{batch_idx}", x_t[sample_idx], context=context, level=2, max_elements=50)
+
+        # 记录操作概率
+        rates_probs = F.softmax(pred_rates, dim=-1)
+        lambda_ins = rates_probs[:, :, 0:1]
+        lambda_del = rates_probs[:, :, 1:2]
+        lambda_sub = rates_probs[:, :, 2:3]
+
+        self.tensor_values(f"pred_lambda_ins_batch{batch_idx}", lambda_ins[sample_idx], context=context, level=2, max_elements=50)
+        self.tensor_values(f"pred_lambda_del_batch{batch_idx}", lambda_del[sample_idx], context=context, level=2, max_elements=50)
+        self.tensor_values(f"pred_lambda_sub_batch{batch_idx}", lambda_sub[sample_idx], context=context, level=2, max_elements=50)
+
+        # 记录操作概率分布（前10个位置）
+        for pos in range(min(10, x_t.shape[1])):
+            if x_t[sample_idx, pos].item() == 0:  # pad token
+                break
+
+            self.log_training_action_probabilities(
+                batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
+                x_t_value=x_t[sample_idx, pos].item(),
+                lambda_ins=lambda_ins[sample_idx, pos, 0].item(),
+                lambda_del=lambda_del[sample_idx, pos, 0].item(),
+                lambda_sub=lambda_sub[sample_idx, pos, 0].item(),
+                lambda_keep=rates_probs[sample_idx, pos, 3].item(),
+                context=context, level=2
+            )
+
+        self.log_u_mask_split(f"GT_u_mask", u_mask_x[sample_idx:sample_idx+1], x_t[sample_idx:sample_idx+1],
+                            vocab_size, context=context, level=2)
+
+        self.log_edit_operations(
+            u_mask_x[sample_idx], x_t[sample_idx], vocab_size,
+            context=context, level=2, max_ops=20, pad_token_id=tokenizer.pad_token_id
+        )
+
+        # 对比预测 vs Ground Truth
+        self.log_pred_vs_gt(sample_idx, batch_idx, context, x_t, u_cat_x, u_mask_x, vocab_size, tokenizer)
+
+        self.tensor_values(f"pred_u_cat_x_batch{batch_idx}_first5pos", u_cat_x[sample_idx, :5, :],
+                         context=context, level=2, max_elements=100)
+
+    def log_pred_vs_gt(self, sample_idx, batch_idx, context, x_t, u_cat_x, u_mask_x, vocab_size, tokenizer):
+        """记录预测与Ground Truth的对比
+
+        Args:
+            sample_idx (int): 样本索引
+            batch_idx (int): batch索引
+            context (str): 上下文标识
+            x_t: 移除gap后的序列
+            u_cat_x: 拼接的操作logits
+            u_mask_x: 编辑操作掩码
+            vocab_size (int): 词汇表大小
+            tokenizer: tokenizer对象，用于token转换
+        """
+        if not self._should_log(2):
+            return
+
+        pred_ops_ids = u_cat_x[sample_idx].argmax(dim=-1)
+
+        for pos in range(min(10, x_t.shape[1])):
+            if x_t[sample_idx, pos].item() == 0:  # pad token
+                break
+
+            gt_op_id = u_mask_x[sample_idx, pos].argmax().item()
+            pred_op_id = pred_ops_ids[pos].item()
+
+            gt_op = self.decode_operation(gt_op_id, vocab_size, tokenizer)
+            pred_op = self.decode_operation(pred_op_id, vocab_size, tokenizer)
+
+            self.log_training_pred_vs_gt(
+                batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
+                x_t_value=x_t[sample_idx, pos].item(),
+                gt_operation=gt_op, pred_operation=pred_op,
+                is_match=(gt_op_id == pred_op_id), context=context, level=2
+            )
+
+    @staticmethod
+    def decode_operation(op_id, vocab_size, tokenizer):
+        """解码操作ID为可读字符串（静态工具方法）
+
+        Args:
+            op_id (int): 操作ID
+            vocab_size (int): 词汇表大小
+            tokenizer: tokenizer对象，用于token转换
+
+        Returns:
+            str: 操作描述字符串，如 "INSERT(token_id=5→x1)"
+        """
+        if op_id < vocab_size:
+            token = tokenizer.convert_ids_to_tokens([op_id])[0]
+            return f"INSERT(token_id={op_id}→{token})"
+        elif op_id == vocab_size:
+            return "DELETE"
+        elif op_id < 2 * vocab_size + 1:
+            sub_token_id = op_id - vocab_size - 1
+            sub_token = tokenizer.convert_ids_to_tokens([sub_token_id])[0]
+            return f"SUBSTITUTE(token_id={sub_token_id}→{sub_token})"
+        else:
+            return "KEEP"
+
     # ==================== 崩溃日志 ====================
 
     def log_crash(self, step_name, batch_idx, dimension, error, extra_info=None):
