@@ -136,9 +136,15 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"正在准备分布式训练 (accelerator.prepare)...")
 
+        import time
+        prepare_start = time.time()
         train_dataloader, test_dataloader = self.accelerator.prepare(
             train_dataloader, test_dataloader
         )
+        prepare_time = time.time() - prepare_start
+
+        if self.accelerator.is_local_main_process:
+            print(f"✓ 分布式训练准备完成 (耗时: {prepare_time:.2f}秒)")
 
         if self.accelerator.is_local_main_process:
             is_stream_mode = getattr(train_dataset, 'stream', False)
@@ -214,23 +220,39 @@ class EditFlowManager:
 
     def _split_nonstream_mode(self, cache_filename, tokenizer, num_proc):
         """非流式模式下的数据分割"""
+        import time
+
+        if self.accelerator.is_local_main_process:
+            print(f"[性能] 开始创建完整数据集...")
+
+        dataset_start = time.time()
         full_dataset = FlowDataset(
             data_file=cache_filename, tokenizer=tokenizer,
             max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
             stream=False, num_proc=num_proc, logger=self.logger
         )
+        dataset_time = time.time() - dataset_start
 
-        total_size = len(full_dataset)
+        # 优化：直接使用已知的样本数，避免调用 len(dataset) 扫描整个数据集
+        # 对于超大数据集，len() 调用可能需要5-15分钟
+        total_size = self.args.num_samples
         train_size = int(total_size * (1 - self.args.test_split))
 
+        if self.accelerator.is_local_main_process:
+            print(f"[性能] FlowDataset 创建耗时: {dataset_time:.2f}秒")
+            print(f"[性能] 开始创建训练/测试集索引 (total_size={total_size})...")
+
+        shuffle_start = time.time()
         from torch.utils.data import Subset
         indices = list(range(total_size))
         np.random.shuffle(indices)
+        shuffle_time = time.time() - shuffle_start
 
         train_indices = indices[:train_size]
         test_indices = indices[train_size:]
 
         if self.accelerator.is_local_main_process:
+            print(f"[性能] 创建和打乱索引耗时: {shuffle_time:.2f}秒")
             print(f"非流式模式: 训练集 {len(train_indices)} 样本, 测试集 {len(test_indices)} 样本")
 
         train_dataset = Subset(full_dataset, train_indices)
@@ -239,6 +261,8 @@ class EditFlowManager:
 
     def _create_dataloaders(self, train_dataset, test_dataset):
         """创建训练和测试DataLoader"""
+        import time
+
         is_stream_mode = getattr(train_dataset, 'stream', False)
         train_size = len(train_dataset)
         test_size = len(test_dataset)
@@ -257,6 +281,7 @@ class EditFlowManager:
         if self.accelerator.is_local_main_process:
             print(f"正在创建 DataLoader (batch_size={self.args.batch_size}, num_workers={num_workers}, shuffle={train_shuffle})...")
 
+        dataloader_start = time.time()
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset, batch_size=self.args.batch_size, shuffle=train_shuffle,
             num_workers=num_workers, collate_fn=custom_collate_fn,
@@ -267,9 +292,10 @@ class EditFlowManager:
             test_dataset, batch_size=self.args.batch_size, shuffle=False,
             num_workers=num_workers, collate_fn=custom_collate_fn, drop_last=test_drop_last
         )
+        dataloader_time = time.time() - dataloader_start
 
         if self.accelerator.is_local_main_process:
-            print(f"✓ DataLoader 创建完成")
+            print(f"✓ DataLoader 创建完成 (耗时: {dataloader_time:.2f}秒)")
 
         return train_dataloader, test_dataloader
 

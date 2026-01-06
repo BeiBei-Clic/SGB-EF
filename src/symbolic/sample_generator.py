@@ -36,6 +36,25 @@ def set_logger(logger: Logger):
     global _sample_logger
     _sample_logger = logger
 
+def pad_sequence_with_bos(token_ids: List[int], max_length: int, bos_token_id: int, pad_token_id: int) -> List[int]:
+    """
+    在数据生成时就完成 BOS 添加和 Padding
+
+    Args:
+        token_ids: 原始 token IDs
+        max_length: 目标长度（包含 BOS）
+        bos_token_id: BOS token ID
+        pad_token_id: PAD token ID
+
+    Returns:
+        padded_ids: 固定长度的序列 [BOS, token1, token2, ..., PAD, PAD, ...]
+    """
+    # 添加 BOS 并截断
+    tokens = [bos_token_id] + token_ids[:max_length-1]
+    # Padding 到固定长度
+    tokens.extend([pad_token_id] * (max_length - len(tokens)))
+    return tokens
+
 def generate_single_sample(
     sample_id: str,
     max_dim: int = 3,
@@ -67,6 +86,9 @@ def generate_single_sample(
     try:
         # 初始化tokenizer用于token→ID转换
         tokenizer = SymbolicRegressionTokenizer(max_dim=max_dim)
+        # 获取特殊 token IDs（用于 padding）
+        bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
+        pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
 
         dim = random.randint(1, max_dim)
 
@@ -205,8 +227,14 @@ def generate_single_sample(
                 "target_tokens": target_tokens,
                 "z0_tokens": z0_tokens,
                 "z1_tokens": z1_tokens,
-                "z0_token_ids": tokenizer.convert_tokens_to_ids(z0_tokens),
-                "z1_token_ids": tokenizer.convert_tokens_to_ids(z1_tokens)
+                "z0_token_ids": pad_sequence_with_bos(
+                    tokenizer.convert_tokens_to_ids(z0_tokens),
+                    max_expr_length, bos_token_id, pad_token_id
+                ),
+                "z1_token_ids": pad_sequence_with_bos(
+                    tokenizer.convert_tokens_to_ids(z1_tokens),
+                    max_expr_length, bos_token_id, pad_token_id
+                )
             })
 
             # 生成对称样本
@@ -245,8 +273,14 @@ def generate_single_sample(
                 "target_tokens": sym_target_tokens,
                 "z0_tokens": sym_z0_tokens,
                 "z1_tokens": sym_z1_tokens,
-                "z0_token_ids": tokenizer.convert_tokens_to_ids(sym_z0_tokens),
-                "z1_token_ids": tokenizer.convert_tokens_to_ids(sym_z1_tokens)
+                "z0_token_ids": pad_sequence_with_bos(
+                    tokenizer.convert_tokens_to_ids(sym_z0_tokens),
+                    max_expr_length, bos_token_id, pad_token_id
+                ),
+                "z1_token_ids": pad_sequence_with_bos(
+                    tokenizer.convert_tokens_to_ids(sym_z1_tokens),
+                    max_expr_length, bos_token_id, pad_token_id
+                )
             })
             _sample_logger.levenshtein_alignment(sample_id, f"{i+1}-sym", len(sym_z0_tokens), len(sym_z1_tokens), sym_align_time)
 

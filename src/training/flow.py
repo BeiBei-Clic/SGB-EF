@@ -273,117 +273,70 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
                        stream: bool = True, num_proc: Optional[int] = None,
                        skip: Optional[int] = None, take: Optional[int] = None):
     """
-    使用 Hugging Face datasets 加载并预处理数据
+    使用 Hugging Face datasets 加载预处理好的数据
+
+    注意：数据生成时已完成 BOS 添加和 Padding，直接加载使用
 
     Args:
         data_file: 数据文件路径 (.parquet格式)
         tokenizer: 分词器
-        max_expr_length: 表达式最大长度
+        max_expr_length: 表达式最大长度（仅用于向后兼容，数据已预先处理）
         stream: 是否使用流式加载（默认True，适合大文件）
-        num_proc: 预处理时的进程数，None表示自动选择
-        skip: 跳过前N个样本（在map之前应用）
-        take: 读取N个样本后停止（在map之前应用）
+        num_proc: 预处理时的进程数（已废弃，保留仅为兼容）
+        skip: 跳过前N个样本
+        take: 读取N个样本后停止
 
     Returns:
         dataset: Hugging Face Dataset 对象
     """
+    import time
     data_files = {"train": data_file}
 
     # 加载Parquet格式数据
+    load_start = time.time()
     if stream:
         # 流式加载：适合大文件，不一次性加载到内存
         raw_dataset = load_dataset("parquet", data_files=data_files, split="train", streaming=True)
     else:
         # 一次性加载：适合小文件，后续处理更快
         raw_dataset = load_dataset("parquet", data_files=data_files, split="train")
+    load_time = time.time() - load_start
+    print(f"  [性能] load_dataset() 耗时: {load_time:.2f}秒")
 
-    # 在map之前应用skip和take（更可靠，避免在已处理的数据集上操作）
+    # 应用skip和take
     if skip is not None:
         raw_dataset = raw_dataset.skip(skip)
     if take is not None:
         raw_dataset = raw_dataset.take(take)
 
-    # 获取token相关信息
-    pad_token_id = tokenizer.convert_tokens_to_ids('<pad>')
-    bos_token_id = tokenizer.convert_tokens_to_ids('<s>')
+    # 添加 gap_token 列（数据生成时没有这个列）
     gap_token_id = tokenizer.convert_tokens_to_ids('<gap>')
 
-    def process_function(examples):
-        """
-        预处理函数：将Parquet数据转换为模型所需的格式
-        Parquet直接返回字典，不需要json.loads
-        """
-        # Parquet加载后直接是字典列表
-        # 获取batch size
-        if isinstance(examples['x_values'], list):
-            batch_size = len(examples['x_values'])
-        else:
-            # 单个样本的情况
-            batch_size = 1
-            examples = {k: [v] for k, v in examples.items()}
+    def add_gap_token(examples):
+        """为每个样本添加 gap_token 常量"""
+        batch_size = len(examples['x_values'])
+        return {'gap_token': [gap_token_id] * batch_size}
 
-        # 预分配列表
-        outputs = {
-            'x_values': examples['x_values'],
-            'y_target': examples['y_target'],
-            'residuals': examples['residuals'],
-            'z0_token_ids': [],
-            'z1_token_ids': [],
-            'gap_token': []
-        }
+    print(f"  [性能] 数据已预先 padded，跳过 map() 操作，仅添加 gap_token 列...")
+    add_gap_start = time.time()
+    tokenized_dataset = raw_dataset.map(
+        add_gap_token,
+        batched=True,
+        num_proc=1  # 单进程即可，只是添加常量
+    )
+    add_gap_time = time.time() - add_gap_start
+    print(f"  [性能] 添加 gap_token 列耗时: {add_gap_time:.2f}秒")
 
-        # Token处理
-        def pad_z_sequence(tokens):
-            # 过滤掉None值，并确保所有token都是整数
-            filtered_tokens = [t for t in tokens if t is not None and isinstance(t, int)]
-            if len(filtered_tokens) != len(tokens):
-                print(f"警告: 过滤了 {len(tokens) - len(filtered_tokens)} 个无效token")
-
-            # 添加BOS token并截断
-            tokens = [bos_token_id] + filtered_tokens[:max_expr_length-1]
-            # Padding到固定长度
-            tokens.extend([pad_token_id] * (max_expr_length - len(tokens)))
-            return tokens
-
-        # 直接使用预计算的token IDs（需要逐个处理因为需要padding）
-        for i in range(batch_size):
-            z0_token_ids = examples['z0_token_ids'][i]
-            z1_token_ids = examples['z1_token_ids'][i]
-
-            outputs['z0_token_ids'].append(pad_z_sequence(z0_token_ids))
-            outputs['z1_token_ids'].append(pad_z_sequence(z1_token_ids))
-            outputs['gap_token'].append(gap_token_id)
-
-        return outputs
-
-    # 应用预处理
+    # 添加 shuffle
     if stream:
-        # 流式模式：使用map (IterableDataset不支持desc参数)
-        tokenized_dataset = raw_dataset.map(
-            process_function,
-            batched=True,
-            remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens']
-        )
-        # 添加 shuffle 以提高数据多样性和支持 set_epoch
         tokenized_dataset = tokenized_dataset.shuffle(seed=42, buffer_size=10000)
     else:
-        # 非流式模式：使用多进程加速
-        tokenized_dataset = raw_dataset.map(
-            process_function,
-            batched=True,
-            num_proc=num_proc,
-            remove_columns=['x_values', 'y_target', 'residuals', 'z0_tokens', 'z1_tokens'],
-            desc="Preprocessing dataset"
-        )
-        # 非流式模式也添加 shuffle
         tokenized_dataset = tokenized_dataset.shuffle(seed=42)
 
-    # 设置格式为torch，这样DataLoader拿到的直接是Tensor
+    # 设置格式为torch
     if stream:
-        # IterableDataset使用with_format (不支持columns参数)
         tokenized_dataset = tokenized_dataset.with_format(type='torch')
     else:
-        # 普通Dataset使用set_format
         tokenized_dataset.set_format(type='torch', columns=[
             'x_values', 'y_target', 'residuals',
             'z0_token_ids', 'z1_token_ids', 'gap_token'
