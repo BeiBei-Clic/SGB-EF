@@ -46,67 +46,48 @@ class EditFlowTrainer:
         self.debug_mode = args.debug
 
     # ============= 分布式工具方法 =============
-    def _gather_average_loss(self, total_loss, num_batches, default_value=0.0):
-        """跨进程收集并计算平均损失"""
-        self.accelerator.wait_for_everyone()
-        total_loss_tensor = torch.tensor(total_loss, device=self.device)
-        num_batches_tensor = torch.tensor(num_batches, device=self.device)
-        gathered_losses = self.accelerator.gather(total_loss_tensor)
-        gathered_batches = self.accelerator.gather(num_batches_tensor)
-        total_batches = gathered_batches.sum().item()
-        return gathered_losses.sum().item() / total_batches if total_batches > 0 else default_value
-
-    def _gather_metrics_across_processes(self, num_batches, total_loss, total_grad_norm):
-        """跨进程收集训练指标（批次数、总损失、总梯度范数）
+    def gather_and_format_metrics(self, num_batches, total_loss, total_grad_norm, default_value=0.0):
+        """跨进程收集并格式化训练指标（合并方法）
 
         Args:
             num_batches: 当前进程的批次数
             total_loss: 当前进程的总损失
             total_grad_norm: 当前进程的总梯度范数
+            default_value: 默认值（当没有批次时使用）
 
         Returns:
-            tuple: (gathered_batches, gathered_total_losses, gathered_total_grad_norms)
+            dict: 包含所有收集到的指标
+                - gpu_metrics: 各GPU的指标信息列表
+                - gathered_batches: 各进程的批次数
+                - gathered_losses: 各进程的总损失
+                - gathered_grad_norms: 各进程的总梯度范数
+                - global_total_batches: 全局总批次数
+                - global_avg_loss: 全局平均损失
+                - global_avg_grad_norm: 全局平均梯度范数
         """
+        self.accelerator.wait_for_everyone()
+
+        # 收集各进程的指标
         if self.accelerator.num_processes > 1:
-            gathered_batches = self.accelerator.gather(
-                torch.tensor(num_batches, device=self.device)
-            )
-            gathered_total_losses = self.accelerator.gather(
-                torch.tensor(total_loss, device=self.device)
-            )
-            gathered_total_grad_norms = self.accelerator.gather(
-                torch.tensor(total_grad_norm, device=self.device)
-            )
+            gathered_batches = self.accelerator.gather(torch.tensor(num_batches, device=self.device))
+            gathered_losses = self.accelerator.gather(torch.tensor(total_loss, device=self.device))
+            gathered_grad_norms = self.accelerator.gather(torch.tensor(total_grad_norm, device=self.device))
         else:
             gathered_batches = torch.tensor([num_batches], device=self.device)
-            gathered_total_losses = torch.tensor([total_loss], device=self.device)
-            gathered_total_grad_norms = torch.tensor([total_grad_norm], device=self.device)
+            gathered_losses = torch.tensor([total_loss], device=self.device)
+            gathered_grad_norms = torch.tensor([total_grad_norm], device=self.device)
 
-        return gathered_batches, gathered_total_losses, gathered_total_grad_norms
+        # 计算全局汇总
+        global_total_batches = gathered_batches.sum().item()
+        global_avg_loss = gathered_losses.sum().item() / global_total_batches if global_total_batches > 0 else default_value
+        global_avg_grad_norm = gathered_grad_norms.mean().item()
 
-    def _format_gpu_metrics_summary(self, gathered_batches, gathered_total_losses,
-                                    gathered_total_grad_norms, include_lr=False, lr=None):
-        """格式化GPU指标统计摘要
-
-        Args:
-            gathered_batches: 各进程的批次数
-            gathered_total_losses: 各进程的总损失
-            gathered_total_grad_norms: 各进程的总梯度范数
-            include_lr: 是否包含学习率信息
-            lr: 学习率值（当include_lr=True时使用）
-
-        Returns:
-            tuple: (gpu_metrics_list, global_total_batches, global_avg_loss, global_avg_grad_norm)
-        """
+        # 格式化各GPU的详细信息
         gpu_metrics = []
-        global_total_batches = 0
-        global_total_loss = 0.0
-        global_total_grad_norm = 0.0
-
         for gpu_idx in range(self.accelerator.num_processes):
             gpu_batches = gathered_batches[gpu_idx].item()
-            gpu_total_loss = gathered_total_losses[gpu_idx].item()
-            gpu_total_grad_norm = gathered_total_grad_norms[gpu_idx].item()
+            gpu_total_loss = gathered_losses[gpu_idx].item()
+            gpu_total_grad_norm = gathered_grad_norms[gpu_idx].item()
 
             gpu_avg_loss = gpu_total_loss / gpu_batches if gpu_batches > 0 else 0.0
             gpu_avg_grad_norm = gpu_total_grad_norm / gpu_batches if gpu_batches > 0 else 0.0
@@ -117,23 +98,23 @@ class EditFlowTrainer:
                 f"avg_grad_norm={gpu_avg_grad_norm:.3f}"
             )
 
-            global_total_batches += gpu_batches
-            global_total_loss += gpu_total_loss
-            global_total_grad_norm += gpu_total_grad_norm
-
-        global_avg_loss = global_total_loss / global_total_batches if global_total_batches > 0 else 0.0
-        global_avg_grad_norm = global_total_grad_norm / self.accelerator.num_processes if self.accelerator.num_processes > 0 else 0.0
-
-        return gpu_metrics, global_total_batches, global_avg_loss, global_avg_grad_norm
+        return {
+            'gpu_metrics': gpu_metrics,
+            'gathered_batches': gathered_batches,
+            'gathered_losses': gathered_losses,
+            'gathered_grad_norms': gathered_grad_norms,
+            'global_total_batches': global_total_batches,
+            'global_avg_loss': global_avg_loss,
+            'global_avg_grad_norm': global_avg_grad_norm
+        }
 
     # ============= 前向传播和损失计算 =============
-    def forward_pass(self, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
-        """前向传播：直接预测从z0到z1的编辑操作"""
-        from ..flow import remove_gap_tokens
+    def forward_and_compute_loss(self, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
+        """前向传播并计算损失（合并方法，减少中间状态传递）"""
+        from ..flow import remove_gap_tokens, fill_gap_tokens_with_repeats
 
         batch_size = z0_token_ids.size(0)
         vocab_size = self.tokenizer.vocab_size
-        batch_size, seq_len = z0_token_ids.shape
 
         # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(z0_token_ids, self.tokenizer)
@@ -143,7 +124,7 @@ class EditFlowTrainer:
         output = self.model(input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask)
         pred_rates = output['rates_logits']
 
-        # 记录debug信息（使用Logger的通用函数）
+        # 记录debug信息
         if debug_info:
             debug_info['sample_idx'] = 0
             self.logger.log_forward_debug(
@@ -159,32 +140,6 @@ class EditFlowTrainer:
                 substitute_logits=output['substitute_logits']
             )
 
-        return {
-            'pred_rates': pred_rates,
-            'pred_ins_logits': output['insert_logits'],
-            'pred_sub_logits': output['substitute_logits'],
-            'x_t': x_t,
-            'z0': z0_token_ids,
-            'z1_token_ids': z1_token_ids,
-            'z_gap_mask': z_gap_mask,
-            'z_pad_mask': z_pad_mask,
-            'attention_mask': attention_mask,
-            'vocab_size': vocab_size,
-        }
-
-    def compute_loss(self, forward_results, debug_info=None):
-        """计算损失"""
-        from ..flow import fill_gap_tokens_with_repeats
-
-        pred_rates = forward_results['pred_rates']
-        x_t = forward_results['x_t']
-        z0 = forward_results['z0']
-        z1_token_ids = forward_results['z1_token_ids']
-        z_gap_mask = forward_results['z_gap_mask']
-        z_pad_mask = forward_results['z_pad_mask']
-        effective_vocab_size = forward_results['vocab_size']
-        gap_token = self.tokenizer.convert_tokens_to_ids('<gap>')
-
         # 拆分操作logits：ins, del, sub, keep
         ins_logits_rate = pred_rates[:, :, 0:1]
         del_logits_rate = pred_rates[:, :, 1:2]
@@ -192,8 +147,8 @@ class EditFlowTrainer:
         keep_logits_rate = pred_rates[:, :, 3:4]
 
         # 在logit空间相加
-        ins_logits = forward_results['pred_ins_logits'] + ins_logits_rate
-        sub_logits = forward_results['pred_sub_logits'] + sub_logits_rate
+        ins_logits = output['insert_logits'] + ins_logits_rate
+        sub_logits = output['substitute_logits'] + sub_logits_rate
         del_logits = del_logits_rate
         keep_logits = keep_logits_rate
 
@@ -204,17 +159,19 @@ class EditFlowTrainer:
         u_z = fill_gap_tokens_with_repeats(u_cat_x, z_gap_mask, z_pad_mask)
 
         # 生成编辑操作掩码
-        u_mask_x = self.criterion.make_ut_mask_from_z(z0, z1_token_ids, effective_vocab_size, gap_token, self.tokenizer, x_t)
+        gap_token = self.tokenizer.convert_tokens_to_ids('<gap>')
+        u_mask_x = self.criterion.make_ut_mask_from_z(z0_token_ids, z1_token_ids, vocab_size, gap_token, self.tokenizer, x_t)
         u_mask = fill_gap_tokens_with_repeats(u_mask_x, z_gap_mask, z_pad_mask)
 
-        # 记录debug信息（使用Logger的方法）
+        # 记录debug信息
         if self.accelerator.is_local_main_process and self.debug_mode:
-            self.logger.log_compute_loss_debug(debug_info, z0, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, effective_vocab_size, self.tokenizer)
+            self.logger.log_compute_loss_debug(debug_info, z0_token_ids, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, vocab_size, self.tokenizer)
 
-        loss = self.criterion(u_cat_x, u_z, u_mask, effective_vocab_size,
+        # 计算损失
+        loss = self.criterion(u_cat_x, u_z, u_mask, vocab_size,
                         accelerator=self.accelerator, logger=self.logger)
 
-        return loss
+        return loss, pred_rates
 
     # ============= 训练和评估 =============
     def train_epoch(self, dataloader, dataset, epoch, dimension):
@@ -295,32 +252,25 @@ class EditFlowTrainer:
                 self.logger.log("BATCH_COMPLETE", f"Batch {batch_idx} 完成 | 总耗时={batch_total_time:.3f}s | timestamp={time.time():.2f}",
                                 f"维度{dimension}_batch{batch_idx}", level=2)
 
-        # 跨进程收集并计算平均损失
-        avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=0.0)
-
-        # 在所有进程上收集训练指标
-        num_processes = self.accelerator.num_processes
-        gathered_batches, gathered_total_losses, gathered_total_grad_norms = \
-            self._gather_metrics_across_processes(num_batches, total_loss, local_total_grad_norm)
+        # 跨进程收集并格式化训练指标
+        metrics = self.gather_and_format_metrics(num_batches, total_loss, local_total_grad_norm, default_value=0.0)
+        avg_loss = metrics['global_avg_loss']
 
         # 数据消耗监控：记录实际处理的 batch 数（只在主进程）
         if self.accelerator.is_local_main_process:
             expected_batches = dataset_size // self.args.batch_size
             actual_batches = num_batches
-            total_batches_all_processes = gathered_batches.sum().item()
+            total_batches_all_processes = metrics['global_total_batches']
 
             # 计算样本覆盖率
             total_samples_processed = total_batches_all_processes * self.args.batch_size
             coverage_rate = (total_samples_processed / dataset_size * 100) if dataset_size > 0 else 0.0
 
             # 根据是否分布式训练，显示不同的日志格式
+            num_processes = self.accelerator.num_processes
             if num_processes > 1:
-                # 使用辅助方法格式化GPU指标（返回的total_batches_all_processes应该与之前计算的一致）
-                gpu_metrics, _, global_avg_loss, global_avg_grad_norm = \
-                    self._format_gpu_metrics_summary(gathered_batches, gathered_total_losses, gathered_total_grad_norms)
-
                 # 构建完整的日志消息
-                gpu_metrics_summary = "\n" + "\n".join(gpu_metrics)
+                gpu_metrics_summary = "\n" + "\n".join(metrics['gpu_metrics'])
                 data_allocation_summary = (
                     f"\n--- 数据分配 --- | 进程数={num_processes} | 数据集大小={dataset_size} | "
                     f"批次大小={self.args.batch_size} | 预期单进程批次数={expected_batches} | "
@@ -328,7 +278,7 @@ class EditFlowTrainer:
                 )
                 global_summary = (
                     f"\n--- 全局汇总 --- | 总批次数={total_batches_all_processes} | "
-                    f"avg_loss={global_avg_loss:.6f} | avg_grad_norm={global_avg_grad_norm:.3f}"
+                    f"avg_loss={metrics['global_avg_loss']:.6f} | avg_grad_norm={metrics['global_avg_grad_norm']:.3f}"
                 )
 
                 self.logger.log(
@@ -406,9 +356,9 @@ class EditFlowTrainer:
 
             debug_info = {'batch_idx': batch_idx, 'context': f'维度{dimension}'}
 
-            # 前向传播
+            # 前向传播并计算损失（合并方法）
             forward_start = time.time()
-            forward_results = self.forward_pass(condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
+            loss, pred_rates = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
             forward_time = time.time() - forward_start
 
             if self.accelerator.is_local_main_process and self.debug_mode:
@@ -418,7 +368,6 @@ class EditFlowTrainer:
             # NaN检查
             nan_check_start = time.time()
             if self.accelerator.distributed_type != "NO":
-                pred_rates = forward_results['pred_rates']
                 local_has_nan = torch.isnan(pred_rates).any().float()
                 gathered_nan_results = self.accelerator.gather(local_has_nan)
                 global_has_nan = gathered_nan_results.sum()
@@ -428,10 +377,7 @@ class EditFlowTrainer:
 
             nan_check_time = time.time() - nan_check_start
 
-            # 计算损失
-            loss_compute_start = time.time()
-            loss = self.compute_loss(forward_results, debug_info)
-            loss_compute_time = time.time() - loss_compute_start
+            loss_compute_time = 0.0  # 已合并到forward_time中
 
             if self.accelerator.is_local_main_process and self.debug_mode:
                 self.logger.log("LOSS_COMPUTED", f"loss={loss.item():.6f} | 耗时={loss_compute_time:.3f}s | NaN检查耗时={nan_check_time:.3f}s",
@@ -523,12 +469,12 @@ class EditFlowTrainer:
                 point_mask = batch['point_mask'].to(self.device)
 
                 condition_embeddings = self.condition_encoder(x_values, y_target, point_mask)
-                forward_results = self.forward_pass(condition_embeddings, z0_token_ids, z1_token_ids)
-                loss = self.compute_loss(forward_results)
+                loss, _ = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids)
 
                 total_loss += loss.item()
                 num_batches += 1
 
-        avg_loss = self._gather_average_loss(total_loss, num_batches, default_value=float('inf'))
+        metrics = self.gather_and_format_metrics(num_batches, total_loss, 0.0, default_value=float('inf'))
+        avg_loss = metrics['global_avg_loss']
 
         return avg_loss

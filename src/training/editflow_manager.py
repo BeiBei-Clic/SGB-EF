@@ -20,7 +20,7 @@ from accelerate.utils import set_seed
 from ..symbolic.data_generator import generate_flow_samples
 from .flow import (
     remove_gap_tokens, fill_gap_tokens_with_repeats,
-    ContinuousFlowLoss, FlowDataset, custom_collate_fn
+    ContinuousFlowLoss, prepare_dataset_hf, custom_collate_fn
 )
 from ..modeling.condition_encoder import SetTransformerConditionEncoder
 from ..modeling.llama_editflow import LlamaEditFlowBackbone
@@ -170,94 +170,83 @@ class EditFlowManager:
         return train_dataloader, train_dataset, test_dataloader, test_dataset
 
     def _split_train_test(self, cache_filename, tokenizer, use_stream, num_proc):
-        """分割训练集和测试集"""
+        """分割训练集和测试集（统一方法）"""
+        import time
+
         # 当样本数很少时，让所有样本同时用于训练和测试
         if self.args.num_samples <= self.args.batch_size:
-            return self._create_full_datasets(cache_filename, tokenizer, use_stream, num_proc)
+            if self.accelerator.is_local_main_process:
+                mode_str = "流式" if use_stream else "非流式"
+                print(f"{mode_str}模式: 样本数({self.args.num_samples}) ≤ batch_size({self.args.batch_size})")
+                print(f"        所有样本将同时用于训练和测试")
+
+            full_dataset = prepare_dataset_hf(
+                data_file=cache_filename, tokenizer=tokenizer,
+                max_expr_length=self.args.max_expr_length,
+                stream=use_stream, num_proc=num_proc,
+                logger=self.logger
+            )
+            return full_dataset, full_dataset, self.args.num_samples, self.args.num_samples
 
         # 正常分割逻辑
-        if use_stream:
-            return self._split_stream_mode(cache_filename, tokenizer, num_proc)
-        else:
-            return self._split_nonstream_mode(cache_filename, tokenizer, num_proc)
-
-    def _create_full_datasets(self, cache_filename, tokenizer, use_stream, num_proc):
-        """样本数很少时，创建完整的训练集和测试集"""
-        if self.accelerator.is_local_main_process:
-            mode_str = "流式" if use_stream else "非流式"
-            print(f"{mode_str}模式: 样本数({self.args.num_samples}) ≤ batch_size({self.args.batch_size})")
-            print(f"        所有样本将同时用于训练和测试")
-
-        full_dataset = FlowDataset(
-            data_file=cache_filename, tokenizer=tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
-            stream=use_stream, num_proc=num_proc, logger=self.logger
-        )
-        return full_dataset, full_dataset, self.args.num_samples, self.args.num_samples
-
-    def _split_stream_mode(self, cache_filename, tokenizer, num_proc):
-        """流式模式下的数据分割"""
         split_ratio = 1 - self.args.test_split
         train_size = int(self.args.num_samples * split_ratio)
         test_size = self.args.num_samples - train_size
 
-        if self.accelerator.is_local_main_process:
-            print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
+        if use_stream:
+            # 流式模式：使用skip和take
+            if self.accelerator.is_local_main_process:
+                print(f"流式模式: 训练集约 {train_size} 样本, 测试集约 {test_size} 样本")
 
-        train_dataset = FlowDataset(
-            data_file=cache_filename, tokenizer=tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
-            stream=True, num_proc=num_proc, logger=self.logger,
-            skip=0, take=train_size
-        )
-        test_dataset = FlowDataset(
-            data_file=cache_filename, tokenizer=tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
-            stream=True, num_proc=num_proc, logger=self.logger,
-            skip=train_size, take=test_size
-        )
-        return train_dataset, test_dataset, train_size, test_size
+            train_dataset = prepare_dataset_hf(
+                data_file=cache_filename, tokenizer=tokenizer,
+                max_expr_length=self.args.max_expr_length,
+                stream=True, num_proc=num_proc,
+                skip=0, take=train_size,
+                logger=self.logger
+            )
+            test_dataset = prepare_dataset_hf(
+                data_file=cache_filename, tokenizer=tokenizer,
+                max_expr_length=self.args.max_expr_length,
+                stream=True, num_proc=num_proc,
+                skip=train_size, take=test_size,
+                logger=self.logger
+            )
+            return train_dataset, test_dataset, train_size, test_size
+        else:
+            # 非流式模式：使用Subset索引
+            if self.accelerator.is_local_main_process:
+                print(f"[性能] 开始创建完整数据集...")
 
-    def _split_nonstream_mode(self, cache_filename, tokenizer, num_proc):
-        """非流式模式下的数据分割"""
-        import time
+            dataset_start = time.time()
+            full_dataset = prepare_dataset_hf(
+                data_file=cache_filename, tokenizer=tokenizer,
+                max_expr_length=self.args.max_expr_length,
+                stream=False, num_proc=num_proc,
+                logger=self.logger
+            )
+            dataset_time = time.time() - dataset_start
 
-        if self.accelerator.is_local_main_process:
-            print(f"[性能] 开始创建完整数据集...")
+            if self.accelerator.is_local_main_process:
+                print(f"[性能] Dataset 创建耗时: {dataset_time:.2f}秒")
+                print(f"[性能] 开始创建训练/测试集索引 (total_size={self.args.num_samples})...")
 
-        dataset_start = time.time()
-        full_dataset = FlowDataset(
-            data_file=cache_filename, tokenizer=tokenizer,
-            max_dim=self.args.max_dim, max_expr_length=self.args.max_expr_length,
-            stream=False, num_proc=num_proc, logger=self.logger
-        )
-        dataset_time = time.time() - dataset_start
+            shuffle_start = time.time()
+            from torch.utils.data import Subset
+            indices = list(range(self.args.num_samples))
+            np.random.shuffle(indices)
+            shuffle_time = time.time() - shuffle_start
 
-        # 优化：直接使用已知的样本数，避免调用 len(dataset) 扫描整个数据集
-        # 对于超大数据集，len() 调用可能需要5-15分钟
-        total_size = self.args.num_samples
-        train_size = int(total_size * (1 - self.args.test_split))
+            train_indices = indices[:train_size]
+            test_indices = indices[train_size:]
 
-        if self.accelerator.is_local_main_process:
-            print(f"[性能] FlowDataset 创建耗时: {dataset_time:.2f}秒")
-            print(f"[性能] 开始创建训练/测试集索引 (total_size={total_size})...")
+            if self.accelerator.is_local_main_process:
+                print(f"[性能] 创建和打乱索引耗时: {shuffle_time:.2f}秒")
+                print(f"非流式模式: 训练集 {len(train_indices)} 样本, 测试集 {len(test_indices)} 样本")
 
-        shuffle_start = time.time()
-        from torch.utils.data import Subset
-        indices = list(range(total_size))
-        np.random.shuffle(indices)
-        shuffle_time = time.time() - shuffle_start
-
-        train_indices = indices[:train_size]
-        test_indices = indices[train_size:]
-
-        if self.accelerator.is_local_main_process:
-            print(f"[性能] 创建和打乱索引耗时: {shuffle_time:.2f}秒")
-            print(f"非流式模式: 训练集 {len(train_indices)} 样本, 测试集 {len(test_indices)} 样本")
-
-        train_dataset = Subset(full_dataset, train_indices)
-        test_dataset = Subset(full_dataset, test_indices)
-        return train_dataset, test_dataset, len(train_indices), len(test_indices)
+            train_dataset = Subset(full_dataset, train_indices)
+            test_dataset = Subset(full_dataset, test_indices)
+            return train_dataset, test_dataset, len(train_indices), len(test_indices)
 
     def _create_dataloaders(self, train_dataset, test_dataset):
         """创建训练和测试DataLoader"""
@@ -507,18 +496,18 @@ class EditFlowManager:
                 train_dataloader, train_dataset, epoch, "Mixed"
             )
 
-            # 在所有进程上收集训练指标
-            gathered_batches, gathered_total_losses, gathered_total_grad_norms = \
-                trainer._gather_metrics_across_processes(num_batches, total_loss, total_grad_norm)
+            # 在所有进程上收集训练指标（使用合并后的方法）
+            metrics = trainer.gather_and_format_metrics(num_batches, total_loss, total_grad_norm)
 
             # 只在主进程上打印和记录日志
             if self.accelerator.is_local_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
 
                 if self.accelerator.num_processes > 1:
-                    # 使用辅助方法格式化GPU指标
-                    gpu_details, global_total_batches, global_avg_loss, _ = \
-                        trainer._format_gpu_metrics_summary(gathered_batches, gathered_total_losses, gathered_total_grad_norms)
+                    # 使用合并后的方法返回的指标
+                    gpu_details = metrics['gpu_metrics']
+                    global_total_batches = metrics['global_total_batches']
+                    global_avg_loss = metrics['global_avg_loss']
 
                     # 构建完整的日志消息
                     gpu_summary = "\n" + "\n".join(gpu_details) + "\n--- 全局汇总 --- | " + \
