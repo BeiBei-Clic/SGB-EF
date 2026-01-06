@@ -146,7 +146,7 @@ def generate_single_sample(
 
         _sample_logger.sample_step(sample_id, "生成删减序列", info_only=True)
         reduction_start = time.time()
-        reduction_sequence = generate_reduction_sequence(target_expr)
+        reduction_sequence = generate_reduction_sequence(target_expr, sample_id=sample_id)
         reduction_time = (time.time() - reduction_start) * 1000
         _sample_logger.reduction_sequence(sample_id, len(reduction_sequence), reduction_time)
 

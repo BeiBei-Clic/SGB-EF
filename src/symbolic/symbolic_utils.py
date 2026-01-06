@@ -228,7 +228,7 @@ def reduce_expression_random_subtree(expr: sp.Expr) -> sp.Expr:
         return expr.func(*new_args)
 
 
-def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool = True) -> List[sp.Expr]:
+def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool = True, sample_id: str = None) -> List[sp.Expr]:
     """生成从目标表达式逐步删减的序列，直到得到最简表达式
 
     Args:
@@ -236,10 +236,13 @@ def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool =
         use_random_subtree: 是否使用随机子树删减方法（默认True）
             - True: 使用reduce_expression_random_subtree（推荐）
             - False: 使用原版reduce_expression（只删根节点）
+        sample_id: 样本ID（用于日志记录）
 
     Returns:
         删减序列，从目标表达式到最简表达式
     """
+    import time
+
     reduction_sequence = []
     current_expr = target_expr
 
@@ -247,28 +250,63 @@ def generate_reduction_sequence(target_expr: sp.Expr, use_random_subtree: bool =
     max_iterations = 20  # 防止无限循环
     iterations = 0
 
+    _logger.sample_step(sample_id, "REDUCTION_START",
+                       f"目标表达式: {str(target_expr)} | max_iterations: {max_iterations}")
+
     while iterations < max_iterations:
+        iteration_start = time.time()
+        iterations += 1
+
+        _logger.sample_step(sample_id, f"REDUCTION_ITERATION {iterations}/{max_iterations}",
+                           f"当前表达式: {str(current_expr)}")
+
         reduction_sequence.append(current_expr)
 
         # 检查是否已经是最简形式（常数或符号）
         if current_expr.is_Number or current_expr.is_Symbol:
+            iteration_time = (time.time() - iteration_start) * 1000
+            _logger.sample_step(sample_id, "REDUCTION_COMPLETE",
+                               f"原因: 达到最简形式({type(current_expr).__name__}) | "
+                               f"总迭代数: {iterations} | 耗时: {iteration_time:.2f}ms")
             break
 
         # 应用一次删减操作
+        reduce_start = time.time()
         if use_random_subtree:
             # 使用新的随机子树删减方法（让编辑分布更均匀）
             reduced_expr = reduce_expression_random_subtree(current_expr)
         else:
             # 使用原版删减方法（只删根节点）
             reduced_expr = reduce_expression(current_expr)
+        reduce_time = (time.time() - reduce_start) * 1000
+
+        _logger.sample_step(sample_id, f"REDUCTION_OP iteration={iterations}",
+                           f"删减后: {str(reduced_expr)} | 耗时: {reduce_time:.2f}ms")
 
         # 如果删减后的表达式与原表达式相同，说明无法进一步删减
         if reduced_expr == current_expr:
             # 强制简化为常数
+            _logger.sample_step(sample_id, f"REDUCTION_FORCE iteration={iterations}",
+                               "删减后表达式相同，强制简化为常数1")
             reduced_expr = sp.Integer(1)
 
+        # 简化表达式
+        simplify_start = time.time()
         current_expr = simplify_expr(reduced_expr)
-        iterations += 1
+        simplify_time = (time.time() - simplify_start) * 1000
+
+        iteration_time = (time.time() - iteration_start) * 1000
+
+        _logger.sample_step(sample_id, f"SIMPLIFY iteration={iterations}",
+                           f"简化后: {str(current_expr)} | "
+                           f"简化耗时: {simplify_time:.2f}ms | "
+                           f"总耗时: {iteration_time:.2f}ms")
+
+    # 检查是否达到最大迭代次数
+    if iterations >= max_iterations:
+        _logger.sample_step(sample_id, "REDUCTION_COMPLETE",
+                           f"原因: 达到最大迭代次数({max_iterations}) | "
+                           f"最终表达式: {str(current_expr)}")
 
     # 确保序列中包含最简形式
     if not reduction_sequence or (reduction_sequence[-1].is_Number or reduction_sequence[-1].is_Symbol):
