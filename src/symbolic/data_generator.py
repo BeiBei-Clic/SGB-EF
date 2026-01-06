@@ -9,6 +9,7 @@ import warnings
 import time
 import json
 import multiprocessing
+import subprocess
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from src.utils.timeout_utils import TimeoutError, with_timeout
@@ -176,6 +177,13 @@ def generate_flow_samples(
         merge_batches_to_main_file(txt_filename, batch_filenames, num_batches, verbose=verbose)
         return
 
+    # 情况3：txt文件存在但批次文件都不存在 → 数据生成已完成，直接生成parquet
+    if os.path.exists(txt_filename) and not any(os.path.exists(f) for f in batch_filenames):
+        if verbose:
+            print(f"检测到已完成的数据生成(txt文件存在，批次文件已合并)，正在生成 Parquet 文件...")
+        merge_batches_to_main_file(txt_filename, batch_filenames, num_batches, verbose=verbose)
+        return
+
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
 
@@ -302,38 +310,159 @@ def merge_batches_to_main_file(filename: str, batch_filenames: List[str], num_ba
     with open(index_filename, 'w', encoding='utf-8') as f:
         json.dump({str(dim): [int(pos) for pos in positions] for dim, positions in dimension_samples.items()}, f, indent=2)
 
-    # 生成Parquet文件（更高效的格式）
+    # 生成Parquet文件（更高效的格式）- 使用分批读取避免内存溢出
     if not os.path.exists(parquet_filename):
         if verbose:
-            print(f"\n正在生成 Parquet 文件: {parquet_filename}")
+            print(f"\n{'='*70}")
+            print(f"🔄 正在生成 Parquet 文件")
+            print(f"{'='*70}")
+            print(f"📁 源文件: {filename}")
+            print(f"📁 目标文件: {parquet_filename}")
 
         import pandas as pd
         from tqdm import tqdm
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import time
+        import psutil
 
-        # 读取txt文件中的所有样本
-        samples = []
+        # 分批读取txt文件并写入parquet，避免一次性加载所有数据到内存
+        BATCH_SIZE = 50000  # 每批处理5万个样本
+        samples_batch = []
+        total_samples = 0
+        batch_num = 0
+
+        # 记录开始时间
+        start_time = time.time()
+
+        # 获取总行数用于进度显示（使用wc命令快速统计）
+        if verbose:
+            print(f"\n⏳ 正在统计总样本数...")
+        result = subprocess.run(['wc', '-l', filename], capture_output=True, text=True)
+        total_lines = int(result.stdout.split()[0])
+
+        if verbose:
+            print(f"📊 转换配置:")
+            print(f"  • 总样本数: {total_lines:,}")
+            print(f"  • 批次大小: {BATCH_SIZE:,} 样本/批")
+            print(f"  • 预计批次数: {(total_lines + BATCH_SIZE - 1) // BATCH_SIZE}")
+            print(f"\n{'='*70}\n")
+
+        # 使用pyarrow.ParquetWriter进行追加写入
+        writer = None
+        schema = None
+
+        # 创建增强的进度条
         with open(filename, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="读取txt样本", unit="样本"):
-                line = line.strip()
-                if line:
-                    samples.append(json.loads(line))
+            pbar = tqdm(
+                total=total_lines,
+                desc="📦 转换进度",
+                unit="样本",
+                unit_scale=True,
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            )
 
-        # 转换为DataFrame并保存为Parquet
-        df = pd.DataFrame(samples)
-        df.to_parquet(
-            parquet_filename,
-            engine='pyarrow',
-            compression='snappy',  # 快速压缩
-            index=False
-        )
+            try:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        sample = json.loads(line)
+                        samples_batch.append(sample)
+
+                        # 当批次达到指定大小时，写入parquet
+                        if len(samples_batch) >= BATCH_SIZE:
+                            df_batch = pd.DataFrame(samples_batch)
+
+                            # 第一次写入时初始化writer和schema
+                            if writer is None:
+                                schema = pa.Table.from_pandas(df_batch).schema
+                                writer = pq.ParquetWriter(
+                                    parquet_filename,
+                                    schema=schema,
+                                    compression='snappy'
+                                )
+
+                            # 写入当前批次
+                            table = pa.Table.from_pandas(df_batch, schema=schema)
+                            writer.write_table(table)
+
+                            total_samples += len(samples_batch)
+                            batch_num += 1
+
+                            # 更新进度条
+                            pbar.update(BATCH_SIZE)
+
+                            # 每批次更新详细统计
+                            if verbose:
+                                elapsed = time.time() - start_time
+                                speed = total_samples / elapsed if elapsed > 0 else 0
+                                progress_pct = 100 * total_samples / total_lines
+                                eta = (total_lines - total_samples) / speed if speed > 0 else 0
+
+                                # 获取内存使用情况
+                                process = psutil.Process()
+                                memory_mb = process.memory_info().rss / (1024**2)
+
+                                # 每5个批次显示一次详细统计
+                                if batch_num % 5 == 0:
+                                    pbar.write(
+                                        f"  📊 批次 #{batch_num:3d} | "
+                                        f"进度: {progress_pct:6.2f}% | "
+                                        f"速度: {speed:8.1f} 样本/秒 | "
+                                        f"ETA: {eta/60:5.1f}分钟 | "
+                                        f"内存: {memory_mb:6.1f}MB"
+                                    )
+
+                            samples_batch = []  # 清空批次，释放内存
+
+                # 处理最后剩余的样本
+                if samples_batch:
+                    df_batch = pd.DataFrame(samples_batch)
+
+                    if writer is None:
+                        schema = pa.Table.from_pandas(df_batch).schema
+                        writer = pq.ParquetWriter(
+                            parquet_filename,
+                            schema=schema,
+                            compression='snappy'
+                        )
+
+                    table = pa.Table.from_pandas(df_batch, schema=schema)
+                    writer.write_table(table)
+                    total_samples += len(samples_batch)
+                    pbar.update(len(samples_batch))
+
+            finally:
+                pbar.close()
+
+        # 关闭writer
+        if writer is not None:
+            writer.close()
+
+        # 计算总耗时
+        end_time = time.time()
+        total_time = end_time - start_time
+        avg_speed = total_samples / total_time if total_time > 0 else 0
 
         if verbose:
             txt_size = os.path.getsize(filename) / (1024**3)
             parquet_size = os.path.getsize(parquet_filename) / (1024**3)
             compression_ratio = (1 - parquet_size / txt_size) * 100
-            print(f"✓ Parquet 文件生成完成:")
-            print(f"  TXT 大小:   {txt_size:.2f} GB")
-            print(f"  Parquet 大小: {parquet_size:.2f} GB (压缩 {compression_ratio:.1f}%)")
-            print(f"  样本数量:   {len(samples)}")
+
+            print(f"\n{'='*70}")
+            print(f"✅ Parquet 文件生成完成")
+            print(f"{'='*70}")
+            print(f"📁 文件信息:")
+            print(f"  • TXT 大小:     {txt_size:.2f} GB")
+            print(f"  • Parquet 大小:  {parquet_size:.2f} GB")
+            print(f"  • 压缩率:       {compression_ratio:.1f}%")
+            print(f"  • 样本数量:     {total_samples:,}")
+            print(f"\n⏱️  性能统计:")
+            print(f"  • 总耗时:       {total_time:.1f} 秒 ({total_time/60:.1f} 分钟)")
+            print(f"  • 平均速度:     {avg_speed:.1f} 样本/秒")
+            print(f"  • 批次总数:     {batch_num} 批")
+            print(f"  • 平均批次耗时: {total_time/batch_num if batch_num > 0 else 0:.2f} 秒/批")
+            print(f"{'='*70}\n")
     elif verbose:
         print(f"✓ Parquet 文件已存在，跳过生成: {parquet_filename}")
