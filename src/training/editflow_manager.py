@@ -288,8 +288,13 @@ class EditFlowManager:
 
         return train_dataloader, test_dataloader
 
-    def setup_models(self, checkpoint_path=None):
-        """初始化模型和tokenizer，支持从检查点加载"""
+    def setup_models(self, checkpoint_path=None, inference_mode=False):
+        """初始化模型和tokenizer，支持从检查点加载
+
+        Args:
+            checkpoint_path: 检查点路径
+            inference_mode: 是否为推理模式（推理模式下不加载优化器等训练状态）
+        """
         if self.accelerator.is_local_main_process:
             print("初始化tokenizer和模型...")
 
@@ -336,37 +341,63 @@ class EditFlowManager:
             verbose=self.accelerator.is_local_main_process
         ).to(self.device)
 
-        # 创建优化器和损失函数
+        # 创建优化器和损失函数（推理模式下不需要）
         criterion = ContinuousFlowLoss(debug_mode=self.debug_mode)
-        optimizer = torch.optim.AdamW(
-            list(model.parameters()) + list(condition_encoder.parameters()),
-            lr=self.args.learning_rate,
-            weight_decay=self.args.weight_decay,
-            eps=1e-8,
-            betas=(0.9, 0.999)
+        optimizer = None
+        scheduler = None
+
+        if not inference_mode:
+            optimizer = torch.optim.AdamW(
+                list(model.parameters()) + list(condition_encoder.parameters()),
+                lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay,
+                eps=1e-8,
+                betas=(0.9, 0.999)
+            )
+
+            # 添加学习率调度器（余弦退火）
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+            scheduler = CosineAnnealingLR(optimizer, T_max=self.args.num_epochs, eta_min=1e-6)
+
+        # 加载检查点（推理模式下跳过training_config.json以加快加载速度）
+        load_checkpoint(
+            checkpoint_path,
+            model,
+            condition_encoder,
+            self.device,
+            optimizer,
+            verbose=self.accelerator.is_local_main_process,
+            skip_config_json=inference_mode
         )
 
-        # 添加学习率调度器（余弦退火）
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.args.num_epochs, eta_min=1e-6)
-
-        # 加载检查点
-        load_checkpoint(checkpoint_path, model, condition_encoder, self.device, optimizer, verbose=self.accelerator.is_local_main_process)
-
-        # 使用 Accelerate 准备模型和优化器
+        # 使用 Accelerate 准备模型
         if self.accelerator.is_local_main_process:
-            print(f"使用 Accelerate 准备模型和优化器...")
+            print(f"使用 Accelerate 准备模型...")
             print(f"  进程数: {self.accelerator.num_processes}")
-            print(f"  设备: {self.accelerator.device}")
+            print(f"  设备: {self.device}")
             print(f"  混合精度: {self.accelerator.mixed_precision}")
 
-        model, condition_encoder, optimizer = self.accelerator.prepare(model, condition_encoder, optimizer)
+        if inference_mode:
+            # 推理模式：只准备模型，不准备优化器
+            model, condition_encoder = self.accelerator.prepare(model, condition_encoder)
 
-        # 如果有checkpoint，使用Accelerate的load_state方法加载完整状态
-        if checkpoint_path:
-            if self.accelerator.is_local_main_process:
-                print(f"Loading complete training state from {checkpoint_path}")
-            self.accelerator.load_state(checkpoint_path)
+            # 加载模型权重（使用Accelerate）
+            if checkpoint_path:
+                if self.accelerator.is_local_main_process:
+                    print(f"Loading model weights from {checkpoint_path}")
+                self.accelerator.load_state(checkpoint_path)
+        else:
+            # 训练模式：准备模型和优化器
+            if optimizer is not None:
+                model, condition_encoder, optimizer = self.accelerator.prepare(model, condition_encoder, optimizer)
+            else:
+                model, condition_encoder = self.accelerator.prepare(model, condition_encoder)
+
+            # 加载完整训练状态
+            if checkpoint_path:
+                if self.accelerator.is_local_main_process:
+                    print(f"Loading complete training state from {checkpoint_path}")
+                self.accelerator.load_state(checkpoint_path)
 
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if self.accelerator.is_local_main_process:
@@ -389,10 +420,9 @@ class EditFlowManager:
         # 使用 Accelerate 的 save_state 方法
         self.accelerator.save_state(checkpoint_dir)
 
-        # 保存模型配置信息
+        # 保存模型配置信息（轻量级，只保存超参数）
         if self.accelerator.is_local_main_process:
             unwrapped_model = self.accelerator.unwrap_model(model)
-            unwrapped_encoder = self.accelerator.unwrap_model(condition_encoder)
 
             model_config = {
                 'vocab_size': unwrapped_model.vocab_size,
@@ -405,17 +435,22 @@ class EditFlowManager:
                 'use_condition_injection': unwrapped_model.use_condition_injection,
             }
 
+            # 只保存必要的信息，不保存整个args对象和模型权重（由Accelerate保存）
             config_data = {
                 'epoch': epoch + 1,
-                'model_state_dict': unwrapped_model.state_dict(),
-                'condition_encoder_state_dict': unwrapped_encoder.state_dict(),
                 'loss': loss,
                 'model_config': model_config,
-                'args': self.args,
-                'accelerate_config': {
-                    'distributed_type': str(self.accelerator.distributed_type),
-                    'num_processes': self.accelerator.num_processes,
-                    'mixed_precision': str(self.accelerator.mixed_precision),
+                # 保存关键的args配置（用于验证和恢复）
+                'training_config': {
+                    'max_dim': self.args.max_dim,
+                    'max_expr_length': self.args.max_expr_length,
+                    'n_points': self.args.n_points,
+                    'max_depth': self.args.max_depth,
+                    'hidden_dim': self.args.hidden_dim,
+                    'n_layers': self.args.n_layers,
+                    'n_heads': self.args.n_heads,
+                    'learning_rate': self.args.learning_rate,
+                    'batch_size': self.args.batch_size,
                 }
             }
 
@@ -580,8 +615,8 @@ class EditFlowManager:
                        f"输入数据: x形状={x_data.shape}, y形状={y_data.shape} | n_steps={n_steps}",
                        "inference", level=3)
 
-        # 加载模型
-        model, condition_encoder, _, _, _, tokenizer = self.setup_models(checkpoint_path=model_path)
+        # 加载模型（推理模式）
+        model, condition_encoder, _, _, _, tokenizer = self.setup_models(checkpoint_path=model_path, inference_mode=True)
         device = self.device
 
         # 准备输入数据
