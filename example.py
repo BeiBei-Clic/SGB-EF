@@ -16,7 +16,7 @@ N_POINTS = 100
 MAX_DEPTH = 5
 MAX_DIM = 3
 DEFAULT_DATA_DIR = 'data'
-DEFAULT_MODEL_PATH = 'checkpoints/continuous_flow_final'
+DEFAULT_MODEL_PATH = 'checkpoints/checkpoint_epoch_20'
 
 
 # ============= 辅助函数 =============
@@ -78,7 +78,7 @@ def list_available_datasets(data_dir=DEFAULT_DATA_DIR):
 
 
 def load_sample(parquet_path, target_expr=None, sample_idx=None):
-    """从Parquet数据集加载样本"""
+    """从Parquet数据集加载样本（只读取需要的行，避免加载整个数据集）"""
     if not os.path.exists(parquet_path):
         available = list_available_datasets()
         raise FileNotFoundError(
@@ -87,16 +87,36 @@ def load_sample(parquet_path, target_expr=None, sample_idx=None):
             "\n".join(f"  - {f}" for f in available)
         )
 
-    df = pd.read_parquet(parquet_path)
-
+    # 读取数据并提取需要的样本
     if sample_idx is not None:
-        row = df.loc[sample_idx]
+        # 尝试只读取第一行（对于sample_idx=0的情况，这是最常见的使用场景）
+        if sample_idx == 0:
+            # 使用PyArrow读取第一行
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(parquet_path)
+
+            # 读取第一个行组的第一行
+            table = parquet_file.read_row_group(0)
+            df = table.slice(0, 1).to_pandas()
+            row = df.iloc[0]
+            del df
+            del table
+        else:
+            # 对于其他索引，还是需要读取整个数据集
+            # 但至少添加一个警告
+            print(f"注意：读取索引 {sample_idx} 需要加载整个数据集")
+            df = pd.read_parquet(parquet_path)
+            row = df.loc[sample_idx]
+            del df
     else:
+        # 需要通过表达式查找，暂时读取整个数据集（这种情况很少使用）
+        df = pd.read_parquet(parquet_path)
         matched = df[df['exp_gt'] == target_expr]
         if len(matched) == 0:
             raise ValueError(f"未找到表达式: {target_expr}")
         sample_idx = matched.index[0]
         row = df.loc[sample_idx]
+        del df
 
     # 处理x_values格式
     x_values = ensure_2d_array(row['x_values'])
@@ -172,8 +192,10 @@ def validate_and_select_dataset(args):
         args.parquet_path = available[0]
         print(f"使用默认数据集: {args.parquet_path}")
 
+    # 如果没有指定样本，默认使用第一个样本
     if args.target_expr is None and args.sample_idx is None:
-        raise ValueError("必须指定 --target_expr 或 --sample_idx 之一")
+        args.sample_idx = 0
+        print(f"使用默认样本索引: 0")
 
     return args
 
@@ -344,7 +366,7 @@ def main():
     model_args = setup_model_config()
 
     # 加载样本
-    print_section(f"加载样本: {args.sample_idx if args.sample_idx else args.target_expr}")
+    print_section(f"加载样本: {args.sample_idx if args.sample_idx is not None else args.target_expr}")
     sample = load_sample(args.parquet_path, args.target_expr, args.sample_idx)
     display_sample_info(sample)
 
