@@ -19,15 +19,22 @@ from datetime import timedelta
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-# 设置NCCL超时时间为无穷大，避免数据生成时的等待超时
-os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）
+# ========== 全面设置分布式超时，防止进程因等待被kill ==========
+
+# NCCL相关超时设置
+os.environ["NCCL_TIMEOUT"] = "31536000"  # 1年（秒）- NCCL操作超时
 os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"   # 启用阻塞等待模式
-# 额外的NCCL超时设置，确保无限等待
 os.environ["NCCL_P2P_DISABLE"] = "1"     # 禁用P2P以避免某些通信问题
 os.environ["NCCL_IB_DISABLE"] = "1"      # 禁用InfiniBand（如果不是必需的）
 
+# PyTorch分布式超时设置
+os.environ["TORCH_DIST_INIT_TIMEOUT"] = "31536000"  # 分布式初始化超时（1年）
+os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "31536000"  # NCCL心跳超时（1年）
+
 # 设置PyTorch分布式默认超时为无限（1年）
 torch.distributed.default_timeout = timedelta(seconds=31536000)
+
+print("✓ 分布式超时设置完成：所有超时已设置为1年，避免进程因等待被kill")
 
 from src.training.editflow_manager import EditFlowManager
 

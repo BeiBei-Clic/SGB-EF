@@ -70,7 +70,7 @@ lsof | grep "flow_samples_10000000"
 # 创建一个名为my_session的tmux会话
 tmux new -s my_session
 # 在tmux会话中运行任务
-accelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 50 --num_samples 1000000 --batch_size 960 --dataset_stream False
+accelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 50 --num_samples 10000000 --batch_size 960 --dataset_stream False
 
 accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no train.py --num_epochs 50 --num_samples 1 --batch_size 1 --debug 1
 
@@ -92,5 +92,5 @@ Ctrl + C
 # 退出复制模式
 Ctrl + D
 #推理测试命令
-python example.py --parquet_path data/flow_samples_1_3dim_100pts_6depth_24len.parquet --sample_idx 0
+python example.py --parquet_path data/flow_samples_10000000_3dim_100pts_6depth_24len.parquet --sample_idx 0
 ```
