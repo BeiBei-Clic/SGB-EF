@@ -324,11 +324,10 @@ def prepare_dataset_hf(data_file: str, tokenizer, max_expr_length: int = 128,
         return {'gap_token': [gap_token_id] * batch_size}
 
     add_gap_start = time.time()
-    tokenized_dataset = raw_dataset.map(
-        add_gap_token,
-        batched=True,
-        num_proc=1  # 单进程即可，只是添加常量
-    )
+    map_kwargs = {"batched": True}
+    if not stream:
+        map_kwargs["num_proc"] = 1  # 单进程即可，只是添加常量
+    tokenized_dataset = raw_dataset.map(add_gap_token, **map_kwargs)
     add_gap_time = time.time() - add_gap_start
 
     if logger:
@@ -493,5 +492,4 @@ def custom_collate_fn(batch):
     }
 
     return result
-
 

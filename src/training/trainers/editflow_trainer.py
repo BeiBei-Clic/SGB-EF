@@ -195,7 +195,10 @@ class EditFlowTrainer:
         local_total_grad_norm = 0.0
 
         # 计算数据集信息
-        dataset_size = len(dataset)
+        try:
+            dataset_size = len(dataset)
+        except TypeError:
+            dataset_size = getattr(dataset, "_size_estimate", self.args.num_samples)
         num_batches_estimate = dataset_size // self.args.batch_size
 
         # 记录epoch开始和数据集信息
@@ -258,7 +261,7 @@ class EditFlowTrainer:
 
         # 数据消耗监控：记录实际处理的 batch 数（只在主进程）
         if self.accelerator.is_local_main_process:
-            expected_batches = dataset_size // self.args.batch_size
+            expected_batches_global = dataset_size // self.args.batch_size
             actual_batches = num_batches
             total_batches_all_processes = metrics['global_total_batches']
 
@@ -269,11 +272,12 @@ class EditFlowTrainer:
             # 根据是否分布式训练，显示不同的日志格式
             num_processes = self.accelerator.num_processes
             if num_processes > 1:
+                expected_batches_per_process = dataset_size // (self.args.batch_size * num_processes)
                 # 构建完整的日志消息
                 gpu_metrics_summary = "\n" + "\n".join(metrics['gpu_metrics'])
                 data_allocation_summary = (
                     f"\n--- 数据分配 --- | 进程数={num_processes} | 数据集大小={dataset_size} | "
-                    f"批次大小={self.args.batch_size} | 预期单进程批次数={expected_batches} | "
+                    f"批次大小={self.args.batch_size} | 预期单进程批次数={expected_batches_per_process} | "
                     f"覆盖率={coverage_rate:.1f}%"
                 )
                 global_summary = (
@@ -295,7 +299,7 @@ class EditFlowTrainer:
                 avg_grad_norm = local_total_grad_norm / num_batches if num_batches > 0 else 0.0
                 self.logger.log(
                     "EPOCH_BATCH_COUNT",
-                    f"Epoch {epoch+1} 完成 | 预期批次数={expected_batches} | "
+                    f"Epoch {epoch+1} 完成 | 预期批次数={expected_batches_global} | "
                     f"实际批次数={actual_batches} | 总损失={total_loss:.2f} | "
                     f"平均损失={avg_loss:.6f} | 平均梯度范数={avg_grad_norm:.3f} | "
                     f"数据集大小={dataset_size} | 批次大小={self.args.batch_size}",
@@ -311,13 +315,17 @@ class EditFlowTrainer:
                     f"这通常意味着 IterableDataset 迭代器已耗尽且未正确重置。",
                     f"epoch{epoch+1}_critical"
                 )
-            elif epoch > 0 and actual_batches < expected_batches * 0.5:
-                self.logger.error(
-                    "INSUFFICIENT_DATA",
-                    f"警告：Epoch {epoch+1} 实际批次数({actual_batches}) "
-                    f"远少于预期({expected_batches})，可能存在数据加载问题。",
-                    f"epoch{epoch+1}_warning"
-                )
+            elif epoch > 0:
+                expected_batches_warning = expected_batches_global
+                if num_processes > 1:
+                    expected_batches_warning = dataset_size // (self.args.batch_size * num_processes)
+                if actual_batches < expected_batches_warning * 0.5:
+                    self.logger.error(
+                        "INSUFFICIENT_DATA",
+                        f"警告：Epoch {epoch+1} 实际批次数({actual_batches}) "
+                        f"远少于预期({expected_batches_warning})，可能存在数据加载问题。",
+                        f"epoch{epoch+1}_warning"
+                    )
 
         # 返回平均损失、批次数、总损失和总梯度范数（用于GPU级别信息汇总）
         return avg_loss, num_batches, total_loss, local_total_grad_norm
@@ -437,7 +445,10 @@ class EditFlowTrainer:
         num_batches = 0
 
         # 计算测试集信息
-        test_size = len(test_dataset)
+        try:
+            test_size = len(test_dataset)
+        except TypeError:
+            test_size = getattr(test_dataset, "_size_estimate", self.args.num_samples)
         test_num_batches_estimate = test_size // self.args.batch_size
 
         # 记录测试开始

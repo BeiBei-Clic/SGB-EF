@@ -936,6 +936,8 @@ class Logger:
             substitute_logits = tensors['substitute_logits']
             x_t_sample = tensors['x_t'][sample_idx]
             rates_probs = F.softmax(pred_rates[sample_idx], dim=-1)
+            insert_logits_sample = insert_logits[sample_idx]
+            substitute_logits_sample = substitute_logits[sample_idx]
 
             # 记录SUBSTITUTE操作的候选token（前5个位置）
             for pos in range(min(5, x_t_sample.shape[0])):
@@ -946,17 +948,17 @@ class Logger:
                     self.log_training_substitute_candidates(
                         batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
                         x_t_value=x_t_sample[pos].item(), lambda_sub=lambda_sub,
-                        substitute_logits=substitute_logits[pos], tokenizer=tokenizer,
+                        substitute_logits=substitute_logits_sample[pos], tokenizer=tokenizer,
                         top_k=5, context=context, level=2
                     )
 
             # 记录INSERT操作的候选token（前3个位置）
-            for pos in range(min(3, insert_logits.shape[0])):
+            for pos in range(min(3, insert_logits_sample.shape[0])):
                 lambda_ins = rates_probs[pos, 0].item()
                 if lambda_ins > 0.01:
                     self.log_training_insert_candidates(
                         batch_idx=batch_idx, sample_idx=sample_idx, position=pos,
-                        lambda_ins=lambda_ins, insert_logits=insert_logits[pos],
+                        lambda_ins=lambda_ins, insert_logits=insert_logits_sample[pos],
                         tokenizer=tokenizer, top_k=5, context=context, level=2
                     )
 

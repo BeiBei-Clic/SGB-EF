@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DataLoaderConfiguration, set_seed
 
 from ..symbolic.data_generator import generate_flow_samples
 from .flow import (
@@ -53,9 +53,11 @@ class EditFlowManager:
 
         # 初始化 Accelerate - 自动处理分布式训练设置
         # 注意：mixed_precision 由 accelerate launch 命令行参数控制
+        dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            log_with=args.log_with
+            log_with=args.log_with,
+            dataloader_config=dataloader_config
         )
 
         set_seed(args.seed)
@@ -126,6 +128,8 @@ class EditFlowManager:
         train_dataset, test_dataset, train_size_estimate, test_size_estimate = self._split_train_test(
             cache_filename, tokenizer, use_stream, num_proc
         )
+        train_dataset._size_estimate = train_size_estimate
+        test_dataset._size_estimate = test_size_estimate
 
         # 创建DataLoader
         train_dataloader, test_dataloader = self._create_dataloaders(
@@ -253,8 +257,13 @@ class EditFlowManager:
         import time
 
         is_stream_mode = getattr(train_dataset, 'stream', False)
-        train_size = len(train_dataset)
-        test_size = len(test_dataset)
+        def _safe_len(dataset, fallback):
+            try:
+                return len(dataset)
+            except TypeError:
+                return getattr(dataset, "_size_estimate", fallback)
+        train_size = _safe_len(train_dataset, self.args.num_samples)
+        test_size = _safe_len(test_dataset, int(self.args.num_samples * self.args.test_split))
         train_drop_last = train_size >= self.args.batch_size
         test_drop_last = test_size >= self.args.batch_size
 
@@ -650,4 +659,3 @@ class EditFlowManager:
             n_steps=n_steps,
             initial_expr=initial_expr
         )
-
