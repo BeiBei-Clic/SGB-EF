@@ -14,7 +14,7 @@ N_POINTS = 100
 MAX_DEPTH = 5
 MAX_DIM = 3
 DEFAULT_DATA_DIR = 'data'
-DEFAULT_MODEL_PATH = 'checkpoints/checkpoint_epoch_10'
+DEFAULT_MODEL_PATH = 'checkpoints/continuous_flow_final'
 
 
 # ============= 辅助函数 =============
@@ -26,11 +26,6 @@ def format_tokens_display(tokens):
     # 在token列表开头添加BOS token，统一位置索引
     tokens_with_bos = ['<BOS>'] + list(tokens)
     return ' '.join([f"[{i}]{t}" for i, t in enumerate(tokens_with_bos)])
-
-
-def ensure_2d_array(x_values):
-    """确保数据是2D数组格式"""
-    return np.stack(x_values) if x_values.ndim == 1 else x_values
 
 
 def reorganize_data_by_used_variables(expression_str, x_data):
@@ -105,7 +100,6 @@ def load_sample(parquet_path, target_expr=None, sample_idx=None):
                 del table
                 return row
             offset += rg_rows
-        raise IndexError(f"样本索引超出范围: {row_idx} (0~{total_rows - 1})")
 
     def find_row_by_expr(expr):
         offset = 0
@@ -129,7 +123,7 @@ def load_sample(parquet_path, target_expr=None, sample_idx=None):
             raise ValueError(f"未找到表达式: {target_expr}")
 
     # 处理x_values格式
-    x_values = ensure_2d_array(row['x_values'])
+    x_values = np.stack(row['x_values']) if row['x_values'].ndim == 1 else row['x_values']
 
     return {
         'x': x_values,
@@ -216,46 +210,48 @@ def validate_and_select_dataset(args):
 
 def setup_model_config():
     """设置模型配置参数"""
-    return type('ModelArgs', (), {
-        'seed': 42,
-        'base_model_name': "google-bert/bert-base-uncased",
-        'condition_model_name': "settransformer",
-        'cache_dir': "models/huggingface_cache",
-        'use_fp16': False,
-        'gradient_accumulation_steps': 1,
-        'log_with': None,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-5,
-        'max_dim': MAX_DIM,
-        'max_expr_length': MAX_EXPR_LENGTH,
-        'num_timesteps': 1,
-        'num_samples': 10000,
-        'batch_size': 32,
-        'num_epochs': 30,
-        'test_split': 0.2,
-        'eval_every': 5,
-        'save_every': 5,
-        'n_points': N_POINTS,
-        'max_depth': MAX_DEPTH,
-        'alignment_method': 'tree_edit_distance',
-        'cache_size': 1000,
-        'num_workers': 4,
-        'save_dir': 'checkpoints',
-        'debug': True,
-        'hidden_dim': 512,
-        'n_layers': 8,
-        'n_heads': 8,
-        'dropout': 0.1,
-        'use_condition_injection': True,
-        'condition_max_input_dim': 3,
-        'condition_dim_hidden': 768,
-        'condition_num_heads': 4,
-        'condition_num_inds': 32,
-        'condition_num_layers': 3,
-        'condition_num_seeds': 32,
-        'condition_dim_output': 128,
-        'condition_input_normalization': False,
-    })()
+    import argparse
+    config = argparse.Namespace(
+        seed=42,
+        base_model_name="google-bert/bert-base-uncased",
+        condition_model_name="settransformer",
+        cache_dir="models/huggingface_cache",
+        use_fp16=False,
+        gradient_accumulation_steps=1,
+        log_with=None,
+        learning_rate=1e-4,
+        weight_decay=1e-5,
+        max_dim=MAX_DIM,
+        max_expr_length=MAX_EXPR_LENGTH,
+        num_timesteps=1,
+        num_samples=10000,
+        batch_size=32,
+        num_epochs=30,
+        test_split=0.2,
+        eval_every=5,
+        save_every=5,
+        n_points=N_POINTS,
+        max_depth=MAX_DEPTH,
+        alignment_method='tree_edit_distance',
+        cache_size=1000,
+        num_workers=4,
+        save_dir='checkpoints',
+        debug=True,
+        hidden_dim=512,
+        n_layers=8,
+        n_heads=8,
+        dropout=0.1,
+        use_condition_injection=True,
+        condition_max_input_dim=3,
+        condition_dim_hidden=768,
+        condition_num_heads=4,
+        condition_num_inds=32,
+        condition_num_layers=3,
+        condition_num_seeds=32,
+        condition_dim_output=128,
+        condition_input_normalization=False,
+    )
+    return config
 
 
 # ============= 推理执行 =============
@@ -278,32 +274,17 @@ def run_inference(model_args, model_path, x_data, y_data, input_dim, initial_exp
         # Ensure background resources are released so the process can exit cleanly.
         try:
             manager.accelerator.end_training()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to end training: {e}")
         try:
             import torch.distributed as dist
             if dist.is_available() and dist.is_initialized():
                 dist.destroy_process_group()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to destroy process group: {e}")
 
 
 # ============= 结果展示 =============
-def print_section(title):
-    """打印分节标题"""
-    print(f"\n{'='*70}")
-    print(f"{title}")
-    print(f"{'='*70}")
-
-
-def display_sample_info(sample):
-    """显示样本信息"""
-    print(f"样本 #{sample['sample_idx']}")
-    print(f"  目标: {sample['exp_gt']}")
-    print(f"  初始: {sample['exp_cur1']}")
-    print(f"  维度: {sample['input_dimension']}, 数据形状: {sample['x'].shape}")
-
-
 def display_inference_details(
     expr_initial, expr_gt, initial_tokens,
     target_tokens, final_tokens, position_actions_history, history
@@ -340,8 +321,17 @@ def display_inference_details(
     print(f"  Tokens: {format_tokens_display(final_tokens)}")
 
 
-def display_comparison(final_tokens, target_tokens):
-    """显示结果对比"""
+def display_results(
+    expr_initial, expr_gt, initial_tokens,
+    target_tokens, final_tokens, position_actions_history, history
+):
+    """展示完整结果"""
+    print(f"\n推理详细信息:")
+    display_inference_details(
+        expr_initial, expr_gt, initial_tokens,
+        target_tokens, final_tokens, position_actions_history, history
+    )
+    # 显示结果对比
     print(f"\n结果对比:")
     if final_tokens == target_tokens:
         print(f"  与目标匹配: ✅ 完全匹配")
@@ -357,19 +347,6 @@ def display_comparison(final_tokens, target_tokens):
             diff = f"有{min_len - matches}个token不同"
 
         print(f"  与目标匹配: ❌ 不匹配 ({diff}, 匹配{matches}/{min_len}个token)")
-
-
-def display_results(
-    expr_initial, expr_gt, initial_tokens,
-    target_tokens, final_tokens, position_actions_history, history
-):
-    """展示完整结果"""
-    print_section("推理详细信息")
-    display_inference_details(
-        expr_initial, expr_gt, initial_tokens,
-        target_tokens, final_tokens, position_actions_history, history
-    )
-    display_comparison(final_tokens, target_tokens)
 
 
 # ============= 主程序 =============
@@ -395,9 +372,12 @@ def main():
     model_args = setup_model_config()
 
     # 加载样本
-    print_section(f"加载样本: {args.sample_idx if args.sample_idx is not None else args.target_expr}")
+    print(f"\n加载样本: {args.sample_idx if args.sample_idx is not None else args.target_expr}")
     sample = load_sample(args.parquet_path, args.target_expr, args.sample_idx)
-    display_sample_info(sample)
+    print(f"样本 #{sample['sample_idx']}")
+    print(f"  目标: {sample['exp_gt']}")
+    print(f"  初始: {sample['exp_cur1']}")
+    print(f"  维度: {sample['input_dimension']}, 数据形状: {sample['x'].shape}")
     if args.read_only:
         return
 
@@ -413,7 +393,7 @@ def main():
     target_tokens = target_tokens_str.split(',') if target_tokens_str else []
 
     # 执行推理
-    print_section(f"开始推理: {args.model_path}")
+    print(f"\n开始推理: {args.model_path}")
     result = run_inference(
         model_args, args.model_path, x_data,
         sample['y'], sample['input_dimension'], expr_initial
