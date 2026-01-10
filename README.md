@@ -70,7 +70,7 @@ lsof | grep "flow_samples_10000000"
 # 创建一个名为my_session的tmux会话
 tmux new -s my_session
 # 在tmux会话中运行任务
-accelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 50 --num_samples 10000000 --batch_size 960 --dataset_stream False
+accelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 1000 --num_samples 1000000 --batch_size 960 --dataset_stream False --save_every 100 --learning_rate 1e-2 --max_expr_length 12
 
 accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no train.py --num_epochs 50 --num_samples 1 --batch_size 1 --debug 1
 
@@ -92,5 +92,39 @@ Ctrl + C
 # 退出复制模式
 Ctrl + D
 #推理测试命令
-python example.py --parquet_path data/flow_samples_10000000_3dim_100pts_6depth_24len.parquet --sample_idx 0
+python example.py --parquet_path data/flow_samples_10000000_3dim_100pts_6depth_24len.parquet --sample_idx 1
+```
+
+# 上传权重和数据集到Hugging Face
+```
+#上传数据集到Hugging Face
+export HF_ENDPOINT=https://huggingface.co
+export HF_HUB_DISABLE_PROGRESS_BARS=0
+export HF_HUB_ENABLE_HF_TRANSFER=0
+
+hf upload BeiBei-Clic/SGB-EF data/flow_samples_10000000_3dim_100pts_6depth_24len.parquet \
+  data/flow_samples_10000000_3dim_100pts_6depth_24len.parquet \
+  --repo-type dataset --commit-message "Add 10M parquet"
+
+hf upload BeiBei-Clic/SGB-EF data/flow_samples_10000000_3dim_100pts_6depth_24len_dimension_index.json \
+  data/flow_samples_10000000_3dim_100pts_6depth_24len_dimension_index.json \
+  --repo-type dataset --commit-message "Add dimension index"
+s
+
+#上传模型权重到Hugging Face
+HF_ENDPOINT=https://huggingface.co python - << 'PY'
+from huggingface_hub import HfApi
+api = HfApi()
+
+api.upload_folder(
+    repo_id="BeiBei-Clic/SGB-EF",
+    repo_type="model",
+    folder_path="checkpoints/checkpoint_epoch_15",
+    path_in_repo="training_checkpoints/epoch_15",
+    allow_patterns=["model*.safetensors", "training_config.json"],
+    ignore_patterns=["optimizer.bin", "random_states_*.pkl"],
+    commit_message="Save epoch 15 weights",
+)
+print("Upload done.")
+PY
 ```

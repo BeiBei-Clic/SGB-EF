@@ -4,11 +4,9 @@
 import numpy as np
 import re
 import argparse
-import pandas as pd
 import os
 from pathlib import Path
 
-from src.training.editflow_manager import EditFlowManager
 
 # ============= 配置常量 =============
 MAX_EXPR_LENGTH = 24
@@ -16,7 +14,7 @@ N_POINTS = 100
 MAX_DEPTH = 5
 MAX_DIM = 3
 DEFAULT_DATA_DIR = 'data'
-DEFAULT_MODEL_PATH = 'checkpoints/checkpoint_epoch_20'
+DEFAULT_MODEL_PATH = 'checkpoints/checkpoint_epoch_10'
 
 
 # ============= 辅助函数 =============
@@ -78,7 +76,7 @@ def list_available_datasets(data_dir=DEFAULT_DATA_DIR):
 
 
 def load_sample(parquet_path, target_expr=None, sample_idx=None):
-    """从Parquet数据集加载样本（只读取需要的行，避免加载整个数据集）"""
+    """从Parquet数据集加载样本（按行组读取，避免加载整个数据集）"""
     if not os.path.exists(parquet_path):
         available = list_available_datasets()
         raise FileNotFoundError(
@@ -87,36 +85,48 @@ def load_sample(parquet_path, target_expr=None, sample_idx=None):
             "\n".join(f"  - {f}" for f in available)
         )
 
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(parquet_path, memory_map=True)
+    total_rows = parquet_file.metadata.num_rows
+    columns = ['x_values', 'y_target', 'exp_gt', 'exp_cur1', 'input_dimension']
+
+    def read_row_by_index(row_idx):
+        if row_idx < 0 or row_idx >= total_rows:
+            raise IndexError(f"样本索引超出范围: {row_idx} (0~{total_rows - 1})")
+        offset = 0
+        for rg_index in range(parquet_file.num_row_groups):
+            rg_rows = parquet_file.metadata.row_group(rg_index).num_rows
+            if row_idx < offset + rg_rows:
+                table = parquet_file.read_row_group(rg_index, columns=columns)
+                row_table = table.slice(row_idx - offset, 1)
+                row = row_table.to_pandas().iloc[0]
+                del row_table
+                del table
+                return row
+            offset += rg_rows
+        raise IndexError(f"样本索引超出范围: {row_idx} (0~{total_rows - 1})")
+
+    def find_row_by_expr(expr):
+        offset = 0
+        for rg_index in range(parquet_file.num_row_groups):
+            exp_table = parquet_file.read_row_group(rg_index, columns=['exp_gt'])
+            exp_series = exp_table.to_pandas()['exp_gt']
+            matches = exp_series[exp_series == expr]
+            if not matches.empty:
+                row_idx = offset + matches.index[0]
+                row = read_row_by_index(row_idx)
+                return row_idx, row
+            offset += parquet_file.metadata.row_group(rg_index).num_rows
+        return None, None
+
     # 读取数据并提取需要的样本
     if sample_idx is not None:
-        # 尝试只读取第一行（对于sample_idx=0的情况，这是最常见的使用场景）
-        if sample_idx == 0:
-            # 使用PyArrow读取第一行
-            import pyarrow.parquet as pq
-            parquet_file = pq.ParquetFile(parquet_path)
-
-            # 读取第一个行组的第一行
-            table = parquet_file.read_row_group(0)
-            df = table.slice(0, 1).to_pandas()
-            row = df.iloc[0]
-            del df
-            del table
-        else:
-            # 对于其他索引，还是需要读取整个数据集
-            # 但至少添加一个警告
-            print(f"注意：读取索引 {sample_idx} 需要加载整个数据集")
-            df = pd.read_parquet(parquet_path)
-            row = df.loc[sample_idx]
-            del df
+        row = read_row_by_index(sample_idx)
     else:
-        # 需要通过表达式查找，暂时读取整个数据集（这种情况很少使用）
-        df = pd.read_parquet(parquet_path)
-        matched = df[df['exp_gt'] == target_expr]
-        if len(matched) == 0:
+        sample_idx, row = find_row_by_expr(target_expr)
+        if row is None:
             raise ValueError(f"未找到表达式: {target_expr}")
-        sample_idx = matched.index[0]
-        row = df.loc[sample_idx]
-        del df
 
     # 处理x_values格式
     x_values = ensure_2d_array(row['x_values'])
@@ -171,6 +181,10 @@ def parse_arguments():
     parser.add_argument(
         '--list_datasets', action='store_true',
         help='列出所有可用的数据集并退出'
+    )
+    parser.add_argument(
+        '--read_only', action='store_true',
+        help='只读取样本并退出（用于测试读取速度）'
     )
     parser.add_argument(
         '--data_dir', type=str, default=DEFAULT_DATA_DIR,
@@ -247,16 +261,31 @@ def setup_model_config():
 # ============= 推理执行 =============
 def run_inference(model_args, model_path, x_data, y_data, input_dim, initial_expr):
     """执行推理"""
+    from src.training.editflow_manager import EditFlowManager
     manager = EditFlowManager(model_args)
-    result = manager.symbolic_regression(
-        model_path=model_path,
-        x_data=x_data,
-        y_data=y_data,
-        n_steps=1,
-        input_dim=input_dim,
-        initial_expr=initial_expr
-    )
-    return result
+    result = None
+    try:
+        result = manager.symbolic_regression(
+            model_path=model_path,
+            x_data=x_data,
+            y_data=y_data,
+            n_steps=1,
+            input_dim=input_dim,
+            initial_expr=initial_expr
+        )
+        return result
+    finally:
+        # Ensure background resources are released so the process can exit cleanly.
+        try:
+            manager.accelerator.end_training()
+        except Exception:
+            pass
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 # ============= 结果展示 =============
@@ -369,6 +398,8 @@ def main():
     print_section(f"加载样本: {args.sample_idx if args.sample_idx is not None else args.target_expr}")
     sample = load_sample(args.parquet_path, args.target_expr, args.sample_idx)
     display_sample_info(sample)
+    if args.read_only:
+        return
 
     # 重新组织数据
     expr_gt, x_data = reorganize_data_by_used_variables(sample['exp_gt'], sample['x'])
