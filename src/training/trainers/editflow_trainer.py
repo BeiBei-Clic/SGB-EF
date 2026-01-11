@@ -112,6 +112,7 @@ class EditFlowTrainer:
     def forward_and_compute_loss(self, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
         """前向传播并计算损失（合并方法，减少中间状态传递）"""
         from ..flow import remove_gap_tokens, fill_gap_tokens_with_repeats
+        from ..op_stats import count_ops_from_mask
 
         batch_size = z0_token_ids.size(0)
         vocab_size = self.tokenizer.vocab_size
@@ -163,6 +164,17 @@ class EditFlowTrainer:
         u_mask_x = self.criterion.make_ut_mask_from_z(z0_token_ids, z1_token_ids, vocab_size, gap_token, self.tokenizer, x_t)
         u_mask = fill_gap_tokens_with_repeats(u_mask_x, z_gap_mask, z_pad_mask)
 
+        ins, delete, sub, keep, valid = count_ops_from_mask(u_mask_x, vocab_size)
+        op_stats = {
+            "ins": ins,
+            "del": delete,
+            "sub": sub,
+            "keep": keep,
+            "valid": valid,
+        }
+        if debug_info is not None:
+            debug_info["op_stats"] = op_stats
+
         # 记录debug信息
         if self.accelerator.is_local_main_process and self.debug_mode:
             self.logger.log_compute_loss_debug(
@@ -182,7 +194,7 @@ class EditFlowTrainer:
         loss = self.criterion(u_cat_x, u_z, u_mask, vocab_size,
                         accelerator=self.accelerator, logger=self.logger)
 
-        return loss, pred_rates
+        return loss, pred_rates, op_stats
 
     # ============= 训练和评估 =============
     def train_epoch(self, dataloader, dataset, epoch, dimension):
@@ -204,6 +216,7 @@ class EditFlowTrainer:
         total_loss = 0.0
         num_batches = 0
         local_total_grad_norm = 0.0
+        local_op_counts = {"ins": 0, "del": 0, "sub": 0, "keep": 0, "valid": 0}
 
         # 计算数据集信息
         try:
@@ -243,13 +256,15 @@ class EditFlowTrainer:
                     level=1
                 )
 
-            loss, grad_norm = self._process_batch(
+            loss, grad_norm, op_stats = self._process_batch(
                 batch, batch_idx, epoch, dimension
             )
 
             total_loss += loss
             num_batches += 1
             local_total_grad_norm += grad_norm
+            for key in local_op_counts:
+                local_op_counts[key] += op_stats[key]
 
             batch_total_time = time.time() - batch_start_time
 
@@ -339,7 +354,7 @@ class EditFlowTrainer:
                     )
 
         # 返回平均损失、批次数、总损失和总梯度范数（用于GPU级别信息汇总）
-        return avg_loss, num_batches, total_loss, local_total_grad_norm
+        return avg_loss, num_batches, total_loss, local_total_grad_norm, local_op_counts
 
     def _process_batch(self, batch, batch_idx, epoch, dimension):
         """处理单个训练batch"""
@@ -377,7 +392,7 @@ class EditFlowTrainer:
 
             # 前向传播并计算损失（合并方法）
             forward_start = time.time()
-            loss, pred_rates = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
+            loss, pred_rates, op_stats = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
             forward_time = time.time() - forward_start
 
             if self.accelerator.is_local_main_process and self.debug_mode:
@@ -434,7 +449,7 @@ class EditFlowTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            return loss.item(), grad_norm
+            return loss.item(), grad_norm, op_stats
 
     def evaluate(self, test_dataloader, test_dataset):
         """测试集评估"""
@@ -491,7 +506,7 @@ class EditFlowTrainer:
                 point_mask = batch['point_mask'].to(self.device)
 
                 condition_embeddings = self.condition_encoder(x_values, y_target, point_mask)
-                loss, _ = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids)
+                loss, _, _ = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids)
 
                 total_loss += loss.item()
                 num_batches += 1

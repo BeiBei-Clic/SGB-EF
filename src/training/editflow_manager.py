@@ -50,6 +50,8 @@ class EditFlowManager:
 
     def __init__(self, args):
         self.args = args
+        self._op_weight_ema = 0.9
+        self._smoothed_op_weights = None
 
         # 初始化 Accelerate - 自动处理分布式训练设置
         # 注意：mixed_precision 由 accelerate launch 命令行参数控制
@@ -569,7 +571,7 @@ class EditFlowManager:
 
         # 训练循环
         for epoch in range(self.args.num_epochs):
-            avg_loss, num_batches, total_loss, total_grad_norm = trainer.train_epoch(
+            avg_loss, num_batches, total_loss, total_grad_norm, op_counts = trainer.train_epoch(
                 train_dataloader, train_dataset, epoch, "Mixed"
             )
 
@@ -578,6 +580,43 @@ class EditFlowManager:
 
             if scheduler is not None:
                 scheduler.step(epoch, avg_loss)
+
+            # 操作分布统计（用于反比权重）
+            if optimizer is not None:
+                counts_tensor = torch.tensor(
+                    [op_counts["ins"], op_counts["del"], op_counts["sub"], op_counts["keep"]],
+                    device=self.device
+                )
+                if self.accelerator.num_processes > 1:
+                    gathered = self.accelerator.gather(counts_tensor)
+                    counts_tensor = gathered.sum(dim=0)
+
+                from .op_stats import compute_inverse_weights
+                op_weights = compute_inverse_weights(
+                    counts_tensor[0].item(),
+                    counts_tensor[1].item(),
+                    counts_tensor[2].item(),
+                    counts_tensor[3].item(),
+                )
+                if self._smoothed_op_weights is None:
+                    self._smoothed_op_weights = dict(op_weights)
+                else:
+                    ema = self._op_weight_ema
+                    self._smoothed_op_weights = {
+                        key: ema * self._smoothed_op_weights[key] + (1 - ema) * op_weights[key]
+                        for key in op_weights
+                    }
+                trainer.criterion.set_op_weights(self._smoothed_op_weights)
+                if self.debug_mode and self.accelerator.is_local_main_process:
+                    self.logger.log(
+                        "OP_WEIGHTS",
+                        f"epoch{epoch+1} | raw_ins={op_weights['ins']:.3f} | raw_del={op_weights['del']:.3f} | "
+                        f"raw_sub={op_weights['sub']:.3f} | raw_keep={op_weights['keep']:.3f} | "
+                        f"ema_ins={self._smoothed_op_weights['ins']:.3f} | ema_del={self._smoothed_op_weights['del']:.3f} | "
+                        f"ema_sub={self._smoothed_op_weights['sub']:.3f} | ema_keep={self._smoothed_op_weights['keep']:.3f}",
+                        "op_weights",
+                        level=2
+                    )
 
             # 只在主进程上打印和记录日志
             if self.accelerator.is_local_main_process:

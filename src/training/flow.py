@@ -68,6 +68,16 @@ class ContinuousFlowLoss:
 
     def __init__(self, debug_mode=False):
         self.debug_mode = debug_mode
+        self.op_weights = None
+        self._cached_weight = None
+        self._cached_vocab_size = None
+        self._cached_key = None
+
+    def set_op_weights(self, op_weights):
+        self.op_weights = op_weights
+        self._cached_weight = None
+        self._cached_vocab_size = None
+        self._cached_key = None
 
     def make_ut_mask_from_z(self, z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int,
                            gap_token: int, tokenizer, x_t: torch.Tensor) -> torch.Tensor:
@@ -236,9 +246,27 @@ class ContinuousFlowLoss:
         # 步骤2: 计算标准cross_entropy（对每个token位置）
         # u_z: [batch, z_seq_len, n_ops] -> [batch*z_seq_len, n_ops]
         # target_ids: [batch, z_seq_len] -> [batch*z_seq_len]
+        weight = None
+        if self.op_weights is not None:
+            key = (vocab_size, self.op_weights["ins"], self.op_weights["del"],
+                   self.op_weights["sub"], self.op_weights["keep"])
+            if self._cached_weight is None or self._cached_key != key:
+                n_ops = 2 * vocab_size + 2
+                weight = torch.ones(n_ops, dtype=torch.float32, device=u_z.device)
+                weight[:vocab_size] *= self.op_weights["ins"]
+                weight[vocab_size] *= self.op_weights["del"]
+                weight[vocab_size + 1:2 * vocab_size + 1] *= self.op_weights["sub"]
+                weight[2 * vocab_size + 1] *= self.op_weights["keep"]
+                self._cached_weight = weight
+                self._cached_vocab_size = vocab_size
+                self._cached_key = key
+            else:
+                weight = self._cached_weight
+
         loss_per_token = F.cross_entropy(
             u_z.reshape(-1, n_ops),
             target_ids.reshape(-1),
+            weight=weight,
             reduction='none'  # 先不归一化，后续手动处理
         )  # [batch*z_seq_len]
 
@@ -492,4 +520,3 @@ def custom_collate_fn(batch):
     }
 
     return result
-

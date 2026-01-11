@@ -1046,6 +1046,16 @@ class Logger:
                 max_elements=5000
             )
 
+        if debug_info and "op_stats" in debug_info:
+            op_stats = debug_info["op_stats"]
+            self.log(
+                "OP_STATS",
+                f"batch{batch_idx} | ins={op_stats['ins']} | del={op_stats['del']} | "
+                f"sub={op_stats['sub']} | keep={op_stats['keep']} | valid={op_stats['valid']}",
+                context,
+                level=2
+            )
+
     def log_pred_vs_gt(self, sample_idx, batch_idx, context, x_t, u_cat_x, u_mask_x, vocab_size, tokenizer):
         """记录预测与Ground Truth的对比
 
