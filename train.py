@@ -60,16 +60,16 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="models/huggingface_cache", help="模型缓存目录")
 
     # LLaMA模型架构参数
-    parser.add_argument("--hidden_dim", type=int, default=1024, help="LLaMA隐藏层维度")
-    parser.add_argument("--n_layers", type=int, default=16, help="LLaMA Transformer层数")
-    parser.add_argument("--n_heads", type=int, default=16, help="LLaMA注意力头数")
+    parser.add_argument("--hidden_dim", type=int, default=1536, help="LLaMA隐藏层维度")
+    parser.add_argument("--n_layers", type=int, default=24, help="LLaMA Transformer层数")
+    parser.add_argument("--n_heads", type=int, default=24, help="LLaMA注意力头数")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout比率")
     parser.add_argument("--use_condition_injection", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否使用交叉注意力条件注入")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
+    parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
     parser.add_argument("--min_lr", type=float, default=1e-6, help="学习率下限(用于余弦退火)")
     parser.add_argument("--warmup_steps", type=int, default=0, help="学习率预热步数(按epoch)")
