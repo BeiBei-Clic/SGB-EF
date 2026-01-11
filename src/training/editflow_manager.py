@@ -368,14 +368,18 @@ class EditFlowManager:
                 betas=(0.9, 0.999)
             )
 
-            # 添加学习率调度器（余弦退火或固定）
-            if self.args.lr_scheduler == "cosine":
-                from torch.optim.lr_scheduler import CosineAnnealingLR
-                scheduler = CosineAnnealingLR(
-                    optimizer,
-                    T_max=self.args.num_epochs,
-                    eta_min=self.args.min_lr
-                )
+            from .lr_schedulers import WarmupCosineWithPlateau
+            scheduler = WarmupCosineWithPlateau(
+                optimizer=optimizer,
+                total_epochs=self.args.num_epochs,
+                min_lr=self.args.min_lr,
+                warmup_steps=self.args.warmup_steps,
+                warmup_ratio=self.args.warmup_ratio,
+                plateau_patience=self.args.plateau_patience,
+                plateau_factor=self.args.plateau_factor,
+                plateau_min_delta=self.args.plateau_min_delta,
+                plateau_min_lr=self.args.plateau_min_lr,
+            )
 
         # 加载检查点（推理模式下跳过training_config.json以加快加载速度）
         load_checkpoint(
@@ -496,14 +500,22 @@ class EditFlowManager:
             print(f"开始连续流训练 ({self.args.num_epochs} epochs)...")
             effective_dropout = 0.0 if self.args.overfit_mode else self.args.dropout
             effective_weight_decay = 0.0 if self.args.overfit_mode else self.args.weight_decay
-            print(f"学习率调度: {self.args.lr_scheduler}, min_lr={self.args.min_lr:.2e}, "
-                  f"weight_decay={effective_weight_decay:.2e}, dropout={effective_dropout:.2f}, "
-                  f"num_samples={self.args.num_samples}")
+            print(
+                f"学习率调度: warmup+cosine+plateau | "
+                f"warmup_steps={self.args.warmup_steps} | warmup_ratio={self.args.warmup_ratio:.2f} | "
+                f"min_lr={self.args.min_lr:.2e} | plateau_patience={self.args.plateau_patience} | "
+                f"plateau_factor={self.args.plateau_factor:.2f} | plateau_min_delta={self.args.plateau_min_delta:.1e} | "
+                f"plateau_min_lr={self.args.plateau_min_lr:.2e} | weight_decay={effective_weight_decay:.2e} | "
+                f"dropout={effective_dropout:.2f} | num_samples={self.args.num_samples}"
+            )
             self.logger.log(
                 "TRAINING_START",
                 f"开始训练 | num_epochs={self.args.num_epochs} | model_params={model_params:,} | "
-                f"encoder_params={encoder_params:,} | lr_scheduler={self.args.lr_scheduler} | "
-                f"min_lr={self.args.min_lr:.2e} | weight_decay={effective_weight_decay:.2e} | "
+                f"encoder_params={encoder_params:,} | lr_scheduler=warmup+cosine+plateau | "
+                f"warmup_steps={self.args.warmup_steps} | warmup_ratio={self.args.warmup_ratio:.2f} | "
+                f"min_lr={self.args.min_lr:.2e} | plateau_patience={self.args.plateau_patience} | "
+                f"plateau_factor={self.args.plateau_factor:.2f} | plateau_min_delta={self.args.plateau_min_delta:.1e} | "
+                f"plateau_min_lr={self.args.plateau_min_lr:.2e} | weight_decay={effective_weight_decay:.2e} | "
                 f"dropout={effective_dropout:.2f} | num_samples={self.args.num_samples}",
                 level=1
             )
@@ -564,6 +576,9 @@ class EditFlowManager:
             # 在所有进程上收集训练指标（使用合并后的方法）
             metrics = trainer.gather_and_format_metrics(num_batches, total_loss, total_grad_norm)
 
+            if scheduler is not None:
+                scheduler.step(epoch, avg_loss)
+
             # 只在主进程上打印和记录日志
             if self.accelerator.is_local_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
@@ -599,9 +614,6 @@ class EditFlowManager:
                         f"avg_grad_norm={avg_grad_norm:.3f} | lr={current_lr:.2e} | batches={num_batches}",
                         level=1
                     )
-
-            if scheduler is not None:
-                scheduler.step()
 
             # 评估
             if (epoch + 1) % eval_every == 0 or epoch == self.args.num_epochs - 1:

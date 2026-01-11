@@ -71,10 +71,13 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
-    parser.add_argument("--lr_scheduler", type=str, default="cosine",
-                        choices=["cosine", "fixed"],
-                        help="学习率调度策略: cosine(余弦退火) 或 fixed(固定)")
-    parser.add_argument("--min_lr", type=float, default=1e-6, help="学习率下限(用于cosine)")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="学习率下限(用于余弦退火)")
+    parser.add_argument("--warmup_steps", type=int, default=0, help="学习率预热步数(按epoch)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="学习率预热比例(按epoch, 0-1)")
+    parser.add_argument("--plateau_patience", type=int, default=5, help="连续多少个epoch不降就触发降LR")
+    parser.add_argument("--plateau_factor", type=float, default=0.5, help="触发后LR缩放因子")
+    parser.add_argument("--plateau_min_delta", type=float, default=1e-4, help="认为loss有改善的最小下降")
+    parser.add_argument("--plateau_min_lr", type=float, default=1e-6, help="plateau降LR的最小学习率")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--save_every", type=int, default=5, help="每多少轮保存一次")
