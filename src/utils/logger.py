@@ -962,7 +962,7 @@ class Logger:
                         tokenizer=tokenizer, top_k=5, context=context, level=2
                     )
 
-    def log_compute_loss_debug(self, debug_info, z0, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, vocab_size, tokenizer):
+    def log_compute_loss_debug(self, debug_info, z0, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, vocab_size, tokenizer, attention_mask=None):
         """记录compute_loss的debug信息
 
         Args:
@@ -975,6 +975,7 @@ class Logger:
             u_mask_x: 编辑操作掩码
             vocab_size (int): 词汇表大小
             tokenizer: tokenizer对象，用于token转换
+            attention_mask: 注意力掩码（仅记录有效位置）
         """
         if not self._should_log(2):
             return
@@ -1026,8 +1027,24 @@ class Logger:
         # 对比预测 vs Ground Truth
         self.log_pred_vs_gt(sample_idx, batch_idx, context, x_t, u_cat_x, u_mask_x, vocab_size, tokenizer)
 
-        self.tensor_values(f"pred_u_cat_x_batch{batch_idx}_first5pos", u_cat_x[sample_idx, :5, :],
-                         context=context, level=2, max_elements=100)
+        if attention_mask is None:
+            self.tensor_values(
+                f"pred_u_cat_x_batch{batch_idx}_first5pos",
+                u_cat_x[sample_idx, :5, :],
+                context=context,
+                level=2,
+                max_elements=100
+            )
+        else:
+            mask = attention_mask[sample_idx].bool()
+            valid_u_cat_x = u_cat_x[sample_idx][mask]
+            self.tensor_values(
+                f"pred_u_cat_x_batch{batch_idx}_validpos",
+                valid_u_cat_x,
+                context=context,
+                level=2,
+                max_elements=5000
+            )
 
     def log_pred_vs_gt(self, sample_idx, batch_idx, context, x_t, u_cat_x, u_mask_x, vocab_size, tokenizer):
         """记录预测与Ground Truth的对比

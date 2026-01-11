@@ -165,7 +165,18 @@ class EditFlowTrainer:
 
         # 记录debug信息
         if self.accelerator.is_local_main_process and self.debug_mode:
-            self.logger.log_compute_loss_debug(debug_info, z0_token_ids, z1_token_ids, x_t, pred_rates, u_cat_x, u_mask_x, vocab_size, self.tokenizer)
+            self.logger.log_compute_loss_debug(
+                debug_info,
+                z0_token_ids,
+                z1_token_ids,
+                x_t,
+                pred_rates,
+                u_cat_x,
+                u_mask_x,
+                vocab_size,
+                self.tokenizer,
+                attention_mask=attention_mask
+            )
 
         # 计算损失
         loss = self.criterion(u_cat_x, u_z, u_mask, vocab_size,

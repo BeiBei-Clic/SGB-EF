@@ -71,9 +71,15 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="权重衰减")
+    parser.add_argument("--lr_scheduler", type=str, default="cosine",
+                        choices=["cosine", "fixed"],
+                        help="学习率调度策略: cosine(余弦退火) 或 fixed(固定)")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="学习率下限(用于cosine)")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--save_every", type=int, default=5, help="每多少轮保存一次")
+    parser.add_argument("--overfit_mode", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False,
+                        help="过拟合训练集模式(用于排查训练损失是否能下降)")
 
     # 多GPU参数 - 由 Accelerate 自动管理
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
