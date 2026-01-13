@@ -70,9 +70,9 @@ lsof | grep "flow_samples_10000000"
 # 创建一个名为my_session的tmux会话
 tmux new -s my_session
 # 在tmux会话中运行任务
-ccelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 1000 --num_samples 1000000 --batch_size 96 --dataset_stream False --save_every 5 --learning_rate 2e-4 --warmup_ratio 0.05 --min_lr 1e-5 --plateau_patience 8 --plateau_factor 0.5 --plateau_min_delta 1e-4 --plateau_min_lr 1e-5 --max_expr_length 12
+accelerate launch --num_processes=3 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --multi_gpu train.py --num_epochs 1000 --num_samples 10000 --batch_size 96 --dataset_stream False --save_every 100 --learning_rate 2e-4 --warmup_ratio 0.05 --min_lr 1e-5 --plateau_patience 50 --plateau_factor 0.8 --plateau_min_delta 1e-4 --plateau_min_lr 1e-5 --max_expr_length 12
 #模型通路测试
-ccelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no train.py --num_epochs 50 --num_samples 1 --batch_size 1 --debug 1 --learning_rate 2e-4 --warmup_steps 0 --min_lr 1e-5 --plateau_patience 5 --plateau_factor 0.5 --plateau_min_delta 1e-4 --plateau_min_lr 1e-5
+accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no train.py --num_epochs 50 --num_samples 1 --batch_size 1 --debug 1 --learning_rate 2e-4 --warmup_steps 0 --min_lr 1e-5 --plateau_patience 5 --plateau_factor 0.5 --plateau_min_delta 1e-4 --plateau_min_lr 1e-5
 #过拟合测试
 accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no train.py --num_epochs 1000 --num_samples 100 --batch_size 24 --debug 1 --learning_rate 2e-4 --overfit_mode true --warmup_ratio 0.05 --min_lr 1e-5 --plateau_patience 5 --plateau_factor 0.5 --plateau_min_delta 1e-4 --plateau_min_lr 1e-5
 
@@ -126,4 +126,9 @@ api.upload_folder(
     ignore_patterns=["optimizer.bin", "random_states_*.pkl"],
     commit_message="Save epoch 15 weights",
 )
+```
+
+###下载数据集
+```bash
+wget -P resources --content-disposition "https://www.dropbox.com/scl/fi/kbi1q63opcgsykik0puzg/Feynman_with_units.tar.gz?rlkey=xqm1mb0vkj7iogao825033ltb&e=1&dl=1"
 ```

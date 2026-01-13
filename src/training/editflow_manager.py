@@ -583,13 +583,25 @@ class EditFlowManager:
 
             # 操作分布统计（用于反比权重）
             if optimizer is not None:
-                counts_tensor = torch.tensor(
+                counts_tensor = torch.as_tensor(
                     [op_counts["ins"], op_counts["del"], op_counts["sub"], op_counts["keep"]],
-                    device=self.device
+                    device=self.device,
+                    dtype=torch.long,
                 )
                 if self.accelerator.num_processes > 1:
                     gathered = self.accelerator.gather(counts_tensor)
-                    counts_tensor = gathered.sum(dim=0)
+                    if gathered.ndim == 1 and gathered.numel() % 4 == 0:
+                        gathered = gathered.view(-1, 4)
+                    if gathered.ndim > 0:
+                        counts_tensor = gathered.sum(dim=0)
+                    else:
+                        counts_tensor = gathered
+                if counts_tensor.ndim == 0 or counts_tensor.numel() != 4:
+                    counts_tensor = torch.as_tensor(
+                        [op_counts["ins"], op_counts["del"], op_counts["sub"], op_counts["keep"]],
+                        device=self.device,
+                        dtype=torch.long,
+                    )
 
                 from .op_stats import compute_inverse_weights
                 op_weights = compute_inverse_weights(
