@@ -118,7 +118,7 @@ class SimpleSymbolicRegression:
         self.numerical_clip_threshold = numerical_clip_threshold
 
         # 准备推理时间步序列（始终启用）
-        from .time_sampling import TimestepSampler
+        from ..core.sampling import TimestepSampler
         self.timestep_sampler = TimestepSampler(
             sampling_strategy="discrete",
             num_discrete_timesteps=num_inference_timesteps
@@ -558,7 +558,7 @@ class SimpleSymbolicRegression:
         try:
             eval_start = time.time()
 
-            from ..symbolic.symbolic_utils import (
+            from ...symbolic.symbolic_utils import (
                 evaluate_expression_with_constants,
                 evaluate_expression_safe
             )

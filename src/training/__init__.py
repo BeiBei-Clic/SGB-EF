@@ -12,7 +12,7 @@
 from .editflow_manager import EditFlowManager
 from .trainers.editflow_trainer import EditFlowTrainer
 from .inference.inference_engine import InferenceEngine
-from .flow import ContinuousFlowLoss, prepare_dataset_hf
+from .core.flow import ContinuousFlowLoss, prepare_dataset_hf
 
 
 __all__ = [

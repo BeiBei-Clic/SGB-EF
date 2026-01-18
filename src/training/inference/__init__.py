@@ -3,5 +3,6 @@
 """
 
 from .inference_engine import InferenceEngine
+from .search import SimpleSymbolicRegression
 
-__all__ = ['InferenceEngine']
+__all__ = ['InferenceEngine', 'SimpleSymbolicRegression']

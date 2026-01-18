@@ -18,7 +18,7 @@ from accelerate import Accelerator
 from accelerate.utils import DataLoaderConfiguration, set_seed
 
 from ..symbolic.data_generator import generate_flow_samples
-from .flow import (
+from .core.flow import (
     remove_gap_tokens, fill_gap_tokens_with_repeats,
     ContinuousFlowLoss, prepare_dataset_hf, custom_collate_fn
 )
@@ -26,7 +26,6 @@ from ..modeling.condition_encoder import SetTransformerConditionEncoder
 from ..modeling.llama_editflow import LlamaEditFlowBackbone
 from ..utils.misc_utils import find_latest_checkpoint, load_checkpoint
 from ..utils.logger import Logger
-from .greedy_search import SimpleSymbolicRegression
 
 # 新导入：训练器和推理引擎
 from .trainers.editflow_trainer import EditFlowTrainer
@@ -371,7 +370,7 @@ class EditFlowManager:
                 betas=(0.9, 0.999)
             )
 
-            from .lr_schedulers import WarmupCosineWithPlateau
+            from .trainers.schedulers import WarmupCosineWithPlateau
             scheduler = WarmupCosineWithPlateau(
                 optimizer=optimizer,
                 total_epochs=self.args.num_epochs,
@@ -605,7 +604,7 @@ class EditFlowManager:
                         dtype=torch.long,
                     )
 
-                from .op_stats import compute_inverse_weights
+                from .utils.stats import compute_inverse_weights
                 op_weights = compute_inverse_weights(
                     counts_tensor[0].item(),
                     counts_tensor[1].item(),

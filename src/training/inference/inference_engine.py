@@ -38,7 +38,7 @@ class InferenceEngine:
         self.condition_encoder.eval()
 
         # 导入搜索器（延迟导入避免循环依赖）
-        from ..greedy_search import SimpleSymbolicRegression
+        from ..inference.search import SimpleSymbolicRegression
         self.searcher = SimpleSymbolicRegression(
             model=model,
             condition_encoder=condition_encoder,

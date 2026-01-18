@@ -3,5 +3,6 @@
 """
 
 from .editflow_trainer import EditFlowTrainer
+from .schedulers import WarmupCosineWithPlateau
 
-__all__ = ['EditFlowTrainer']
+__all__ = ['EditFlowTrainer', 'WarmupCosineWithPlateau']

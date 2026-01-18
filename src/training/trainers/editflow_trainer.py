@@ -50,7 +50,7 @@ class EditFlowTrainer:
         self.debug_mode = args.debug
 
         # 时间步采样器（始终启用）
-        from ..time_sampling import TimestepSampler
+        from ..core.sampling import TimestepSampler
         self.timestep_sampler = TimestepSampler(
             sampling_strategy=time_sampling_strategy,
             num_discrete_timesteps=num_discrete_timesteps
@@ -131,9 +131,9 @@ class EditFlowTrainer:
             z1_token_ids: 目标状态token IDs
             debug_info: 调试信息
         """
-        from ..flow import remove_gap_tokens, fill_gap_tokens_with_repeats
-        from ..flow_interpolation import interpolate_z_to_zt, CubicScheduler
-        from ..op_stats import count_ops_from_mask
+        from ..core.flow import remove_gap_tokens, fill_gap_tokens_with_repeats
+        from ..core.interpolation import interpolate_z_to_zt, CubicScheduler
+        from ..utils.stats import count_ops_from_mask
 
         batch_size = z0_token_ids.size(0)
         vocab_size = self.tokenizer.vocab_size
