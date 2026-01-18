@@ -234,7 +234,7 @@ def generate_single_sample(
                 "z1_token_ids": pad_sequence_with_bos(
                     tokenizer.convert_tokens_to_ids(z1_tokens),
                     max_expr_length, bos_token_id, pad_token_id
-                )
+                ),
             })
 
             # 生成对称样本
@@ -280,7 +280,7 @@ def generate_single_sample(
                 "z1_token_ids": pad_sequence_with_bos(
                     tokenizer.convert_tokens_to_ids(sym_z1_tokens),
                     max_expr_length, bos_token_id, pad_token_id
-                )
+                ),
             })
             _sample_logger.levenshtein_alignment(sample_id, f"{i+1}-sym", len(sym_z0_tokens), len(sym_z1_tokens), sym_align_time)
 

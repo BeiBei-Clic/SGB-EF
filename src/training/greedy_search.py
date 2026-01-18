@@ -91,7 +91,8 @@ class SimpleSymbolicRegression:
                  logger,
                  min_action_score=0.01,
                  max_expression_length=50,
-                 numerical_clip_threshold=1e6):
+                 numerical_clip_threshold=1e6,
+                 num_inference_timesteps: int = 10):
         """初始化简单推理器
 
         Args:
@@ -104,6 +105,7 @@ class SimpleSymbolicRegression:
             min_action_score: 最小操作分数阈值（用于过滤低分操作）
             max_expression_length: 表达式最大长度
             numerical_clip_threshold: 数值裁剪阈值
+            num_inference_timesteps: 推理时使用的时间步数量
         """
         self.model = model
         self.condition_encoder = condition_encoder
@@ -114,6 +116,18 @@ class SimpleSymbolicRegression:
         self.min_action_score = min_action_score
         self.max_expression_length = max_expression_length
         self.numerical_clip_threshold = numerical_clip_threshold
+
+        # 准备推理时间步序列（始终启用）
+        from .time_sampling import TimestepSampler
+        self.timestep_sampler = TimestepSampler(
+            sampling_strategy="discrete",
+            num_discrete_timesteps=num_inference_timesteps
+        )
+        self.inference_timesteps = self.timestep_sampler.get_timesteps_for_inference(
+            num_inference_timesteps, device
+        )
+        self.current_timestep_idx = 0
+        self.num_inference_timesteps = num_inference_timesteps
 
     def generate_action_proposals(self,
                                   current_tokens: List[str],
@@ -142,11 +156,15 @@ class SimpleSymbolicRegression:
         input_ids = torch.LongTensor([tokenized_expr]).to(self.device)
         attention_mask = (input_ids != pad_token).float().to(self.device)
 
+        # 准备时间步（使用当前推理步对应的时间步）
+        timestep = self.inference_timesteps[self.current_timestep_idx:self.current_timestep_idx+1]
+
         with torch.no_grad():
             output = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                condition=condition
+                condition=condition,
+                timestep=timestep
             )
 
             # 提取结果（使用logits，和训练时一致）
@@ -618,6 +636,7 @@ class SimpleSymbolicRegression:
 
         if self._is_main_process():
             print(f"\n开始贪婪搜索推理 (共{n_steps}步)")
+            print(f"使用多时间步推理模式: {self.num_inference_timesteps} 个时间步")
             print(f"初始表达式: {','.join(initial_tokens)}")
 
         # 初始化当前候选
@@ -634,6 +653,26 @@ class SimpleSymbolicRegression:
         for step in range(n_steps):
             if self._is_main_process():
                 print(f"步骤 {step + 1}/{n_steps}: {','.join(current_candidate.tokens)}")
+
+            # 多时间步推理：基于表达式长度的自适应时间步调度
+            # 方案：根据当前表达式长度与目标长度的比例来估计时间步
+            current_length = len(current_candidate.tokens)
+            # 假设目标长度约15（可根据实际情况调整）
+            target_length_estimate = 15
+            # t=1表示简单（短），t=0表示复杂（长）
+            estimated_t = 1.0 - min(current_length / target_length_estimate, 1.0)
+
+            # 平滑过渡：结合推理进度
+            t_progress = step / n_steps
+            current_t = 0.7 * estimated_t + 0.3 * t_progress  # 加权融合
+
+            self.current_timestep_idx = min(
+                int((1.0 - current_t) * self.num_inference_timesteps),
+                self.num_inference_timesteps - 1
+            )
+
+            if self._is_main_process():
+                print(f"  当前时间步: {current_t:.3f} (基于表达式长度: {current_length})")
 
             # 生成操作提案
             proposals = self.generate_action_proposals(

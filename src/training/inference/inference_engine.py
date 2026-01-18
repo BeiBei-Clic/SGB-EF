@@ -48,7 +48,8 @@ class InferenceEngine:
             logger=logger,
             min_action_score=self.MIN_ACTION_SCORE,
             max_expression_length=self.MAX_EXPRESSION_LENGTH,
-            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD
+            numerical_clip_threshold=self.NUMERICAL_CLIP_THRESHOLD,
+            num_inference_timesteps=getattr(args, 'num_discrete_timesteps', 10)
         )
 
     def _prepare_initial_expression(self, initial_expr, x_data, y_data_len):

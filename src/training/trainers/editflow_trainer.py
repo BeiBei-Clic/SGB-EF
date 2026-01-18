@@ -18,7 +18,9 @@ class EditFlowTrainer:
     MIN_ACTION_SCORE = 0.01
 
     def __init__(self, model, condition_encoder, criterion, optimizer, scheduler,
-                 tokenizer, args, logger, accelerator):
+                 tokenizer, args, logger, accelerator,
+                 time_sampling_strategy: str = "uniform",
+                 num_discrete_timesteps: int = 10):
         """
         初始化训练器
 
@@ -32,6 +34,8 @@ class EditFlowTrainer:
             args: 训练参数配置
             logger: 日志记录器
             accelerator: Accelerate加速器
+            time_sampling_strategy: 时间步采样策略
+            num_discrete_timesteps: 离散采样的时间步数量
         """
         self.model = model
         self.condition_encoder = condition_encoder
@@ -44,6 +48,15 @@ class EditFlowTrainer:
         self.accelerator = accelerator
         self.device = accelerator.device
         self.debug_mode = args.debug
+
+        # 时间步采样器（始终启用）
+        from ..time_sampling import TimestepSampler
+        self.timestep_sampler = TimestepSampler(
+            sampling_strategy=time_sampling_strategy,
+            num_discrete_timesteps=num_discrete_timesteps
+        )
+        if self.accelerator.is_local_main_process:
+            print(f"时间步采样已启用: strategy={time_sampling_strategy}, num_timesteps={num_discrete_timesteps}")
 
     # ============= 分布式工具方法 =============
     def gather_and_format_metrics(self, num_batches, total_loss, total_grad_norm, default_value=0.0):
@@ -110,19 +123,41 @@ class EditFlowTrainer:
 
     # ============= 前向传播和损失计算 =============
     def forward_and_compute_loss(self, condition_embeddings, z0_token_ids, z1_token_ids, debug_info=None):
-        """前向传播并计算损失（合并方法，减少中间状态传递）"""
+        """前向传播并计算损失
+
+        Args:
+            condition_embeddings: 条件嵌入
+            z0_token_ids: 当前状态token IDs
+            z1_token_ids: 目标状态token IDs
+            debug_info: 调试信息
+        """
         from ..flow import remove_gap_tokens, fill_gap_tokens_with_repeats
+        from ..flow_interpolation import interpolate_z_to_zt, CubicScheduler
         from ..op_stats import count_ops_from_mask
 
         batch_size = z0_token_ids.size(0)
         vocab_size = self.tokenizer.vocab_size
 
-        # 移除gap token得到输入序列x_t（原始序列空间，无gap重复）
-        x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(z0_token_ids, self.tokenizer)
+        # 采样时间步
+        timestep = self.timestep_sampler.sample(batch_size, self.device)
+
+        # 使用概率插值生成 z_t
+        kappa_scheduler = CubicScheduler()
+        zt_token_ids = interpolate_z_to_zt(
+            z0_token_ids,
+            z1_token_ids,
+            timestep,
+            vocab_size,
+            kappa_scheduler
+        )
+
+        # 使用 z_t 作为输入
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = remove_gap_tokens(zt_token_ids, self.tokenizer)
+
         attention_mask = (~x_pad_mask).float()
 
         # 调用模型
-        output = self.model(input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask)
+        output = self.model(input_ids=x_t, condition=condition_embeddings, attention_mask=attention_mask, timestep=timestep)
         pred_rates = output['rates_logits']
 
         # 记录debug信息
@@ -392,7 +427,7 @@ class EditFlowTrainer:
 
             # 前向传播并计算损失（合并方法）
             forward_start = time.time()
-            loss, pred_rates, op_stats = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids, debug_info)
+            loss, pred_rates, op_stats = self.forward_and_compute_loss(condition_embeddings, z0_token_ids, z1_token_ids, debug_info=debug_info)
             forward_time = time.time() - forward_start
 
             if self.accelerator.is_local_main_process and self.debug_mode:

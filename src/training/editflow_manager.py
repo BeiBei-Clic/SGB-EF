@@ -349,7 +349,8 @@ class EditFlowManager:
             condition_dim=self.args.condition_dim_hidden,
             dropout=effective_dropout,
             max_seq_len=self.args.max_expr_length,
-            use_condition_injection=self.args.use_condition_injection,
+            time_embed_dim=getattr(self.args, 'time_embed_dim', 256),
+            time_max_period=getattr(self.args, 'time_max_period', 10000.0),
             verbose=self.accelerator.is_local_main_process
         ).to(self.device)
 
@@ -456,7 +457,6 @@ class EditFlowManager:
                 'condition_dim': unwrapped_model.condition_dim,
                 'dropout': unwrapped_model.dropout,
                 'max_seq_len': unwrapped_model.max_seq_len,
-                'use_condition_injection': unwrapped_model.use_condition_injection,
             }
 
             # 只保存必要的信息，不保存整个args对象和模型权重（由Accelerate保存）
@@ -564,7 +564,9 @@ class EditFlowManager:
             tokenizer=tokenizer,
             args=self.args,
             logger=self.logger,
-            accelerator=self.accelerator
+            accelerator=self.accelerator,
+            time_sampling_strategy=getattr(self.args, 'time_sampling_strategy', 'uniform'),
+            num_discrete_timesteps=getattr(self.args, 'num_discrete_timesteps', 10)
         )
 
         eval_every = self.args.eval_every

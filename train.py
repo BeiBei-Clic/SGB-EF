@@ -64,7 +64,6 @@ def main():
     parser.add_argument("--n_layers", type=int, default=24, help="LLaMA Transformer层数")
     parser.add_argument("--n_heads", type=int, default=24, help="LLaMA注意力头数")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout比率")
-    parser.add_argument("--use_condition_injection", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否使用交叉注意力条件注入")
 
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小 (每个GPU)")
@@ -117,6 +116,12 @@ def main():
     parser.add_argument("--condition_num_seeds", type=int, default=32, help="SetTransformer种子数（输出序列长度，特征向量数量）")
     parser.add_argument("--condition_dim_output", type=int, default=128, help="SetTransformer输出维度（已弃用：现在输出序列而非单个向量）")
     parser.add_argument("--condition_input_normalization", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True, help="是否对输入进行标准化")
+
+    # 时间步嵌入参数（始终启用）
+    parser.add_argument("--time_embed_dim", type=int, default=256, help="时间步嵌入维度")
+    parser.add_argument("--time_max_period", type=float, default=10000.0, help="正弦嵌入最大周期")
+    parser.add_argument("--time_sampling_strategy", type=str, default="uniform", choices=["uniform", "discrete", "importance"], help="时间步采样策略")
+    parser.add_argument("--num_discrete_timesteps", type=int, default=10, help="离散采样的时间步数量")
 
     # 保持向后兼容性，但现在不再使用的参数
     parser.add_argument("--condition_max_length", type=int, default=1024, help="条件嵌入器的最大token长度")

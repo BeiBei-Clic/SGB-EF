@@ -516,7 +516,7 @@ def custom_collate_fn(batch):
         'z0_token_ids': torch.stack([item['z0_token_ids'] for item in batch]),
         'z1_token_ids': torch.stack([item['z1_token_ids'] for item in batch]),
         'gap_token': batch[0]['gap_token'],
-        'original_dims': original_dims  # 记录原始维度，供调试使用
+        'original_dims': original_dims,  # 记录原始维度，供调试使用
     }
 
     return result

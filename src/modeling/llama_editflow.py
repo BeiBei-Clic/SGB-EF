@@ -10,6 +10,10 @@ from transformers import LlamaConfig, LlamaModel
 from typing import Optional, Dict
 
 
+# 导入时间步嵌入模块
+from .time_embedding import SinusoidalTimeEmbedding, AdaLNModulator
+
+
 class CrossAttentionConditionInjection(nn.Module):
     """
     交叉注意力条件注入
@@ -76,7 +80,8 @@ class LlamaEditFlowBackbone(nn.Module):
         condition_dim: int = 128,
         dropout: float = 0.1,
         max_seq_len: int = 24,
-        use_condition_injection: bool = True,
+        time_embed_dim: int = 256,
+        time_max_period: float = 10000.0,
         verbose: bool = False
     ):
         super().__init__()
@@ -101,10 +106,10 @@ class LlamaEditFlowBackbone(nn.Module):
         self.condition_dim = condition_dim
         self.dropout = dropout
         self.max_seq_len = max_seq_len
-        self.use_condition_injection = use_condition_injection
 
         if verbose:
             print(f"初始化LlamaEditFlowBackbone: vocab_size={vocab_size}, hidden_dim={hidden_dim}, n_layers={n_layers}")
+            print(f"  时间步嵌入已启用: time_embed_dim={time_embed_dim}, time_max_period={time_max_period}")
 
         # 基础LLaMA骨干网络
         self.backbone = LlamaModel(self.llama_config)
@@ -112,10 +117,20 @@ class LlamaEditFlowBackbone(nn.Module):
         # 条件投影
         self.cond_proj = nn.Linear(condition_dim, hidden_dim) if condition_dim != hidden_dim else nn.Identity()
 
-        # 交叉注意力条件注入
-        if use_condition_injection:
-            self.condition_injection = CrossAttentionConditionInjection(hidden_dim, n_heads)
-            self.condition_layer_norm = nn.LayerNorm(hidden_dim)
+        # 交叉注意力条件注入（始终启用）
+        self.condition_injection = CrossAttentionConditionInjection(hidden_dim, n_heads)
+        self.condition_layer_norm = nn.LayerNorm(hidden_dim)
+
+        # 时间步嵌入和 AdaLN 调制器（始终启用）
+        self.time_embedding = SinusoidalTimeEmbedding(
+            embedding_dim=time_embed_dim,
+            max_period=time_max_period
+        )
+        # 为每个 Transformer 层创建 AdaLN 调制器
+        self.adaln_modulators = nn.ModuleList([
+            AdaLNModulator(time_embed_dim, hidden_dim)
+            for _ in range(n_layers)
+        ])
 
         # 编辑流输出头
         self.rates_head = nn.Sequential(
@@ -143,6 +158,7 @@ class LlamaEditFlowBackbone(nn.Module):
         input_ids: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -151,11 +167,17 @@ class LlamaEditFlowBackbone(nn.Module):
             input_ids: (batch_size, seq_len) 输入token IDs
             condition: (batch_size, num_cond_tokens, condition_dim) 来自SetTransformer
             attention_mask: (batch_size, seq_len) 注意力掩码
+            timestep: (batch_size,) 时间步，范围 [0, 1]（必需参数）
 
         Returns:
             dict: 包含 rates_logits, insert_logits, substitute_logits, insert_probs, substitute_probs
         """
         batch_size, seq_len = input_ids.shape
+
+        # 时间步嵌入（始终启用）
+        if timestep is None:
+            raise ValueError("timestep 是必需的参数")
+        time_embed = self.time_embedding(timestep)
 
         # 处理条件
         if condition is None:
@@ -170,17 +192,40 @@ class LlamaEditFlowBackbone(nn.Module):
             batch_size, seq_len, device=input_ids.device, dtype=torch.bool
         )
 
-        # LLaMA前向传播
+        # 嵌入 tokens
+        inputs_embeds = self.backbone.embed_tokens(input_ids)
+        hidden_states = inputs_embeds
+
+        # 手动遍历 LLaMA 层，应用 AdaLN 调制（始终启用）
+        # 创建钩子函数用于 AdaLN 调制
+        hooks = []
+        for layer_idx in range(self.n_layers):
+            def create_hook(idx):
+                def hook(module, input, output):
+                    # output 是 tuple，output[0] 是 hidden_states
+                    h = output[0] if isinstance(output, tuple) else output
+                    scale, shift = self.adaln_modulators[idx](time_embed)
+                    h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                    return (h,) + output[1:] if isinstance(output, tuple) else h
+                return hook
+
+            hook = self.backbone.layers[layer_idx].register_forward_hook(create_hook(layer_idx))
+            hooks.append(hook)
+
+        # 调用 backbone（钩子会自动应用 AdaLN）
         hidden_states = self.backbone(
-            inputs_embeds=self.backbone.embed_tokens(input_ids),
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         ).last_hidden_state
 
-        # 条件注入（通过交叉注意力）
-        if self.use_condition_injection:
-            hidden_states = self.condition_layer_norm(
-                hidden_states + self.condition_injection(hidden_states, condition_proj)
-            )
+        # 移除钩子
+        for hook in hooks:
+            hook.remove()
+
+        # 条件注入（通过交叉注意力，始终启用）
+        hidden_states = self.condition_layer_norm(
+            hidden_states + self.condition_injection(hidden_states, condition_proj)
+        )
 
         # 计算输出
         rates_logits = self.rates_head(hidden_states)
