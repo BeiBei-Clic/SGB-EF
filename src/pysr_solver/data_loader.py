@@ -3,6 +3,11 @@ import pandas as pd
 from pathlib import Path
 
 
+# 获取项目根目录
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_RESOURCES_DIR = _PROJECT_ROOT / "resources"
+
+
 def load_equation_data(equation_name: str, n_samples: int | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     加载指定方程的数据
@@ -17,7 +22,7 @@ def load_equation_data(equation_name: str, n_samples: int | None = None) -> tupl
         metadata: 方程元数据字典
     """
     # 加载元数据
-    df_meta = pd.read_csv("resources/FeynmanEquations.csv")
+    df_meta = pd.read_csv(_RESOURCES_DIR / "FeynmanEquations.csv")
     eq_row = df_meta[df_meta["Filename"] == equation_name]
 
     if eq_row.empty:
@@ -42,7 +47,7 @@ def load_equation_data(equation_name: str, n_samples: int | None = None) -> tupl
     metadata["var_names"] = var_names
 
     # 加载数据文件
-    data_path = Path(f"resources/Feynman_with_units/{equation_name}")
+    data_path = _RESOURCES_DIR / f"Feynman_with_units/{equation_name}"
     if not data_path.exists():
         raise FileNotFoundError(f"数据文件不存在: {data_path}")
 

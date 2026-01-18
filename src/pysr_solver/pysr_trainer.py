@@ -53,12 +53,24 @@ def evaluate_model(model: PySRRegressor, X: np.ndarray, y: np.ndarray) -> dict:
     """
     y_pred = model.predict(X)
 
+    # 获取所有表达式（hall of fame）
+    equations = model.equations_
+    all_equations = [
+        {
+            "complexity": int(row["complexity"]),
+            "loss": float(row["loss"]),
+            "equation": str(row["equation"]),
+        }
+        for _, row in equations.iterrows()
+    ]
+
     metrics = {
         "r2": r2_score(y, y_pred),
         "mse": mean_squared_error(y, y_pred),
         "rmse": np.sqrt(mean_squared_error(y, y_pred)),
         "best_equation": model.get_best()["equation"],
-        "best_loss": model.get_best()["loss"],
+        "best_loss": float(model.get_best()["loss"]),
+        "all_equations": all_equations,
     }
 
     return metrics

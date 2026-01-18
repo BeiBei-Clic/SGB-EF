@@ -1,8 +1,12 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# 添加当前目录到 path，支持直接运行
+sys.path.insert(0, str(Path(__file__).parent))
 
 from data_loader import load_equation_data
 from pysr_trainer import train_pysr, evaluate_model
@@ -11,7 +15,7 @@ from pysr_trainer import train_pysr, evaluate_model
 def parse_args():
     parser = argparse.ArgumentParser(description="使用 PySR 求解 Feynman 符号回归问题")
     parser.add_argument("--equation", type=str, default="I.10.7", help="方程名称（如 I.10.7）")
-    parser.add_argument("--n_samples", type=int, default=10000, help="采样数量")
+    parser.add_argument("--n_samples", type=int, default=1000, help="采样数量")
     parser.add_argument("--niterations", type=int, default=100, help="PySR 迭代次数")
     parser.add_argument("--output", type=str, default=None, help="结果输出路径")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -23,9 +27,7 @@ def main():
 
     np.random.seed(args.seed)
 
-    print("=" * 60)
     print("PySR 符号回归 - Feynman 方程求解")
-    print("=" * 60)
 
     # 加载数据
     print(f"\n加载数据: {args.equation}")
@@ -41,13 +43,7 @@ def main():
     model = train_pysr(X, y, niterations=args.niterations)
 
     # 评估
-    print("\n评估结果:")
     metrics = evaluate_model(model, X, y)
-    print(f"  最佳表达式: {metrics['best_equation']}")
-    print(f"  损失: {metrics['best_loss']:.6e}")
-    print(f"  R²: {metrics['r2']:.6f}")
-    print(f"  MSE: {metrics['mse']:.6e}")
-    print(f"  RMSE: {metrics['rmse']:.6e}")
 
     # 保存结果
     if args.output:
@@ -60,6 +56,7 @@ def main():
             "formula": meta["formula"],
             "var_names": meta["var_names"],
             "best_equation": metrics["best_equation"],
+            "all_equations": metrics["all_equations"],
             "metrics": {
                 "r2": float(metrics["r2"]),
                 "mse": float(metrics["mse"]),

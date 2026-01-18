@@ -128,7 +128,15 @@ api.upload_folder(
 )
 ```
 
-###下载数据集
+### 下载数据集
 ```bash
 wget -P resources --content-disposition "https://www.dropbox.com/scl/fi/kbi1q63opcgsykik0puzg/Feynman_with_units.tar.gz?rlkey=xqm1mb0vkj7iogao825033ltb&e=1&dl=1"
 ```
+
+### 运行gp
+```bash
+uv run --directory src/pysr_solver python run_pysr.py --equation I.10.7 --n_samples 1000 --niterations 100 --output ../../outputs
+```
+
+
+
