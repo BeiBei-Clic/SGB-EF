@@ -18,7 +18,12 @@ def train_pysr(X: np.ndarray, y: np.ndarray, niterations: int = 100, **kwargs) -
     """
     default_params = {
         "binary_operators": ["+", "-", "*", "/", "^"],
-        "unary_operators": ["sqrt", "exp", "log", "sin", "cos", "abs"],
+        "unary_operators": [
+            "sqrt", "exp", "log", "abs",
+            "sin", "cos", "tan",
+            "asin", "acos", "atan",
+            "sinh", "cosh", "tanh",
+        ],
         "maxsize": 30,
         "niterations": niterations,
         "populations": 15,

@@ -3,11 +3,6 @@ import pandas as pd
 from pathlib import Path
 
 
-def load_equation_metadata(csv_path: str = "resources/FeynmanEquations.csv") -> pd.DataFrame:
-    """加载 Feynman 方程元数据"""
-    return pd.read_csv(csv_path)
-
-
 def load_equation_data(equation_name: str, n_samples: int | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     加载指定方程的数据
@@ -22,7 +17,7 @@ def load_equation_data(equation_name: str, n_samples: int | None = None) -> tupl
         metadata: 方程元数据字典
     """
     # 加载元数据
-    df_meta = load_equation_metadata()
+    df_meta = pd.read_csv("resources/FeynmanEquations.csv")
     eq_row = df_meta[df_meta["Filename"] == equation_name]
 
     if eq_row.empty:
