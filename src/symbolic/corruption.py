@@ -103,7 +103,7 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
                 return sp.exp(expr.args[0] + sp.Rational(1, 100))
 
         # 三角函数和一元运算符的变异
-        elif func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
+        elif func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs', 'tanh']:
             operand = expr.args[0] if expr.args else sp.Integer(1)
 
             # 三角函数之间的相互替换
@@ -148,8 +148,8 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
 
             # 指数和对数函数的替换
             elif func_name == 'exp':
-                mutation_type = random.choice(['log', 'sqrt', 'abs', 'neg', 'identity', 'square'])
-                if mutation_type == 'log':
+                mutation_type = random.choice(['ln', 'sqrt', 'abs', 'neg', 'identity', 'square'])
+                if mutation_type == 'ln':
                     return sp.log(abs(operand) + sp.Rational(1, 100))
                 elif mutation_type == 'sqrt':
                     return sp.sqrt(abs(operand) + sp.Rational(1, 100))
@@ -163,7 +163,7 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
                     return operand ** 2
 
             elif func_name == 'log':
-                mutation_type = random.choice(['exp', 'sqrt', 'abs', 'neg', 'identity', 'square'])
+                mutation_type = random.choice(['exp', 'sqrt', 'abs', 'neg', 'identity', 'square', 'tanh'])
                 if mutation_type == 'exp':
                     return sp.exp(abs(operand))
                 elif mutation_type == 'sqrt':
@@ -176,17 +176,19 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
                     return operand
                 elif mutation_type == 'square':
                     return operand ** 2
+                elif mutation_type == 'tanh':
+                    return sp.tanh(operand)
 
             # 开根号函数的替换
             elif func_name == 'sqrt':
-                mutation_type = random.choice(['abs', 'neg', 'exp', 'log', 'identity', 'square'])
+                mutation_type = random.choice(['abs', 'neg', 'exp', 'ln', 'identity', 'square'])
                 if mutation_type == 'abs':
                     return abs(operand)
                 elif mutation_type == 'neg':
                     return -operand
                 elif mutation_type == 'exp':
                     return sp.exp(abs(operand))
-                elif mutation_type == 'log':
+                elif mutation_type == 'ln':
                     return sp.log(abs(operand) + sp.Rational(1, 100))
                 elif mutation_type == 'identity':
                     return operand
@@ -195,12 +197,12 @@ def corrupt_expression(expr: sp.Expr) -> sp.Expr:
 
             # 绝对值函数的替换
             elif func_name == 'abs':
-                mutation_type = random.choice(['neg', 'exp', 'log', 'sqrt', 'identity', 'square', 'sin'])
+                mutation_type = random.choice(['neg', 'exp', 'ln', 'sqrt', 'identity', 'square', 'sin'])
                 if mutation_type == 'neg':
                     return -operand
                 elif mutation_type == 'exp':
                     return sp.exp(operand)
-                elif mutation_type == 'log':
+                elif mutation_type == 'ln':
                     return sp.log(abs(operand) + sp.Rational(1, 100))
                 elif mutation_type == 'sqrt':
                     return sp.sqrt(abs(operand))

@@ -14,7 +14,7 @@ from src.utils.logger import Logger
 _logger = Logger(enabled=True)
 
 # 运算符定义
-UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
+UNARY_OPS = ['sin', 'cos', 'tan', 'exp', 'ln', 'sqrt', 'abs', 'arcsin', 'tanh']
 BINARY_OPS = ['add', 'sub', 'mul', 'div', 'pow']
 
 
@@ -35,6 +35,8 @@ def expr_to_tree(expr: sp.Expr) -> str:
     elif expr.is_Number:
         # 所有数值常数都返回统一的 "constant" token
         return "constant"
+    elif expr == sp.pi:
+        return "pi"
 
     if not hasattr(expr, 'args') or not expr.args:
         return str(expr)
@@ -52,16 +54,22 @@ def expr_to_tree(expr: sp.Expr) -> str:
         return f'div,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
     elif 'pow' in func_name:
         return f'pow,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
+    elif 'asin' in func_name:
+        return f'arcsin,{expr_to_tree(args[0])}'
     elif 'sin' in func_name:
         return f'sin,{expr_to_tree(args[0])}'
     elif 'cos' in func_name:
         return f'cos,{expr_to_tree(args[0])}'
+    elif 'tanh' in func_name:
+        return f'tanh,{expr_to_tree(args[0])}'
     elif 'tan' in func_name:
         return f'tan,{expr_to_tree(args[0])}'
     elif 'exp' in func_name:
         return f'exp,{expr_to_tree(args[0])}'
     elif 'log' in func_name:
-        return f'log,{expr_to_tree(args[0])}'
+        return f'ln,{expr_to_tree(args[0])}'
+    elif 'tanh' in func_name:
+        return f'tanh,{expr_to_tree(args[0])}'
     elif 'sqrt' in func_name:
         return f'sqrt,{expr_to_tree(args[0])}'
     elif 'abs' in func_name:
@@ -87,6 +95,9 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
             raise Exception(f"递归次数过多: {recursion_count} > {max_recursions}")
 
         if depth >= max_depth:
+            # 叶子节点：符号、常数或 pi（~5% 概率）
+            if random.random() < 0.05:
+                return sp.pi
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
         node_type = "operation" if random.random() < 0.5 else "leaf"
@@ -102,9 +113,14 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
                 elif op == 'cos': return sp.cos(operand)
                 elif op == 'tan': return sp.tan(operand)
                 elif op == 'exp': return sp.exp(operand)
-                elif op == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
+                elif op == 'ln': return sp.log(abs(operand) + sp.Rational(1, 1000))
+                elif op == 'tanh': return sp.tanh(operand)
                 elif op == 'sqrt': return sp.sqrt(abs(operand))
                 elif op == 'abs': return abs(operand)
+                elif op == 'arcsin':
+                    # 限制 arcsin 参数范围在 [-1, 1] 内避免复数
+                    safe_operand = sp.sin(operand)  # sin 的结果在 [-1, 1]
+                    return sp.asin(safe_operand)
                 else: return operand
             else:
                 op = random.choice(BINARY_OPS)
@@ -118,6 +134,9 @@ def generate_random_expr(input_dimension: int, max_depth: int = 4) -> sp.Expr:
                 elif op == 'pow': return left ** right
                 else: return left + right
         else:
+            # 叶子节点
+            if random.random() < 0.05:
+                return sp.pi
             return random.choice(symbols + [sp.Rational(random.randint(-5, 5))])
 
     # 生成表达式
@@ -149,7 +168,7 @@ def reduce_expression(expr: sp.Expr) -> sp.Expr:
     args = expr.args
 
     # 处理一元操作
-    if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
+    if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs', 'asin', 'tanh']:
         # 一元操作删减：直接返回操作数
         return args[0] if args else sp.Integer(1)
 
@@ -196,7 +215,7 @@ def reduce_expression_random_subtree(expr: sp.Expr) -> sp.Expr:
 
     if strategy == 'root':
         # 使用原有的根节点删减逻辑（保持向后兼容）
-        if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']:
+        if func_name in ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs', 'asin', 'tanh']:
             # 一元操作：直接返回操作数
             return expr.args[0] if expr.args else sp.Integer(1)
         else:
@@ -461,6 +480,8 @@ def tree_to_expr(tree_str: str) -> sp.Expr:
     if ',' not in tree_str:
         if tree_str == 'constant':
             return sp.Symbol('c')  # 用符号c表示常数
+        elif tree_str == 'pi':
+            return sp.pi
         elif tree_str.startswith('x') and tree_str[1:].isdigit():
             return sp.Symbol(tree_str)
         else:
@@ -482,6 +503,8 @@ def tree_to_expr(tree_str: str) -> sp.Expr:
 
         if token == 'constant':
             return sp.Symbol('c')
+        elif token == 'pi':
+            return sp.pi
         elif token.startswith('x') and token[1:].isdigit():
             return sp.Symbol(token)
         elif token in UNARY_OPS:
@@ -491,8 +514,10 @@ def tree_to_expr(tree_str: str) -> sp.Expr:
             if token == 'sin': return sp.sin(operand)
             elif token == 'cos': return sp.cos(operand)
             elif token == 'tan': return sp.tan(operand)
+            elif token == 'arcsin': return sp.asin(operand)
             elif token == 'exp': return sp.exp(operand)
-            elif token == 'log': return sp.log(abs(operand) + sp.Rational(1, 1000))
+            elif token == 'ln': return sp.log(abs(operand) + sp.Rational(1, 1000))
+            elif token == 'tanh': return sp.tanh(operand)
             elif token == 'sqrt': return sp.sqrt(abs(operand))
             elif token == 'abs': return abs(operand)
             else: return operand

@@ -15,8 +15,11 @@ class SymbolicVocab:
     # 运算符 (5个)
     OPERATORS = ['add', 'sub', 'mul', 'div', 'pow']
 
-    # 函数 (7个)
-    FUNCTIONS = ['sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'abs']
+    # 函数 (9个)
+    FUNCTIONS = ['sin', 'cos', 'tan', 'exp', 'ln', 'sqrt', 'abs', 'arcsin', 'tanh']
+
+    # 常数 (1个)
+    CONSTANTS = ['pi']
 
     # 特殊token (7个)
     SPECIAL_TOKENS = {
@@ -51,13 +54,18 @@ class SymbolicVocab:
         for idx, op in enumerate(cls.OPERATORS):
             vocab[op] = offset + idx
 
-        # 3. 添加函数 (ID: 12-18)
+        # 3. 添加函数 (ID: 12-19)
         offset += len(cls.OPERATORS)
         for idx, func in enumerate(cls.FUNCTIONS):
             vocab[func] = offset + idx
 
-        # 4. 添加变量 (ID: 19-...)
+        # 4. 添加常数 (ID: 20)
         offset += len(cls.FUNCTIONS)
+        for idx, const in enumerate(cls.CONSTANTS):
+            vocab[const] = offset + idx
+
+        # 5. 添加变量 (ID: 21-...)
+        offset += len(cls.CONSTANTS)
         for i in range(max_dim):
             vocab[f'x{i}'] = offset + i
 
@@ -66,7 +74,7 @@ class SymbolicVocab:
     @classmethod
     def get_vocab_size(cls, max_dim: int = 10) -> int:
         """获取词汇表大小"""
-        return len(cls.SPECIAL_TOKENS) + len(cls.OPERATORS) + len(cls.FUNCTIONS) + max_dim
+        return len(cls.SPECIAL_TOKENS) + len(cls.OPERATORS) + len(cls.FUNCTIONS) + len(cls.CONSTANTS) + max_dim
 
 
 class SymbolicRegressionTokenizer(PreTrainedTokenizer):
@@ -75,7 +83,7 @@ class SymbolicRegressionTokenizer(PreTrainedTokenizer):
 
     使用小词汇表，仅包含符号回归所需的token：
     - 运算符: add, sub, mul, div, pow
-    - 函数: sin, cos, tan, exp, log, sqrt, abs
+    - 函数: sin, cos, tan, exp, ln, sqrt, abs, arcsin, tanh
     - 变量: x0, x1, x2, ..., x(max_dim-1)
     - 特殊token: <gap>, <constant>, <s>, </s>, <pad>, <unk>, <mask>
     """
