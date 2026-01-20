@@ -45,11 +45,27 @@ def expr_to_tree(expr: sp.Expr) -> str:
     args = expr.args
 
     if 'add' in func_name:
-        return f'add,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "0"}'
+        if len(args) == 0:
+            return "0"
+        elif len(args) == 1:
+            return expr_to_tree(args[0])
+        else:
+            result = expr_to_tree(args[-1])
+            for arg in reversed(args[:-1]):
+                result = f'add,{expr_to_tree(arg)},{result}'
+            return result
     elif 'sub' in func_name:
         return f'sub,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "0"}'
     elif 'mul' in func_name:
-        return f'mul,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
+        if len(args) == 0:
+            return "1"
+        elif len(args) == 1:
+            return expr_to_tree(args[0])
+        else:
+            result = expr_to_tree(args[-1])
+            for arg in reversed(args[:-1]):
+                result = f'mul,{expr_to_tree(arg)},{result}'
+            return result
     elif 'div' in func_name or 'truediv' in func_name:
         return f'div,{expr_to_tree(args[0])},{expr_to_tree(args[1]) if len(args) >= 2 else "1"}'
     elif 'pow' in func_name:
