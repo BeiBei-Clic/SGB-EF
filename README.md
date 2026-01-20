@@ -136,7 +136,10 @@ wget -P resources --content-disposition "https://www.dropbox.com/scl/fi/kbi1q63o
 ### 运行gp
 ```bash
 uv run --directory src/pysr_solver python run_pysr.py --equation I.10.7 --n_samples 1000 --niterations 100 --output ../../outputs
+
+uv run -m src.gp_sample_generator.main
 ```
+
 
 
 

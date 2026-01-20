@@ -1,6 +1,15 @@
+import sys
+from pathlib import Path
 import numpy as np
 from pysr import PySRRegressor
 from sklearn.metrics import r2_score, mean_squared_error
+from sympy import sympify
+
+# 添加项目根目录到 path
+_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_root))
+
+from src.symbolic.symbolic_utils import simplify_expr
 
 
 def train_pysr(X: np.ndarray, y: np.ndarray, niterations: int = 100, **kwargs) -> PySRRegressor:
@@ -59,17 +68,18 @@ def evaluate_model(model: PySRRegressor, X: np.ndarray, y: np.ndarray) -> dict:
         {
             "complexity": int(row["complexity"]),
             "loss": float(row["loss"]),
-            "equation": str(row["equation"]),
+            "equation": str(simplify_expr(sympify(str(row["equation"]).replace('^', '**')))),
         }
         for _, row in equations.iterrows()
     ]
 
+    best = model.get_best()
     metrics = {
         "r2": r2_score(y, y_pred),
         "mse": mean_squared_error(y, y_pred),
         "rmse": np.sqrt(mean_squared_error(y, y_pred)),
-        "best_equation": model.get_best()["equation"],
-        "best_loss": float(model.get_best()["loss"]),
+        "best_equation": str(simplify_expr(sympify(best["equation"].replace('^', '**')))),
+        "best_loss": float(best["loss"]),
         "all_equations": all_equations,
     }
 
