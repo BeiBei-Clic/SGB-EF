@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--equation", type=str, default="I.10.7", help="方程名称（如 I.10.7）")
     parser.add_argument("--n_samples", type=int, default=1000, help="采样数量")
     parser.add_argument("--niterations", type=int, default=100, help="PySR 迭代次数")
+    parser.add_argument("--test_split", type=float, default=0.2, help="测试集比例 (0.0-1.0)")
     parser.add_argument("--output", type=str, default=None, help="结果输出路径")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     return parser.parse_args()
@@ -31,24 +32,60 @@ def main():
 
     # 加载数据
     print(f"\n加载数据: {args.equation}")
-    X, y, meta = load_equation_data(args.equation, n_samples=args.n_samples)
+    X_all, y_all, meta = load_equation_data(args.equation, n_samples=args.n_samples)
 
     print(f"  公式: {meta['formula']}")
     print(f"  变量: {meta['var_names']}")
-    print(f"  数据量: {len(X)}")
-    print(f"  特征数: {X.shape[1]}")
+    print(f"  总数据量: {len(X_all)}")
+    print(f"  特征数: {X_all.shape[1]}")
+
+    # 训练/测试分割
+    n_train = int(len(X_all) * (1 - args.test_split))
+    indices = np.random.permutation(len(X_all))
+    train_idx, test_idx = indices[:n_train], indices[n_train:]
+
+    X_train, y_train = X_all[train_idx], y_all[train_idx]
+    X_test, y_test = X_all[test_idx], y_all[test_idx]
+
+    print(f"  训练集: {len(X_train)} 样本")
+    print(f"  测试集: {len(X_test)} 样本")
 
     # 训练模型
     print(f"\n开始训练 (niterations={args.niterations})...")
-    model = train_pysr(X, y, niterations=args.niterations)
+    model = train_pysr(X_train, y_train, niterations=args.niterations)
 
-    # 评估
-    metrics = evaluate_model(model, X, y)
+    # 评估（在测试集上）
+    print(f"\n在测试集上评估...")
+    metrics = evaluate_model(model, X_train, y_train, X_test, y_test)
 
     # 保存结果
     if args.output:
         output_path = Path(args.output)
         output_path.mkdir(parents=True, exist_ok=True)
+
+        # 构建 metrics 字典（区分训练集和测试集）
+        result_metrics = {
+            "test_split": args.test_split,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+        }
+
+        # 添加测试集指标
+        result_metrics.update({
+            "test_r2": float(metrics["r2"]),
+            "test_mse": float(metrics["mse"]),
+            "test_rmse": float(metrics["rmse"]),
+        })
+
+        # 添加训练集指标（用于检测过拟合）
+        if "r2_train" in metrics:
+            result_metrics.update({
+                "train_r2": float(metrics["r2_train"]),
+                "train_mse": float(metrics["mse_train"]),
+                "train_rmse": float(metrics["rmse_train"]),
+            })
+
+        result_metrics["best_loss"] = float(metrics["best_loss"])
 
         # 保存 JSON 结果
         result = {
@@ -57,17 +94,24 @@ def main():
             "var_names": meta["var_names"],
             "best_equation": metrics["best_equation"],
             "all_equations": metrics["all_equations"],
-            "metrics": {
-                "r2": float(metrics["r2"]),
-                "mse": float(metrics["mse"]),
-                "rmse": float(metrics["rmse"]),
-                "best_loss": float(metrics["best_loss"]),
-            },
+            "metrics": result_metrics,
         }
 
         with open(output_path / f"{args.equation}_result.json", "w") as f:
             json.dump(result, f, indent=2)
         print(f"结果已保存: {output_path / args.equation}_result.json")
+
+    # 打印评估结果
+    print(f"\n评估结果:")
+    print(f"  测试集 R²: {metrics['r2']:.6f}")
+    print(f"  测试集 MSE: {metrics['mse']:.4e}")
+    print(f"  测试集 RMSE: {metrics['rmse']:.4e}")
+    if "r2_train" in metrics:
+        print(f"  训练集 R²: {metrics['r2_train']:.6f}")
+        print(f"  训练集 MSE: {metrics['mse_train']:.4e}")
+        print(f"  训练集 RMSE: {metrics['rmse_train']:.4e}")
+        print(f"  过拟合检测: MSE(test)/MSE(train) = {metrics['mse']/metrics['mse_train']:.2f}")
+    print(f"  PySR best_loss: {metrics['best_loss']:.4e}")
 
 
 if __name__ == "__main__":

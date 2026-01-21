@@ -48,19 +48,31 @@ def train_pysr(X: np.ndarray, y: np.ndarray, niterations: int = 100, **kwargs) -
     return model
 
 
-def evaluate_model(model: PySRRegressor, X: np.ndarray, y: np.ndarray) -> dict:
+def evaluate_model(
+    model: PySRRegressor,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray | None = None,
+    y_test: np.ndarray | None = None,
+) -> dict:
     """
     评估 PySR 模型
 
     Args:
         model: 训练好的 PySRRegressor
-        X: 测试集特征
-        y: 测试集目标
+        X_train: 训练集特征
+        y_train: 训练集目标
+        X_test: 测试集特征（可选，如果不提供则用训练集评估）
+        y_test: 测试集目标（可选）
 
     Returns:
         评估指标字典
     """
-    y_pred = model.predict(X)
+    # 在测试集上预测（如果没有测试集则用训练集）
+    X_eval = X_test if X_test is not None else X_train
+    y_eval = y_test if y_test is not None else y_train
+
+    y_pred = model.predict(X_eval)
 
     # 获取所有表达式（hall of fame）
     equations = model.equations_
@@ -74,14 +86,31 @@ def evaluate_model(model: PySRRegressor, X: np.ndarray, y: np.ndarray) -> dict:
     ]
 
     best = model.get_best()
-    metrics = {
-        "r2": r2_score(y, y_pred),
-        "mse": mean_squared_error(y, y_pred),
-        "rmse": np.sqrt(mean_squared_error(y, y_pred)),
+
+    # 计算评估集指标
+    eval_metrics = {
+        "r2": r2_score(y_eval, y_pred),
+        "mse": mean_squared_error(y_eval, y_pred),
+        "rmse": np.sqrt(mean_squared_error(y_eval, y_pred)),
+    }
+
+    # 如果有测试集，也计算训练集指标（用于检测过拟合）
+    if X_test is not None:
+        y_pred_train = model.predict(X_train)
+        train_metrics = {
+            "r2_train": r2_score(y_train, y_pred_train),
+            "mse_train": mean_squared_error(y_train, y_pred_train),
+            "rmse_train": np.sqrt(mean_squared_error(y_train, y_pred_train)),
+        }
+        metrics = {**train_metrics, **eval_metrics}
+    else:
+        metrics = eval_metrics
+
+    metrics.update({
         "best_equation": str(simplify_expr(sympify(best["equation"].replace('^', '**')))),
         "best_loss": float(best["loss"]),
         "all_equations": all_equations,
-    }
+    })
 
     return metrics
 
